@@ -1,1 +1,1 @@
-# protoc-gen-cloudevents
+# pubsub-go
