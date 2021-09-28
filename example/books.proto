@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package example.books.v1;
+
+option go_package = "example/books/v1;books";
+option php_namespace = "Example\\books\\V1";
+
+/* @protoevent */
+message BookCreatedEvent {
+  int32 id = 1;
+}
+
+/* @protoevent */
+message BookUpdatedEvent {
+  int32 id = 1;
+}
+
+/* @protoevent */
+message BookDeletedEvent {
+  int32 id = 1;
+}

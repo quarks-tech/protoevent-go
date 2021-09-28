@@ -1,1 +1,1 @@
-# pubsub-go
+# protoevent-go
