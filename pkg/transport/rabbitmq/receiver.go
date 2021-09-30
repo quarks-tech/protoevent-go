@@ -2,9 +2,10 @@ package rabbitmq
 
 import (
 	"context"
-	"os"
+	"runtime"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
@@ -14,56 +15,72 @@ import (
 
 const dlxSuffix = "-dlx"
 
-type ReceiverOption func(s *Receiver)
+type receiverOptions struct {
+	workerCount   int
+	prefetchCount int
+	consumerName  string
+	consumerTag   string
+	enableDLX     bool
+}
+
+func defaultReceiverOptions() receiverOptions {
+	maxProcs := runtime.GOMAXPROCS(0)
+
+	return receiverOptions{
+		workerCount:   maxProcs,
+		prefetchCount: maxProcs * 3,
+	}
+}
+
+func (o *receiverOptions) complete() {
+	if o.consumerName == "" {
+		o.consumerName = "protoevent-go"
+	}
+
+	if o.consumerTag == "" {
+		o.consumerTag = o.consumerName + "-" + uuid.New().String()
+	}
+}
+
+type ReceiverOption func(o *receiverOptions)
 
 func WithWorkerNum(c int) ReceiverOption {
-	return func(s *Receiver) {
-		s.workerCount = c
+	return func(o *receiverOptions) {
+		o.workerCount = c
+	}
+}
+
+func WithDLX() ReceiverOption {
+	return func(o *receiverOptions) {
+		o.enableDLX = true
 	}
 }
 
 func WithPrefetchCount(c int) ReceiverOption {
-	return func(s *Receiver) {
-		s.prefetchCount = c
-	}
-}
-
-func WithAutogen() ReceiverOption {
-	return func(s *Receiver) {
-		name, err := os.Hostname()
-		if err != nil {
-			name = ""
-		}
-
-		s.consumerName = name
+	return func(o *receiverOptions) {
+		o.prefetchCount = c
 	}
 }
 
 type Receiver struct {
-	client        *Client
-	consumerName  string
-	consumerTag   string
-	queue         string
-	prefetchCount int
-	workerCount   int
-	enableDLX     bool
+	client  *Client
+	options receiverOptions
+	queue   string
 }
 
-func NewReceiver(client *Client, opts ...ReceiverOption) *Receiver {
-	s := &Receiver{
-		client:        client,
-		prefetchCount: 1,
-		enableDLX:     true,
-		queue:         "books",
-		consumerTag:   "test",
-	}
+func NewReceiver(client *Client, queue string, opts ...ReceiverOption) *Receiver {
+	options := defaultReceiverOptions()
 
 	for _, opt := range opts {
-		opt(s)
+		opt(&options)
 	}
 
-	if s.queue == "" {
-		s.queue = s.consumerName
+	options.complete()
+
+	s := &Receiver{
+		client:  client,
+		options: options,
+		queue:   queue,
 	}
 
 	return s
@@ -78,7 +95,7 @@ func (r *Receiver) Setup(ctx context.Context, infos ...eventbus.ServiceInfo) err
 func (r *Receiver) setup(conn *connpool.Conn, infos []eventbus.ServiceInfo) error {
 	var queueDeclareArgs amqp.Table
 
-	if r.enableDLX {
+	if r.options.enableDLX {
 		dlxExchange := r.queue + dlxSuffix
 		dlxQueue := r.queue + dlxSuffix
 
@@ -108,9 +125,7 @@ func (r *Receiver) setup(conn *connpool.Conn, infos []eventbus.ServiceInfo) erro
 
 	for _, info := range infos {
 		for _, eventName := range info.Events {
-			fullName := info.ServiceName + "." + eventName
-
-			if err = conn.Channel().QueueBind(r.queue, fullName, info.ServiceName, false, nil); err != nil {
+			if err = conn.Channel().QueueBind(r.queue, eventName, info.ServiceName, false, nil); err != nil {
 				return err
 			}
 		}
@@ -119,18 +134,18 @@ func (r *Receiver) setup(conn *connpool.Conn, infos []eventbus.ServiceInfo) erro
 	return nil
 }
 
-func (r *Receiver) Receive(ctx context.Context, fn func(md *event.Metadata, data []byte) error) error {
+func (r *Receiver) Receive(ctx context.Context, processor eventbus.Processor) error {
 	return r.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
-		return r.receive(conn, ctx, fn)
+		return r.receive(conn, ctx, processor)
 	})
 }
 
-func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, fn func(md *event.Metadata, data []byte) error) error {
-	if err := conn.Channel().Qos(r.prefetchCount, 0, false); err != nil {
+func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, processor eventbus.Processor) error {
+	if err := conn.Channel().Qos(r.options.prefetchCount, 0, false); err != nil {
 		return err
 	}
 
-	deliveries, err := conn.Channel().Consume(r.queue, r.consumerTag, false, false, false, false, nil)
+	deliveries, err := conn.Channel().Consume(r.queue, r.options.consumerTag, false, false, false, false, nil)
 	if err != nil {
 		return err
 	}
@@ -140,7 +155,7 @@ func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, fn func(md 
 	eg.Go(func() error {
 		select {
 		case <-ctx.Done():
-			return conn.Channel().Cancel(r.consumerTag, false)
+			return conn.Channel().Cancel(r.options.consumerTag, false)
 		case <-egCtx.Done():
 			return conn.Close()
 		case connErr := <-conn.NotifyClose(make(chan *amqp.Error)):
@@ -148,7 +163,7 @@ func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, fn func(md 
 		}
 	})
 
-	for i := 0; i < r.workerCount; i++ {
+	for i := 0; i < r.options.workerCount; i++ {
 		eg.Go(func() error {
 			for delivery := range deliveries {
 				select {
@@ -157,7 +172,7 @@ func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, fn func(md 
 				default:
 					md, data, err := parseDelivery(&delivery)
 					if err == nil {
-						err = fn(md, data)
+						err = processor(md, data)
 					}
 
 					if ackErr := doAcknowledge(&delivery, err); ackErr != nil {

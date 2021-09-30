@@ -8,6 +8,7 @@ package books
 
 import (
 	context "context"
+	event "github.com/quarks-tech/protoevent-go/pkg/event"
 	eventbus "github.com/quarks-tech/protoevent-go/pkg/eventbus"
 )
 
@@ -49,70 +50,58 @@ type BookDeletedEventHandler interface {
 	HandleBookDeletedEvent(ctx context.Context, e *BookDeletedEvent) error
 }
 
-func RegisterBookCreatedEventHandler(r eventbus.SubscriptionRegistrar, h BookCreatedEventHandler) {
-	r.RegisterSubscription(&EventbusServiceDesc, "BookCreated", h)
+func RegisterBookCreatedEventHandler(r eventbus.EventHandlerRegistrar, h BookCreatedEventHandler) {
+	r.RegisterEventHandler(&EventbusServiceDesc, "BookCreated", h)
 }
 
-func RegisterBookUpdatedEventHandler(r eventbus.SubscriptionRegistrar, h BookUpdatedEventHandler) {
-	r.RegisterSubscription(&EventbusServiceDesc, "BookUpdated", h)
+func RegisterBookUpdatedEventHandler(r eventbus.EventHandlerRegistrar, h BookUpdatedEventHandler) {
+	r.RegisterEventHandler(&EventbusServiceDesc, "BookUpdated", h)
 }
 
-func RegisterBookDeletedEventHandler(r eventbus.SubscriptionRegistrar, h BookDeletedEventHandler) {
-	r.RegisterSubscription(&EventbusServiceDesc, "BookDeleted", h)
+func RegisterBookDeletedEventHandler(r eventbus.EventHandlerRegistrar, h BookDeletedEventHandler) {
+	r.RegisterEventHandler(&EventbusServiceDesc, "BookDeleted", h)
 }
 
-func _BookCreatedEvent_Handler(s interface{}, ctx context.Context, dec func(interface{}) error, interceptor eventbus.SubscriberInterceptor) error {
+func _BookCreatedEvent_Handler(h interface{}, md *event.Metadata, ctx context.Context, dec func(interface{}) error, interceptor eventbus.SubscriberInterceptor) error {
 	e := new(BookCreatedEvent)
 	if err := dec(e); err != nil {
 		return err
 	}
 	if interceptor == nil {
-		return s.(BookCreatedEventHandler).HandleBookCreatedEvent(ctx, e)
-	}
-	info := &eventbus.SubscriberInfo{
-		Subscriber: s,
-		EventName:  "example.books.v1.BookCreated",
+		return h.(BookCreatedEventHandler).HandleBookCreatedEvent(ctx, e)
 	}
 	handler := func(ctx context.Context, e interface{}) error {
-		return s.(BookCreatedEventHandler).HandleBookCreatedEvent(ctx, e.(*BookCreatedEvent))
+		return h.(BookCreatedEventHandler).HandleBookCreatedEvent(ctx, e.(*BookCreatedEvent))
 	}
-	return interceptor(ctx, e, info, handler)
+	return interceptor(ctx, md, e, handler)
 }
 
-func _BookUpdatedEvent_Handler(s interface{}, ctx context.Context, dec func(interface{}) error, interceptor eventbus.SubscriberInterceptor) error {
+func _BookUpdatedEvent_Handler(h interface{}, md *event.Metadata, ctx context.Context, dec func(interface{}) error, interceptor eventbus.SubscriberInterceptor) error {
 	e := new(BookUpdatedEvent)
 	if err := dec(e); err != nil {
 		return err
 	}
 	if interceptor == nil {
-		return s.(BookUpdatedEventHandler).HandleBookUpdatedEvent(ctx, e)
-	}
-	info := &eventbus.SubscriberInfo{
-		Subscriber: s,
-		EventName:  "example.books.v1.BookUpdated",
+		return h.(BookUpdatedEventHandler).HandleBookUpdatedEvent(ctx, e)
 	}
 	handler := func(ctx context.Context, e interface{}) error {
-		return s.(BookUpdatedEventHandler).HandleBookUpdatedEvent(ctx, e.(*BookUpdatedEvent))
+		return h.(BookUpdatedEventHandler).HandleBookUpdatedEvent(ctx, e.(*BookUpdatedEvent))
 	}
-	return interceptor(ctx, e, info, handler)
+	return interceptor(ctx, md, e, handler)
 }
 
-func _BookDeletedEvent_Handler(s interface{}, ctx context.Context, dec func(interface{}) error, interceptor eventbus.SubscriberInterceptor) error {
+func _BookDeletedEvent_Handler(h interface{}, md *event.Metadata, ctx context.Context, dec func(interface{}) error, interceptor eventbus.SubscriberInterceptor) error {
 	e := new(BookDeletedEvent)
 	if err := dec(e); err != nil {
 		return err
 	}
 	if interceptor == nil {
-		return s.(BookDeletedEventHandler).HandleBookDeletedEvent(ctx, e)
-	}
-	info := &eventbus.SubscriberInfo{
-		Subscriber: s,
-		EventName:  "example.books.v1.BookDeleted",
+		return h.(BookDeletedEventHandler).HandleBookDeletedEvent(ctx, e)
 	}
 	handler := func(ctx context.Context, e interface{}) error {
-		return s.(BookDeletedEventHandler).HandleBookDeletedEvent(ctx, e.(*BookDeletedEvent))
+		return h.(BookDeletedEventHandler).HandleBookDeletedEvent(ctx, e.(*BookDeletedEvent))
 	}
-	return interceptor(ctx, e, info, handler)
+	return interceptor(ctx, md, e, handler)
 }
 
 var EventbusServiceDesc = eventbus.ServiceDesc{

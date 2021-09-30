@@ -6,18 +6,21 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"google.golang.org/grpc/grpclog"
 )
 
-var logger = grpclog.Component("eventbus")
+var logger = grpclog.Component("protoevent")
 
 type Receiver interface {
 	Setup(ctx context.Context, infos ...ServiceInfo) error
-	Receive(ctx context.Context, fn func(md *event.Metadata, data []byte) error) error
+	Receive(ctx context.Context, p Processor) error
 }
+
+type Processor func(md *event.Metadata, data []byte) error
 
 type EventDesc struct {
 	Name        string
@@ -51,28 +54,10 @@ type serviceInfo struct {
 	mdata  string
 }
 
-type SubscriberInfo struct {
-	Subscriber interface{}
-	EventName  string
-}
+type eventHandler func(h interface{}, md *event.Metadata, ctx context.Context, dec func(interface{}) error, inter SubscriberInterceptor) error
 
-type Handler func(ctx context.Context, attrs interface{}) error
-
-type SubscriberInterceptor func(ctx context.Context, data interface{}, info *SubscriberInfo, handler Handler) error
-
-type eventHandler func(cons interface{}, ctx context.Context, dec func(interface{}) error, interceptor SubscriberInterceptor) error
-
-type SubscriptionDesc struct {
-	EventName string
-	// The pointer to the subscriber interface. Used to check whether the user
-	// provided implementation satisfies the interface requirements.
-	HandlerType interface{}
-	Handler     eventHandler
-	Metadata    interface{}
-}
-
-type SubscriptionRegistrar interface {
-	RegisterSubscription(desc *ServiceDesc, event string, impl interface{})
+type EventHandlerRegistrar interface {
+	RegisterEventHandler(desc *ServiceDesc, event string, impl interface{})
 }
 
 type subscriberOptions struct {
@@ -80,34 +65,37 @@ type subscriberOptions struct {
 	chainInterceptors []SubscriberInterceptor
 }
 
-func defaultSubscriberOptions() *subscriberOptions {
-	return &subscriberOptions{}
+func defaultSubscriberOptions() subscriberOptions {
+	return subscriberOptions{}
 }
 
 type SubscriberOption func(opts *subscriberOptions)
 
 type Subscriber struct {
 	mux      sync.Mutex
-	options  *subscriberOptions
+	opts     subscriberOptions
 	services map[string]*serviceInfo
 	serve    bool
-	workers  int
 }
 
 func NewSubscriber(opts ...SubscriberOption) *Subscriber {
-	defOpts := defaultSubscriberOptions()
+	options := defaultSubscriberOptions()
 
 	for _, opt := range opts {
-		opt(defOpts)
+		opt(&options)
 	}
 
-	return &Subscriber{
-		options:  defOpts,
+	s := &Subscriber{
+		opts:     options,
 		services: make(map[string]*serviceInfo),
 	}
+
+	chainSubscriberInterceptors(s)
+
+	return s
 }
 
-func (s *Subscriber) RegisterSubscription(sd *ServiceDesc, eventName string, h interface{}) {
+func (s *Subscriber) RegisterEventHandler(sd *ServiceDesc, eventName string, h interface{}) {
 	ed, ok := sd.findEvent(eventName)
 	if !ok {
 		logger.Fatalf("find event")
@@ -127,10 +115,10 @@ func (s *Subscriber) register(sd *ServiceDesc, ed EventDesc, h interface{}) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
-	logger.Infof("eventbus: RegisterSubscription(%q)", "")
+	logger.Infof("protoevent: RegisterSubscription(%q)", "")
 
 	if s.serve {
-		logger.Fatalf("eventbus: Subscriber.RegisterSubscription after Subscriber.SubscribeAndConsume for %q", "")
+		logger.Fatalf("protoevent: Subscriber.RegisterEventHandler after Subscriber.Subscribe for %q", "")
 	}
 
 	if _, ok := s.services[sd.ServiceName]; !ok {
@@ -141,7 +129,7 @@ func (s *Subscriber) register(sd *ServiceDesc, ed EventDesc, h interface{}) {
 	}
 
 	if _, ok := s.services[sd.ServiceName].events[ed.Name]; ok {
-		logger.Fatalf("eventbus: Subscriber.RegisterSubscription found duplicate service registration for %q", "")
+		logger.Fatalf("protoevent: Subscriber.RegisterEventHandler found duplicate service registration for %q", "")
 	}
 
 	s.services[sd.ServiceName].events[ed.Name] = &eventInfo{
@@ -218,7 +206,9 @@ func (s *Subscriber) process(md *event.Metadata, data []byte) error {
 		return nil
 	}
 
-	ctx := event.NewIncomingContext(context.Background(), md)
+	// @todo
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
 
-	return ei.handler(ei.handlerImpl, ctx, df, s.options.interceptor)
+	return ei.handler(ei.handlerImpl, md, ctx, df, s.opts.interceptor)
 }

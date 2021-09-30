@@ -30,7 +30,7 @@ func main() {
 	defer client.Close()
 
 	sender := rabbitmq.NewSender(client)
-	publisher := eventbus.NewPublisher(sender, nil)
+	publisher := eventbus.NewPublisher(sender)
 	booksPublisher := books.NewEventPublisher(publisher)
 
 	var eg errgroup.Group

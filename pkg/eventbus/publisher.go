@@ -8,9 +8,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
-
-	_ "github.com/quarks-tech/protoevent-go/pkg/encoding/json"
-	_ "github.com/quarks-tech/protoevent-go/pkg/encoding/proto"
 )
 
 type Sender interface {
@@ -23,29 +20,45 @@ type Publisher interface {
 
 type PublishOption func(m *event.Metadata)
 
-type publishFn func(ctx context.Context, name string, e interface{}, p *PublisherImpl, opts ...PublishOption) error
-
-type PublishInterceptor func(ctx context.Context, name string, e interface{}, p *PublisherImpl, pf publishFn, opts ...PublishOption) error
-
-type PublisherImpl struct {
-	transport   Sender
-	options     []PublishOption
-	interceptor PublishInterceptor
+type publisherOptions struct {
+	publishOptions    []PublishOption
+	chainInterceptors []PublisherInterceptor
+	interceptor       PublisherInterceptor
 }
 
-func NewPublisher(transport Sender, interceptor PublishInterceptor, options ...PublishOption) *PublisherImpl {
-	return &PublisherImpl{
-		transport:   transport,
-		options:     options,
-		interceptor: interceptor,
+func defaultPublisherOptions() publisherOptions {
+	return publisherOptions{}
+}
+
+type PublisherOption func(opts *publisherOptions)
+
+type PublisherImpl struct {
+	sender  Sender
+	options publisherOptions
+}
+
+func NewPublisher(sender Sender, opts ...PublisherOption) *PublisherImpl {
+	options := defaultPublisherOptions()
+
+	for _, opt := range opts {
+		opt(&options)
 	}
+
+	p := &PublisherImpl{
+		sender:  sender,
+		options: options,
+	}
+
+	chainPublisherInterceptors(p)
+
+	return p
 }
 
 func (p *PublisherImpl) Publish(ctx context.Context, name string, event interface{}, opts ...PublishOption) error {
-	opts = combine(p.options, opts)
+	opts = combine(p.options.publishOptions, opts)
 
-	if p.interceptor != nil {
-		return p.interceptor(ctx, name, event, p, publish, opts...)
+	if p.options.interceptor != nil {
+		return p.options.interceptor(ctx, name, event, p, publish, opts...)
 	}
 
 	return publish(ctx, name, event, p, opts...)
@@ -73,7 +86,7 @@ func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, 
 		return fmt.Errorf(": %w", err)
 	}
 
-	if err = p.transport.Send(ctx, md, data); err != nil {
+	if err = p.sender.Send(ctx, md, data); err != nil {
 		return fmt.Errorf(": %w", err)
 	}
 
@@ -97,11 +110,10 @@ func combine(o1 []PublishOption, o2 []PublishOption) []PublishOption {
 
 func newMetadata(t string) *event.Metadata {
 	return &event.Metadata{
-		SpecVersion: "1.0.0",
-		Type:        t,
-		ID:          uuid.New().String(),
-		Time:        time.Now(),
-		// @todo add
+		SpecVersion:     "1.0.0",
+		Type:            t,
+		ID:              uuid.New().String(),
+		Time:            time.Now(),
 		DataContentType: "application/cloudevents+proto",
 	}
 }

@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
@@ -14,20 +15,36 @@ const (
 	DeliveryModePersistent = 2
 )
 
-type SendOption func(mess *amqp.Publishing)
-
-func WithDeliveryMode(mode uint8) SendOption {
-	return func(mess *amqp.Publishing) {
-		mess.DeliveryMode = mode
+func WithTransientDeliveryMode() SenderOption {
+	return func(opts *senderOptions) {
+		opts.deliveryMode = DeliveryModeTransient
 	}
 }
 
-type Sender struct {
-	client  *Client
-	options []SendOption
+type senderOptions struct {
+	deliveryMode uint8
 }
 
-func NewSender(client *Client, options ...SendOption) *Sender {
+func defaultSenderOptions() senderOptions {
+	return senderOptions{
+		deliveryMode: DeliveryModePersistent,
+	}
+}
+
+type SenderOption func(opts *senderOptions)
+
+type Sender struct {
+	client  *Client
+	options senderOptions
+}
+
+func NewSender(client *Client, opts ...SenderOption) *Sender {
+	options := defaultSenderOptions()
+
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	return &Sender{
 		client:  client,
 		options: options,
@@ -36,14 +53,14 @@ func NewSender(client *Client, options ...SendOption) *Sender {
 
 func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) error {
 	publishing := newPublishing(meta, data)
+	publishing.DeliveryMode = s.options.deliveryMode
 
-	for _, option := range s.options {
-		option(&publishing)
-	}
+	pos := strings.LastIndex(publishing.Type, ".")
+	exchange := publishing.Type[:pos]
+	routingKey := publishing.Type[pos+1:]
 
-	//@todo exchange, key?
 	return s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
-		return conn.Channel().Publish("example.books.v1", meta.Type, false, false, publishing)
+		return conn.Channel().Publish(exchange, routingKey, false, false, publishing)
 	})
 }
 

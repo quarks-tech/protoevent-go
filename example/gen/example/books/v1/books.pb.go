@@ -20,7 +20,6 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// @protoevent
 type BookCreatedEvent struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -68,7 +67,6 @@ func (x *BookCreatedEvent) GetId() int32 {
 	return 0
 }
 
-// @protoevent
 type BookUpdatedEvent struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -116,7 +114,6 @@ func (x *BookUpdatedEvent) GetId() int32 {
 	return 0
 }
 
-// @protoevent
 type BookDeletedEvent struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache

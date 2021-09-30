@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"runtime"
 	"syscall"
 
 	"github.com/quarks-tech/protoevent-go/example/gen/example/books/v1"
@@ -41,9 +40,8 @@ func main() {
 
 	defer client.Close()
 
-	receiver := rabbitmq.NewReceiver(client,
-		rabbitmq.WithWorkerNum(runtime.GOMAXPROCS(0)),
-		rabbitmq.WithPrefetchCount(1000),
+	receiver := rabbitmq.NewReceiver(client, "books",
+		rabbitmq.WithDLX(),
 	)
 
 	subscriber := eventbus.NewSubscriber()
