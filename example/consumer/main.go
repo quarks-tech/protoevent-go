@@ -40,12 +40,12 @@ func main() {
 
 	defer client.Close()
 
-	receiver := rabbitmq.NewReceiver(client, "books",
+	receiver := rabbitmq.NewReceiver(client, "example.books.v1",
+		rabbitmq.WithTopologySetup(),
 		rabbitmq.WithDLX(),
 	)
 
 	subscriber := eventbus.NewSubscriber()
-
 	books.RegisterBookCreatedEventHandler(subscriber, Handler{})
 
 	sigs := make(chan os.Signal, 1)

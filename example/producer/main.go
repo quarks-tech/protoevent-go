@@ -30,6 +30,11 @@ func main() {
 	defer client.Close()
 
 	sender := rabbitmq.NewSender(client)
+
+	if err := sender.Setup(context.Background(), &books.EventbusServiceDesc); err != nil {
+		log.Fatal(err)
+	}
+
 	publisher := eventbus.NewPublisher(sender)
 	booksPublisher := books.NewEventPublisher(publisher)
 

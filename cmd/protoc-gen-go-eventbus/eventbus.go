@@ -11,6 +11,12 @@ const (
 )
 
 func generateFile(gen *protogen.Plugin, f *protogen.File) {
+	messages := filterEventMessages(f.Messages)
+
+	if len(messages) == 0 {
+		return
+	}
+
 	filename := f.GeneratedFilenamePrefix + "_eventbus.pb.go"
 
 	g := gen.NewGeneratedFile(filename, f.GoImportPath)
@@ -29,11 +35,7 @@ func generateFile(gen *protogen.Plugin, f *protogen.File) {
 	g.P("package ", f.GoPackageName)
 	g.P()
 
-	generateFileContent(f, g)
-}
-
-func generateFileContent(f *protogen.File, g *protogen.GeneratedFile) {
-	genPubSub(g, f, filterEventDataMessages(f.Messages))
+	genPubSub(g, f, messages)
 }
 
 func genPubSub(g *protogen.GeneratedFile, f *protogen.File, messages []*protogen.Message) {

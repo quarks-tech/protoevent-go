@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
+	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
 	"github.com/streadway/amqp"
 )
@@ -51,11 +52,17 @@ func NewSender(client *Client, opts ...SenderOption) *Sender {
 	}
 }
 
+func (s *Sender) Setup(ctx context.Context, desc *eventbus.ServiceDesc) error {
+	return s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
+		return conn.Channel().ExchangeDeclare(desc.ServiceName, amqp.ExchangeTopic, true, false, false, false, nil)
+	})
+}
+
 func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) error {
 	publishing := newPublishing(meta, data)
 	publishing.DeliveryMode = s.options.deliveryMode
 
-	pos := strings.LastIndex(publishing.Type, ".")
+	pos := strings.LastIndex(meta.Type, ".")
 	exchange := publishing.Type[:pos]
 	routingKey := publishing.Type[pos+1:]
 

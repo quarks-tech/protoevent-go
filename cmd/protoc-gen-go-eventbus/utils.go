@@ -21,7 +21,7 @@ func protocVersion(gen *protogen.Plugin) string {
 	return fmt.Sprintf("%d.%d.%d%s", v.GetMajor(), v.GetMinor(), v.GetPatch(), suffix)
 }
 
-func filterEventDataMessages(messages []*protogen.Message) []*protogen.Message {
+func filterEventMessages(messages []*protogen.Message) []*protogen.Message {
 	var result []*protogen.Message
 
 	for _, m := range messages {

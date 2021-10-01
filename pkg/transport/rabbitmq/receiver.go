@@ -13,13 +13,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const dlxSuffix = "-dlx"
+const dlxSuffix = ".dlx"
 
 type receiverOptions struct {
 	workerCount   int
 	prefetchCount int
 	consumerName  string
 	consumerTag   string
+	setupTopology bool
 	enableDLX     bool
 }
 
@@ -50,6 +51,12 @@ func WithWorkerNum(c int) ReceiverOption {
 	}
 }
 
+func WithTopologySetup() ReceiverOption {
+	return func(o *receiverOptions) {
+		o.setupTopology = true
+	}
+}
+
 func WithDLX() ReceiverOption {
 	return func(o *receiverOptions) {
 		o.enableDLX = true
@@ -63,12 +70,13 @@ func WithPrefetchCount(c int) ReceiverOption {
 }
 
 type Receiver struct {
-	client  *Client
-	options receiverOptions
-	queue   string
+	client      *Client
+	options     receiverOptions
+	serviceName string
+	queue       string
 }
 
-func NewReceiver(client *Client, queue string, opts ...ReceiverOption) *Receiver {
+func NewReceiver(client *Client, serviceName string, opts ...ReceiverOption) *Receiver {
 	options := defaultReceiverOptions()
 
 	for _, opt := range opts {
@@ -78,21 +86,26 @@ func NewReceiver(client *Client, queue string, opts ...ReceiverOption) *Receiver
 	options.complete()
 
 	s := &Receiver{
-		client:  client,
-		options: options,
-		queue:   queue,
+		client:      client,
+		options:     options,
+		serviceName: serviceName,
+		queue:       serviceName,
 	}
 
 	return s
 }
 
 func (r *Receiver) Setup(ctx context.Context, infos ...eventbus.ServiceInfo) error {
+	if !r.options.setupTopology {
+		return nil
+	}
+
 	return r.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
-		return r.setup(conn, infos)
+		return r.setupTopology(conn, infos)
 	})
 }
 
-func (r *Receiver) setup(conn *connpool.Conn, infos []eventbus.ServiceInfo) error {
+func (r *Receiver) setupTopology(conn *connpool.Conn, infos []eventbus.ServiceInfo) error {
 	var queueDeclareArgs amqp.Table
 
 	if r.options.enableDLX {
