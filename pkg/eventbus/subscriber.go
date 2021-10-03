@@ -16,7 +16,7 @@ import (
 var logger = grpclog.Component("protoevent")
 
 type Receiver interface {
-	Setup(ctx context.Context, infos ...ServiceInfo) error
+	Setup(ctx context.Context, serviceName string, infos ...ServiceInfo) error
 	Receive(ctx context.Context, p Processor) error
 }
 
@@ -63,22 +63,26 @@ type EventHandlerRegistrar interface {
 type subscriberOptions struct {
 	interceptor       SubscriberInterceptor
 	chainInterceptors []SubscriberInterceptor
+	processTimeout    time.Duration
 }
 
 func defaultSubscriberOptions() subscriberOptions {
-	return subscriberOptions{}
+	return subscriberOptions{
+		processTimeout: time.Minute * 5,
+	}
 }
 
 type SubscriberOption func(opts *subscriberOptions)
 
 type Subscriber struct {
 	mux      sync.Mutex
+	name     string
 	opts     subscriberOptions
 	services map[string]*serviceInfo
 	serve    bool
 }
 
-func NewSubscriber(opts ...SubscriberOption) *Subscriber {
+func NewSubscriber(name string, opts ...SubscriberOption) *Subscriber {
 	options := defaultSubscriberOptions()
 
 	for _, opt := range opts {
@@ -87,6 +91,7 @@ func NewSubscriber(opts ...SubscriberOption) *Subscriber {
 
 	s := &Subscriber{
 		opts:     options,
+		name:     name,
 		services: make(map[string]*serviceInfo),
 	}
 
@@ -166,7 +171,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, r Receiver) error {
 	s.serve = true
 	s.mux.Unlock()
 
-	if err := r.Setup(ctx, s.GetServiceInfo()...); err != nil {
+	if err := r.Setup(ctx, s.name, s.GetServiceInfo()...); err != nil {
 		return err
 	}
 
@@ -206,8 +211,7 @@ func (s *Subscriber) process(md *event.Metadata, data []byte) error {
 		return nil
 	}
 
-	// @todo
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.processTimeout)
 	defer cancel()
 
 	return ei.handler(ei.handlerImpl, md, ctx, df, s.opts.interceptor)

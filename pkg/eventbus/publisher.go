@@ -110,7 +110,7 @@ func combine(o1 []PublishOption, o2 []PublishOption) []PublishOption {
 
 func newMetadata(t string) *event.Metadata {
 	return &event.Metadata{
-		SpecVersion:     "1.0.0",
+		SpecVersion:     "1.0",
 		Type:            t,
 		ID:              uuid.New().String(),
 		Time:            time.Now(),

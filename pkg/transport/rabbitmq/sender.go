@@ -3,11 +3,12 @@ package rabbitmq
 import (
 	"context"
 	"strings"
-	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message/cloudevent"
 	"github.com/streadway/amqp"
 )
 
@@ -22,13 +23,21 @@ func WithTransientDeliveryMode() SenderOption {
 	}
 }
 
+func WithMessageFormatter(f message.Formatter) SenderOption {
+	return func(opts *senderOptions) {
+		opts.messageFormatter = f
+	}
+}
+
 type senderOptions struct {
-	deliveryMode uint8
+	deliveryMode     uint8
+	messageFormatter message.Formatter
 }
 
 func defaultSenderOptions() senderOptions {
 	return senderOptions{
-		deliveryMode: DeliveryModePersistent,
+		messageFormatter: cloudevent.Formatter{},
+		deliveryMode:     DeliveryModePersistent,
 	}
 }
 
@@ -59,32 +68,14 @@ func (s *Sender) Setup(ctx context.Context, desc *eventbus.ServiceDesc) error {
 }
 
 func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) error {
-	publishing := newPublishing(meta, data)
-	publishing.DeliveryMode = s.options.deliveryMode
+	mess := s.options.messageFormatter.Format(meta, data)
+	mess.DeliveryMode = s.options.deliveryMode
 
 	pos := strings.LastIndex(meta.Type, ".")
-	exchange := publishing.Type[:pos]
-	routingKey := publishing.Type[pos+1:]
+	exchange := mess.Type[:pos]
+	routingKey := mess.Type[pos+1:]
 
 	return s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
-		return conn.Channel().Publish(exchange, routingKey, false, false, publishing)
+		return conn.Channel().Publish(exchange, routingKey, false, false, mess)
 	})
-}
-
-func newPublishing(meta *event.Metadata, data []byte) amqp.Publishing {
-	return amqp.Publishing{
-		Type:        meta.Type,
-		ContentType: meta.DataContentType,
-		Headers:     buildPublishingHeaders(meta),
-		Body:        data,
-	}
-}
-
-func buildPublishingHeaders(meta *event.Metadata) amqp.Table {
-	return amqp.Table{
-		"cloudEvents:time":        meta.Time.Format(time.RFC3339),
-		"cloudEvents:id":          meta.ID,
-		"cloudEvents:specversion": meta.SpecVersion,
-		"cloudEvents:source":      meta.Source,
-	}
 }

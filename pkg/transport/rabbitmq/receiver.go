@@ -2,13 +2,14 @@ package rabbitmq
 
 import (
 	"context"
+	"fmt"
 	"runtime"
-	"time"
 
 	"github.com/google/uuid"
-	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message/cloudevent"
 	"github.com/streadway/amqp"
 	"golang.org/x/sync/errgroup"
 )
@@ -16,9 +17,10 @@ import (
 const dlxSuffix = ".dlx"
 
 type receiverOptions struct {
+	messageParser message.Parser
+	queue         string
 	workerCount   int
 	prefetchCount int
-	consumerName  string
 	consumerTag   string
 	setupTopology bool
 	enableDLX     bool
@@ -28,18 +30,9 @@ func defaultReceiverOptions() receiverOptions {
 	maxProcs := runtime.GOMAXPROCS(0)
 
 	return receiverOptions{
+		messageParser: cloudevent.Parser{},
 		workerCount:   maxProcs,
 		prefetchCount: maxProcs * 3,
-	}
-}
-
-func (o *receiverOptions) complete() {
-	if o.consumerName == "" {
-		o.consumerName = "protoevent-go"
-	}
-
-	if o.consumerTag == "" {
-		o.consumerTag = o.consumerName + "-" + uuid.New().String()
 	}
 }
 
@@ -69,33 +62,44 @@ func WithPrefetchCount(c int) ReceiverOption {
 	}
 }
 
-type Receiver struct {
-	client      *Client
-	options     receiverOptions
-	serviceName string
-	queue       string
+func WithMessageParser(p message.Parser) ReceiverOption {
+	return func(opts *receiverOptions) {
+		opts.messageParser = p
+	}
 }
 
-func NewReceiver(client *Client, serviceName string, opts ...ReceiverOption) *Receiver {
+type Receiver struct {
+	client       *Client
+	options      receiverOptions
+	consumerName string
+}
+
+func NewReceiver(client *Client, opts ...ReceiverOption) *Receiver {
 	options := defaultReceiverOptions()
 
 	for _, opt := range opts {
 		opt(&options)
 	}
 
-	options.complete()
-
 	s := &Receiver{
-		client:      client,
-		options:     options,
-		serviceName: serviceName,
-		queue:       serviceName,
+		client:  client,
+		options: options,
 	}
 
 	return s
 }
 
-func (r *Receiver) Setup(ctx context.Context, infos ...eventbus.ServiceInfo) error {
+func (r *Receiver) Setup(ctx context.Context, consumerName string, infos ...eventbus.ServiceInfo) error {
+	r.consumerName = consumerName
+
+	if r.options.queue == "" {
+		r.options.queue = consumerName
+	}
+
+	if r.options.consumerTag == "" {
+		r.options.consumerTag = fmt.Sprintf("%s-%s", consumerName, uuid.New().String())
+	}
+
 	if !r.options.setupTopology {
 		return nil
 	}
@@ -109,8 +113,8 @@ func (r *Receiver) setupTopology(conn *connpool.Conn, infos []eventbus.ServiceIn
 	var queueDeclareArgs amqp.Table
 
 	if r.options.enableDLX {
-		dlxExchange := r.queue + dlxSuffix
-		dlxQueue := r.queue + dlxSuffix
+		dlxExchange := r.options.queue + dlxSuffix
+		dlxQueue := r.options.queue + dlxSuffix
 
 		queueDeclareArgs = amqp.Table{
 			"x-dead-letter-exchange": dlxExchange,
@@ -131,14 +135,14 @@ func (r *Receiver) setupTopology(conn *connpool.Conn, infos []eventbus.ServiceIn
 		}
 	}
 
-	_, err := conn.Channel().QueueDeclare(r.queue, true, false, false, false, queueDeclareArgs)
+	_, err := conn.Channel().QueueDeclare(r.options.queue, true, false, false, false, queueDeclareArgs)
 	if err != nil {
 		return err
 	}
 
 	for _, info := range infos {
 		for _, eventName := range info.Events {
-			if err = conn.Channel().QueueBind(r.queue, eventName, info.ServiceName, false, nil); err != nil {
+			if err = conn.Channel().QueueBind(r.options.queue, eventName, info.ServiceName, false, nil); err != nil {
 				return err
 			}
 		}
@@ -158,7 +162,7 @@ func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, processor e
 		return err
 	}
 
-	deliveries, err := conn.Channel().Consume(r.queue, r.options.consumerTag, false, false, false, false, nil)
+	deliveries, err := conn.Channel().Consume(r.options.queue, r.options.consumerTag, false, false, false, false, nil)
 	if err != nil {
 		return err
 	}
@@ -183,7 +187,7 @@ func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, processor e
 				case <-ctx.Done():
 					return nil
 				default:
-					md, data, err := parseDelivery(&delivery)
+					md, data, err := r.options.messageParser.Parse(&delivery)
 					if err == nil {
 						err = processor(md, data)
 					}
@@ -199,23 +203,6 @@ func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, processor e
 	}
 
 	return eg.Wait()
-}
-
-func parseDelivery(d *amqp.Delivery) (*event.Metadata, []byte, error) {
-	meta := &event.Metadata{
-		SpecVersion:     d.Headers["cloudEvents:specversion"].(string),
-		DataContentType: d.ContentType,
-		Type:            d.Type,
-	}
-
-	var err error
-
-	meta.Time, err = time.Parse(time.RFC3339, d.Headers["cloudEvents:time"].(string))
-	if err != nil {
-		return nil, nil, eventbus.NewUnprocessableEventError(err)
-	}
-
-	return meta, d.Body, nil
 }
 
 func doAcknowledge(m *amqp.Delivery, err error) error {
