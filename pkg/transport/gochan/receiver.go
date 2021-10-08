@@ -2,7 +2,6 @@ package gochan
 
 import (
 	"context"
-	"io"
 
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 )
@@ -17,7 +16,7 @@ func (r receiver) Receive(ctx context.Context, processor eventbus.Processor) err
 	for m := range r {
 		select {
 		case <-ctx.Done():
-			return io.EOF
+			return ctx.Err()
 		default:
 			if err := processor(m.meta, m.data); err != nil {
 				return err
