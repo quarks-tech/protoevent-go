@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
@@ -24,6 +25,16 @@ type publisherOptions struct {
 	publishOptions    []PublishOption
 	chainInterceptors []PublisherInterceptor
 	interceptor       PublisherInterceptor
+}
+
+func WithCustomDataContentType(t string) PublishOption {
+	return func(m *event.Metadata) {
+		m.DataContentType = t
+	}
+}
+
+func WithJSONDataContentType() PublishOption {
+	return WithCustomDataContentType("application/cloudevents+json")
 }
 
 func defaultPublisherOptions() publisherOptions {
