@@ -27,7 +27,10 @@ func (Parser) Parse(d *amqp.Delivery) (*event.Metadata, []byte, error) {
 		return nil, nil, eventbus.NewUnprocessableEventError(err)
 	}
 
-	codec, _ := encoding.GetCodec(meta.DataContentType)
+	codec, err := encoding.GetCodec(meta.DataContentType)
+	if err != nil {
+		return nil, nil, eventbus.NewUnprocessableEventError(err)
+	}
 
 	eventData := &legacyEventData{}
 	err = codec.Unmarshal(d.Body, eventData)
