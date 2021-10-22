@@ -6,12 +6,13 @@ import (
 	"runtime"
 
 	"github.com/google/uuid"
+	"github.com/streadway/amqp"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message/cloudevent"
-	"github.com/streadway/amqp"
-	"golang.org/x/sync/errgroup"
 )
 
 const dlxSuffix = ".dlx"
@@ -187,6 +188,7 @@ func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, processor e
 				case <-ctx.Done():
 					return nil
 				default:
+					delivery := delivery
 					md, data, err := r.options.messageParser.Parse(&delivery)
 					if err == nil {
 						err = processor(md, data)

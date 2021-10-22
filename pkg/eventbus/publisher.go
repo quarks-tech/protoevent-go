@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
@@ -31,6 +32,18 @@ func defaultPublisherOptions() publisherOptions {
 }
 
 type PublisherOption func(opts *publisherOptions)
+
+func WithContentType(t string) PublishOption {
+	return func(m *event.Metadata) {
+		m.DataContentType = t
+	}
+}
+
+func WithPublisherContentType(t string) PublisherOption {
+	return func(opts *publisherOptions) {
+		opts.publishOptions = append(opts.publishOptions, WithContentType(t))
+	}
+}
 
 type PublisherImpl struct {
 	sender  Sender
@@ -93,7 +106,7 @@ func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, 
 	return nil
 }
 
-func combine(o1 []PublishOption, o2 []PublishOption) []PublishOption {
+func combine(o1, o2 []PublishOption) []PublishOption {
 	// we don't use append because o1 could have extra capacity whose
 	// elements would be overwritten, which could cause inadvertent
 	// sharing (and race conditions) between concurrent calls

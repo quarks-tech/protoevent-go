@@ -8,9 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/grpclog"
+
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
-	"google.golang.org/grpc/grpclog"
 )
 
 var logger = grpclog.Component("protoevent")
@@ -154,6 +155,7 @@ func (s *Subscriber) GetServiceInfo() []ServiceInfo {
 	for name, service := range s.services {
 		si := ServiceInfo{
 			ServiceName: name,
+			Events:      make([]string, 0, len(service.events)),
 		}
 
 		for eName := range service.events {
