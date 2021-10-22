@@ -33,19 +33,15 @@ func defaultPublisherOptions() publisherOptions {
 
 type PublisherOption func(opts *publisherOptions)
 
-func WithCustomDataContentType(t string) PublishOption {
+func WithContentType(t string) PublishOption {
 	return func(m *event.Metadata) {
 		m.DataContentType = t
 	}
 }
 
-func WithJSONDataContentType() PublishOption {
-	return WithCustomDataContentType("application/cloudevents+json")
-}
-
-func WithJSONDataContentTypePublisher() PublisherOption {
+func WithPublisherContentType(t string) PublisherOption {
 	return func(opts *publisherOptions) {
-		opts.publishOptions = append(opts.publishOptions, WithJSONDataContentType())
+		opts.publishOptions = append(opts.publishOptions, WithContentType(t))
 	}
 }
 
