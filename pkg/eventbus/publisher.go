@@ -27,6 +27,12 @@ type publisherOptions struct {
 	interceptor       PublisherInterceptor
 }
 
+func defaultPublisherOptions() publisherOptions {
+	return publisherOptions{}
+}
+
+type PublisherOption func(opts *publisherOptions)
+
 func WithCustomDataContentType(t string) PublishOption {
 	return func(m *event.Metadata) {
 		m.DataContentType = t
@@ -37,11 +43,11 @@ func WithJSONDataContentType() PublishOption {
 	return WithCustomDataContentType("application/cloudevents+json")
 }
 
-func defaultPublisherOptions() publisherOptions {
-	return publisherOptions{}
+func WithJSONDataContentTypePublisher() PublisherOption {
+	return func(opts *publisherOptions) {
+		opts.publishOptions = append(opts.publishOptions, WithJSONDataContentType())
+	}
 }
-
-type PublisherOption func(opts *publisherOptions)
 
 type PublisherImpl struct {
 	sender  Sender
