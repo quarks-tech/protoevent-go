@@ -3,8 +3,9 @@ package cloudevent
 import (
 	"time"
 
-	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/streadway/amqp"
+
+	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
 type Formatter struct{}

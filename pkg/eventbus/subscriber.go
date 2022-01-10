@@ -8,13 +8,13 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/grpc/grpclog"
+	"github.com/sirupsen/logrus"
 
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
-var logger = grpclog.Component("protoevent")
+var logger = logrus.WithField("component", "protoevent")
 
 type Receiver interface {
 	Setup(ctx context.Context, serviceName string, infos ...ServiceInfo) error

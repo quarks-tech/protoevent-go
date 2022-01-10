@@ -26,7 +26,7 @@ func protocVersion(gen *protogen.Plugin) string {
 }
 
 func filterEventMessages(messages []*protogen.Message, extTypes *protoregistry.Types) ([]*protogen.Message, error) {
-	var result []*protogen.Message
+	result := make([]*protogen.Message, 0, len(messages))
 
 	for _, m := range messages {
 		options := m.Desc.Options().(*descriptorpb.MessageOptions)

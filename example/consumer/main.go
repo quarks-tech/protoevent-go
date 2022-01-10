@@ -8,14 +8,14 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/streadway/amqp"
+
 	"github.com/quarks-tech/protoevent-go/example/gen/example/books/v1"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
-	"github.com/streadway/amqp"
 )
 
-type Handler struct {
-}
+type Handler struct{}
 
 func (h Handler) HandleBookCreatedEvent(ctx context.Context, e *books.BookCreatedEvent) error {
 	fmt.Printf("%d\n", e.Id)

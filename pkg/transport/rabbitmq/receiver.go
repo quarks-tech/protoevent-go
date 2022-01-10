@@ -188,7 +188,6 @@ func (r *Receiver) receive(conn *connpool.Conn, ctx context.Context, processor e
 				case <-ctx.Done():
 					return nil
 				default:
-					delivery := delivery
 					md, data, err := r.options.messageParser.Parse(&delivery)
 					if err == nil {
 						err = processor(md, data)

@@ -10,8 +10,7 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/gochan"
 )
 
-type Handler struct {
-}
+type Handler struct{}
 
 func (h Handler) HandleBookCreatedEvent(_ context.Context, e *books.BookCreatedEvent) error {
 	fmt.Printf("Creating book with ID %d\n", e.Id)

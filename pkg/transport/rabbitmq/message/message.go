@@ -1,8 +1,9 @@
 package message
 
 import (
-	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/streadway/amqp"
+
+	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
 type Formatter interface {

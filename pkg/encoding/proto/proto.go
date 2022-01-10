@@ -3,7 +3,8 @@ package proto
 import (
 	"fmt"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 )
 

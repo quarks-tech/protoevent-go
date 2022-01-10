@@ -4,12 +4,13 @@ import (
 	"context"
 	"strings"
 
+	"github.com/streadway/amqp"
+
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message/cloudevent"
-	"github.com/streadway/amqp"
 )
 
 const (

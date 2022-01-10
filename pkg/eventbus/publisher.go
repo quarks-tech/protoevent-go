@@ -86,7 +86,7 @@ func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, 
 
 	contentSubtype, ok := event.ContentSubtype(md.DataContentType)
 	if !ok {
-		// @todo add error
+		return fmt.Errorf("unsupported content type: %s", md.DataContentType)
 	}
 
 	codec, err := encoding.GetCodec(contentSubtype)
@@ -96,11 +96,11 @@ func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, 
 
 	data, err := codec.Marshal(e)
 	if err != nil {
-		return fmt.Errorf(": %w", err)
+		return fmt.Errorf("marshal : %w", err)
 	}
 
 	if err = p.sender.Send(ctx, md, data); err != nil {
-		return fmt.Errorf(": %w", err)
+		return fmt.Errorf("send : %w", err)
 	}
 
 	return nil

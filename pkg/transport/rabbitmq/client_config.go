@@ -4,8 +4,9 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
 	"github.com/streadway/amqp"
+
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
 )
 
 type Limiter interface {
@@ -85,7 +86,7 @@ func (c *Config) complete() {
 		c.PoolTimeout = time.Second
 	}
 	if c.IdleTimeout == 0 {
-		//c.IdleTimeout = 5 * time.Minute
+		// c.IdleTimeout = 5 * time.Minute
 	}
 	if c.IdleCheckFrequency == 0 {
 		c.IdleCheckFrequency = time.Minute

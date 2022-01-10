@@ -2,6 +2,7 @@ package proto
 
 import (
 	json "github.com/json-iterator/go"
+
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 )
 

@@ -10,8 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
 	"github.com/streadway/amqp"
+
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/connpool"
 )
 
 type Command func(ctx context.Context, conn *connpool.Conn) error
@@ -69,7 +70,7 @@ func (c *Client) withConn(ctx context.Context, fn Command) error {
 		c.releaseConn(ctx, conn, err)
 	}()
 
-	done := ctx.Done() //nolint:ifshort
+	done := ctx.Done()
 
 	if done == nil {
 		err = fn(ctx, conn)

@@ -3,9 +3,10 @@ package cloudevent
 import (
 	"time"
 
+	"github.com/streadway/amqp"
+
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
-	"github.com/streadway/amqp"
 )
 
 type Parser struct{}

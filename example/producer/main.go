@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/streadway/amqp"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/quarks-tech/protoevent-go/example/gen/example/books/v1"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
-	"github.com/streadway/amqp"
-	"golang.org/x/sync/errgroup"
 )
 
 func main() {
@@ -43,7 +44,7 @@ func main() {
 	for i := int32(1); i <= 4; i++ {
 		i := i
 		eg.Go(func() error {
-			fmt.Println("start publisher: ", i)
+			fmt.Println("start publisher:", i)
 
 			for c := int32(1); c <= 1000; c++ {
 				err := booksPublisher.PublishBookCreatedEvent(context.Background(), &books.BookCreatedEvent{
@@ -54,7 +55,7 @@ func main() {
 				}
 			}
 
-			fmt.Println("stop publisher: ", i)
+			fmt.Println("stop publisher:", i)
 
 			return nil
 		})
