@@ -9,6 +9,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 )
 
 const messageSuffix = "Event"
@@ -30,12 +31,14 @@ func filterEventMessages(messages []*protogen.Message, extTypes *protoregistry.T
 
 	for _, m := range messages {
 		options := m.Desc.Options().(*descriptorpb.MessageOptions)
+		if options == nil {
+			continue
+		}
+
 		b, err := proto.Marshal(options)
 		if err != nil {
 			return nil, err
 		}
-
-		options.Reset()
 
 		err = proto.UnmarshalOptions{Resolver: extTypes}.Unmarshal(b, options)
 		if err != nil {
@@ -44,8 +47,6 @@ func filterEventMessages(messages []*protogen.Message, extTypes *protoregistry.T
 
 		var isEventMessage bool
 
-		// Use protobuf reflection to iterate over all the extension fields,
-		// looking for the ones that we are interested in.
 		options.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
 			if !fd.IsExtension() {
 				return true
@@ -84,4 +85,23 @@ func unexport(s string) string {
 
 func quote(s string) string {
 	return fmt.Sprintf(`"%s"`, s)
+}
+
+type Descriptors interface {
+	Messages() protoreflect.MessageDescriptors
+	Extensions() protoreflect.ExtensionDescriptors
+}
+
+func registerAllExtensions(extTypes *protoregistry.Types, descs Descriptors) error {
+	mds := descs.Messages()
+	for i := 0; i < mds.Len(); i++ {
+		registerAllExtensions(extTypes, mds.Get(i))
+	}
+	xds := descs.Extensions()
+	for i := 0; i < xds.Len(); i++ {
+		if err := extTypes.RegisterExtension(dynamicpb.NewExtensionType(xds.Get(i))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
