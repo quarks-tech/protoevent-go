@@ -1,0 +1,10 @@
+version: v1
+name: buf.build/quarks-tech/protoevent
+deps:
+  - buf.build/quarks-tech/protoevent:v0.1.0
+lint:
+  use:
+    - DEFAULT
+breaking:
+  use:
+    - FILE

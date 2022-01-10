@@ -2,6 +2,7 @@ package main
 
 import (
 	"google.golang.org/protobuf/compiler/protogen"
+	"google.golang.org/protobuf/reflect/protoregistry"
 )
 
 const (
@@ -10,11 +11,14 @@ const (
 	eventbusPackage = protogen.GoImportPath("github.com/quarks-tech/protoevent-go/pkg/eventbus")
 )
 
-func generateFile(gen *protogen.Plugin, f *protogen.File) {
-	messages := filterEventMessages(f.Messages)
+func generateFile(gen *protogen.Plugin, f *protogen.File, extTypes *protoregistry.Types) error {
+	messages, err := filterEventMessages(f.Messages, extTypes)
+	if err != nil {
+		return err
+	}
 
 	if len(messages) == 0 {
-		return
+		return nil
 	}
 
 	filename := f.GeneratedFilenamePrefix + ".pb.eventbus.go"
@@ -36,6 +40,8 @@ func generateFile(gen *protogen.Plugin, f *protogen.File) {
 	g.P()
 
 	genPubSub(g, f, messages)
+
+	return nil
 }
 
 func genPubSub(g *protogen.GeneratedFile, f *protogen.File, messages []*protogen.Message) {
