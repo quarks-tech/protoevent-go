@@ -181,6 +181,9 @@ func (s *Subscriber) Subscribe(ctx context.Context, r Receiver) error {
 }
 
 func (s *Subscriber) process(md *event.Metadata, data []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.opts.processTimeout)
+	defer cancel()
+
 	pos := strings.LastIndex(md.Type, ".")
 	service := md.Type[:pos]
 	eventName := md.Type[pos+1:]
@@ -213,8 +216,7 @@ func (s *Subscriber) process(md *event.Metadata, data []byte) error {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), s.opts.processTimeout)
-	defer cancel()
+	ctx = event.NewIncomingContext(ctx, md)
 
 	return ei.handler(ei.handlerImpl, md, ctx, df, s.opts.interceptor)
 }
