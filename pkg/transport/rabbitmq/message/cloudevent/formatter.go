@@ -21,9 +21,10 @@ func (Formatter) Format(meta *event.Metadata, data []byte) amqp.Publishing {
 
 func buildPublishingHeaders(meta *event.Metadata) amqp.Table {
 	return amqp.Table{
+		"cloudEvents:specversion": meta.SpecVersion,
 		"cloudEvents:time":        meta.Time.Format(time.RFC3339),
 		"cloudEvents:id":          meta.ID,
-		"cloudEvents:specversion": meta.SpecVersion,
 		"cloudEvents:source":      meta.Source,
+		"cloudEvents:subject":     meta.Subject,
 	}
 }

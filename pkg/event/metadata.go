@@ -9,6 +9,7 @@ type Metadata struct {
 	SpecVersion     string
 	Type            string
 	Source          string
+	Subject         string
 	ID              string
 	Time            time.Time
 	Extensions      map[string]string
