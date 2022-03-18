@@ -33,15 +33,25 @@ func defaultPublisherOptions() publisherOptions {
 
 type PublisherOption func(opts *publisherOptions)
 
-func WithContentType(t string) PublishOption {
+func WithEventContentType(t string) PublishOption {
 	return func(m *event.Metadata) {
 		m.DataContentType = t
 	}
 }
 
+func WithEventSource(src string) PublishOption {
+	return func(m *event.Metadata) {
+		m.Source = src
+	}
+}
+
 func WithPublisherContentType(t string) PublisherOption {
+	return WithDefaultPublishOptions(WithEventContentType(t))
+}
+
+func WithDefaultPublishOptions(pos ...PublishOption) PublisherOption {
 	return func(opts *publisherOptions) {
-		opts.publishOptions = append(opts.publishOptions, WithContentType(t))
+		opts.publishOptions = append(opts.publishOptions, pos...)
 	}
 }
 
