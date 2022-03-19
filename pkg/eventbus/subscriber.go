@@ -6,7 +6,6 @@ import (
 	"reflect"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -64,13 +63,10 @@ type EventHandlerRegistrar interface {
 type subscriberOptions struct {
 	interceptor       SubscriberInterceptor
 	chainInterceptors []SubscriberInterceptor
-	processTimeout    time.Duration
 }
 
 func defaultSubscriberOptions() subscriberOptions {
-	return subscriberOptions{
-		processTimeout: time.Minute * 5,
-	}
+	return subscriberOptions{}
 }
 
 type SubscriberOption func(opts *subscriberOptions)
@@ -181,7 +177,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, r Receiver) error {
 }
 
 func (s *Subscriber) process(md *event.Metadata, data []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.opts.processTimeout)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	pos := strings.LastIndex(md.Type, ".")
