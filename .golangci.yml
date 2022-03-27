@@ -1,0 +1,37 @@
+run:
+  concurrency: 2
+  timeout: 1m
+
+linters:
+  enable-all: true
+  disable:
+    - exhaustivestruct
+    - interfacer
+    - scopelint
+    - maligned
+    - golint
+    - wrapcheck
+    - contextcheck
+    - gomnd
+    - goimports
+    - varnamelen
+    - gochecknoinits
+    - testpackage
+    - gochecknoglobals
+
+linters-settings:
+  misspell:
+    locale: US
+  goimports:
+    local-prefixes: github.com/quarks-tech/protoevent-go
+  tagliatelle:
+    case:
+      use-field-name: true
+      rules:
+        json: snake
+  revive:
+    rules:
+    - name: context-as-argument
+      disabled: 'true'
+  lll:
+    line-length: 180

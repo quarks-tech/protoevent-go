@@ -3,11 +3,13 @@ package eventbus
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
-
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
+	"github.com/quarks-tech/protoevent-go/pkg/encoding/proto"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
@@ -33,15 +35,37 @@ func defaultPublisherOptions() publisherOptions {
 
 type PublisherOption func(opts *publisherOptions)
 
-func WithEventContentType(t string) PublishOption {
+func WithEventContentType(contentType string) PublishOption {
 	return func(m *event.Metadata) {
-		m.DataContentType = t
+		m.DataContentType = strings.ToLower(contentType)
 	}
 }
 
-func WithEventSource(src string) PublishOption {
+func WithEventSource(source string) PublishOption {
 	return func(m *event.Metadata) {
-		m.Source = src
+		m.Source = source
+	}
+}
+
+func WithEventSubject(subject string) PublishOption {
+	return func(m *event.Metadata) {
+		m.Subject = subject
+	}
+}
+
+func WithEventDataSchema(schema *url.URL) PublishOption {
+	return func(m *event.Metadata) {
+		m.DataSchema = schema
+	}
+}
+
+func WithEventExtension(name string, value interface{}) PublishOption {
+	return func(m *event.Metadata) {
+		if m.Extensions == nil {
+			m.Extensions = make(map[string]interface{})
+		}
+
+		m.Extensions[name] = value
 	}
 }
 
@@ -88,11 +112,13 @@ func (p *PublisherImpl) Publish(ctx context.Context, name string, event interfac
 }
 
 func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, opts ...PublishOption) error {
-	md := newMetadata(name)
+	md := event.NewMetadata(name)
 
 	for _, opt := range opts {
 		opt(md)
 	}
+
+	completeMetadata(md)
 
 	contentSubtype, ok := event.ContentSubtype(md.DataContentType)
 	if !ok {
@@ -131,12 +157,20 @@ func combine(o1, o2 []PublishOption) []PublishOption {
 	return ret
 }
 
-func newMetadata(t string) *event.Metadata {
-	return &event.Metadata{
-		SpecVersion:     "1.0",
-		Type:            t,
-		ID:              uuid.New().String(),
-		Time:            time.Now(),
-		DataContentType: "application/cloudevents+proto",
+func completeMetadata(md *event.Metadata) {
+	if md.DataContentType == "" {
+		md.DataContentType = event.ContentType(proto.Name)
+	}
+
+	if md.Source == "" {
+		md.Source = "protoevent-go"
+	}
+
+	if md.ID == "" {
+		md.ID = uuid.New().String()
+	}
+
+	if md.Time.IsZero() {
+		md.Time = time.Now()
 	}
 }

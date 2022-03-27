@@ -4,27 +4,29 @@ import (
 	"strings"
 )
 
-const baseContentType = "application/cloudevents"
+const (
+	baseContentType        = "application"
+	cloudeventsContentType = "application/cloudevents"
+)
 
 func ContentSubtype(contentType string) (string, bool) {
-	if contentType == baseContentType {
-		return "", true
-	}
-	if !strings.HasPrefix(contentType, baseContentType) {
+	if !strings.HasPrefix(contentType, cloudeventsContentType) {
+		if strings.HasPrefix(contentType, baseContentType) {
+			return contentType[len(baseContentType)+1:], true
+		}
+
 		return "", false
 	}
-	// guaranteed since != baseContentType and has baseContentType prefix
-	switch contentType[len(baseContentType)] {
+
+	// guaranteed since != cloudeventsContentType and has cloudeventsContentType prefix
+	switch contentType[len(cloudeventsContentType)] {
 	case '+', ';':
-		return contentType[len(baseContentType)+1:], true
+		return contentType[len(cloudeventsContentType)+1:], true
 	default:
 		return "", false
 	}
 }
 
 func ContentType(contentSubtype string) string {
-	if contentSubtype == "" {
-		return baseContentType
-	}
-	return baseContentType + "+" + contentSubtype
+	return baseContentType + "/" + contentSubtype
 }

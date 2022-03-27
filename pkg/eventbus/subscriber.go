@@ -7,17 +7,16 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/sirupsen/logrus"
-
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
-var logger = logrus.WithField("component", "protoevent")
-
 type Receiver interface {
-	Setup(ctx context.Context, serviceName string, infos ...ServiceInfo) error
 	Receive(ctx context.Context, p Processor) error
+}
+
+type Setuper interface {
+	Setup(ctx context.Context, serviceName string, info ...ServiceInfo) error
 }
 
 type Processor func(md *event.Metadata, data []byte) error
@@ -34,7 +33,7 @@ type ServiceDesc struct {
 	Metadata    string
 }
 
-func (sd ServiceDesc) findEvent(name string) (EventDesc, bool) {
+func (sd ServiceDesc) getEventDesc(name string) (EventDesc, bool) {
 	for _, ed := range sd.Events {
 		if ed.Name == name {
 			return ed, true
@@ -98,18 +97,19 @@ func NewSubscriber(name string, opts ...SubscriberOption) *Subscriber {
 }
 
 func (s *Subscriber) RegisterEventHandler(sd *ServiceDesc, eventName string, h interface{}) {
-	ed, ok := sd.findEvent(eventName)
+	ed, ok := sd.getEventDesc(eventName)
 	if !ok {
-		logger.Fatalf("find event")
+		panicf("event not found: %s", eventName)
 	}
 
 	if h != nil {
 		sht := reflect.TypeOf(ed.HandlerType).Elem()
 		ht := reflect.TypeOf(h)
 		if !ht.Implements(sht) {
-			logger.Fatalf("eventbus: Subscriber.RegisterSubscription found the handlerImpl of type %v that does not satisfy %v", ht, sht)
+			panicf("Subscriber.RegisterSubscription found the handlerImpl of type %v that does not satisfy %v", ht, sht)
 		}
 	}
+
 	s.register(sd, ed, h)
 }
 
@@ -117,10 +117,8 @@ func (s *Subscriber) register(sd *ServiceDesc, ed EventDesc, h interface{}) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
-	logger.Infof("protoevent: RegisterSubscription(%q)", "")
-
 	if s.serve {
-		logger.Fatalf("protoevent: Subscriber.RegisterEventHandler after Subscriber.Subscribe for %q", "")
+		panicf("Subscriber.RegisterEventHandler after Subscriber.Subscribe for %q", ed.Name)
 	}
 
 	if _, ok := s.services[sd.ServiceName]; !ok {
@@ -131,7 +129,7 @@ func (s *Subscriber) register(sd *ServiceDesc, ed EventDesc, h interface{}) {
 	}
 
 	if _, ok := s.services[sd.ServiceName].events[ed.Name]; ok {
-		logger.Fatalf("protoevent: Subscriber.RegisterEventHandler found duplicate service registration for %q", "")
+		panicf("Subscriber.RegisterEventHandler found duplicate service registration for %q", ed.Name)
 	}
 
 	s.services[sd.ServiceName].events[ed.Name] = &eventInfo{
@@ -148,9 +146,9 @@ type ServiceInfo struct {
 func (s *Subscriber) GetServiceInfo() []ServiceInfo {
 	sInfos := make([]ServiceInfo, 0, len(s.services))
 
-	for name, service := range s.services {
+	for sName, service := range s.services {
 		si := ServiceInfo{
-			ServiceName: name,
+			ServiceName: sName,
 			Events:      make([]string, 0, len(service.events)),
 		}
 
@@ -169,8 +167,10 @@ func (s *Subscriber) Subscribe(ctx context.Context, r Receiver) error {
 	s.serve = true
 	s.mux.Unlock()
 
-	if err := r.Setup(ctx, s.name, s.GetServiceInfo()...); err != nil {
-		return err
+	if setuper, ok := r.(Setuper); ok {
+		if err := setuper.Setup(ctx, s.name, s.GetServiceInfo()...); err != nil {
+			return err
+		}
 	}
 
 	return r.Receive(ctx, s.process)
@@ -215,4 +215,8 @@ func (s *Subscriber) process(md *event.Metadata, data []byte) error {
 	ctx = event.NewIncomingContext(ctx, md)
 
 	return ei.handler(ei.handlerImpl, md, ctx, df, s.opts.interceptor)
+}
+
+func panicf(format string, a ...interface{}) {
+	panic(fmt.Sprintf("eventbus: "+format, a...))
 }

@@ -9,7 +9,7 @@ import (
 )
 
 func SubscriberInterceptor(timeout time.Duration) eventbus.SubscriberInterceptor {
-	return func(ctx context.Context, md *event.Metadata, event interface{}, handler eventbus.Handler) (err error) {
+	return func(ctx context.Context, md *event.Metadata, event interface{}, handler eventbus.Handler) error {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
