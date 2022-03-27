@@ -2,6 +2,7 @@ package event
 
 import (
 	"context"
+	"net/url"
 	"time"
 )
 
@@ -12,8 +13,16 @@ type Metadata struct {
 	Subject         string
 	ID              string
 	Time            time.Time
-	Extensions      map[string]string
+	Extensions      map[string]interface{}
+	DataSchema      *url.URL
 	DataContentType string
+}
+
+func NewMetadata(t string) *Metadata {
+	return &Metadata{
+		SpecVersion: "1.0",
+		Type:        t,
+	}
 }
 
 type mdIncomingKey struct{}

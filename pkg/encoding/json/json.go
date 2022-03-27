@@ -1,4 +1,4 @@
-package proto
+package json
 
 import (
 	json "github.com/json-iterator/go"
