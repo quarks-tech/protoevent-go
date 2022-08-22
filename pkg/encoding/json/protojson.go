@@ -23,7 +23,7 @@ func (codec) Name() string {
 func (codec) Marshal(v interface{}) ([]byte, error) {
 	m, ok := v.(proto.Message)
 	if !ok {
-		return nil, fmt.Errorf("protojson: no support for marshal %T", v)
+		return nil, fmt.Errorf("failed to marshal, message is %T, want proto.Message", v)
 	}
 
 	return protojson.Marshal(m)
@@ -32,7 +32,7 @@ func (codec) Marshal(v interface{}) ([]byte, error) {
 func (codec) Unmarshal(data []byte, v interface{}) error {
 	m, ok := v.(proto.Message)
 	if !ok {
-		return fmt.Errorf("protojson: no support for unmarshal %T", v)
+		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
 	}
 
 	return protojson.Unmarshal(data, m)
