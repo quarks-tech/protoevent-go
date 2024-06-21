@@ -10,6 +10,8 @@ import (
 
 const Name = "json"
 
+var unmarshaler = protojson.UnmarshalOptions{DiscardUnknown: true}
+
 func init() {
 	encoding.RegisterCodec(codec{})
 }
@@ -35,5 +37,5 @@ func (codec) Unmarshal(data []byte, v interface{}) error {
 		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
 	}
 
-	return protojson.Unmarshal(data, m)
+	return unmarshaler.Unmarshal(data, m)
 }
