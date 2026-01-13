@@ -3,9 +3,10 @@ package json
 import (
 	"fmt"
 
-	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 )
 
 const Name = "json"

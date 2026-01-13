@@ -1,37 +1,28 @@
+version: "2"
 run:
   concurrency: 2
+  go: '1.25'
   timeout: 1m
 
 linters:
   enable-all: true
   disable:
-    - exhaustivestruct
-    - interfacer
-    - scopelint
-    - maligned
-    - golint
+    - depguard
     - wrapcheck
-    - contextcheck
-    - gomnd
-    - goimports
+    - mnd
     - varnamelen
-    - gochecknoinits
-    - testpackage
-    - gochecknoglobals
 
 linters-settings:
+  gci:
+    sections:
+      - standard
+      - default
+      - prefix(github.com/quarks-tech)
+      - prefix(github.com/quarks-tech/protoevent-go)
+      - blank
   misspell:
     locale: US
   goimports:
     local-prefixes: github.com/quarks-tech/protoevent-go
-  tagliatelle:
-    case:
-      use-field-name: true
-      rules:
-        json: snake
-  revive:
-    rules:
-    - name: context-as-argument
-      disabled: 'true'
   lll:
     line-length: 180
