@@ -455,22 +455,23 @@ func main() {
 ```sql
 CREATE TABLE outbox
 (
-  id          VARCHAR(36),                               -- UUID v7 (time-sortable)
+  id          BINARY(16),                                -- UUID v7 (time-sortable)
   metadata    JSON                             NOT NULL, -- CloudEvents metadata
   data        VARBINARY(your-max-message-size) NOT NULL, -- Serialized event payload
-  create_time DATETIME NOT NULL,
+  create_time DATETIME                         NOT NULL,
   sent_time   DATETIME,                                  -- NULL until relayed
   PRIMARY KEY (id, create_time)                          -- create_time required for partitioning
 )
-PARTITION BY HASH (HOUR(create_time)) PARTITIONS 24;    -- p0-p23 for each hour
+  PARTITION BY HASH(HOUR(create_time)) PARTITIONS 24; -- p0-p23 for each hour
 
 CREATE TABLE outbox_cursor
 (
-  cursor VARCHAR(36) NOT NULL       -- last processed message ID
+  cursor BINARY(16) NOT NULL -- last processed message ID
 );
 
 -- Optional: for monitoring/cleanup queries
-CREATE INDEX idx_outbox_sent_time ON outbox (sent_time);
+CREATE
+INDEX idx_outbox_sent_time ON outbox (sent_time);
 ```
 
 ### Typical Queries
