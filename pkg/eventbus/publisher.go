@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"github.com/quarks-tech/protoevent-go/pkg/encoding/proto"
 	"github.com/quarks-tech/protoevent-go/pkg/event"

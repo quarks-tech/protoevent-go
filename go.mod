@@ -1,10 +1,8 @@
 module github.com/quarks-tech/protoevent-go
 
-go 1.17
+go 1.25.3
 
 require (
-	github.com/google/go-cmp v0.5.9 // indirect
-	github.com/google/uuid v1.3.0
-	github.com/quarks-tech/protoevent v0.2.0
-	google.golang.org/protobuf v1.31.0
+	github.com/google/uuid v1.6.0
+	google.golang.org/protobuf v1.36.11
 )
