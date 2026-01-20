@@ -37,5 +37,5 @@ func (s *Sender) Send(ctx context.Context, metadata *event.Metadata, data []byte
 		CreateTime: time.Now(),
 	}
 
-	return s.store.CreateMessage(ctx, msg)
+	return s.store.CreateOutboxMessage(ctx, msg)
 }

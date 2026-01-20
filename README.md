@@ -229,7 +229,7 @@ receiver := parkinglot.NewReceiver(client,
 
 The outbox transport implements the transactional outbox pattern for reliable event publishing with database transactions.
 
-#### Implement Store Interface (TiDB)
+#### Implement Store Interfaces (TiDB)
 
 ```go
 package storage
@@ -246,43 +246,68 @@ import (
     "github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 )
 
-// Store implements outbox.Store for transactional operations
+// Store implements outbox.Store for transactional operations.
+// Embed this in your application store to use within transactions.
 type Store struct {
     db *sql.DB
 }
 
-func (s *Store) CreateMessage(ctx context.Context, msg *outbox.Message) error {
+func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) error {
     metadata, err := json.Marshal(msg.Metadata)
     if err != nil {
         return fmt.Errorf("marshal metadata: %w", err)
     }
 
     _, err = s.db.ExecContext(ctx, `
-        INSERT INTO outbox (id, metadata, data, create_time)
+        INSERT INTO outbox_messages (id, metadata, data, create_time)
         VALUES (?, ?, ?, ?)
     `, msg.ID, metadata, msg.Data, msg.CreateTime)
     return err
 }
 
-// RelayStore implements outbox.RelayStore for relay operations
+// RelayStore implements relay.Store for relay operations.
+// This is used by the relay to read and process outbox messages.
 type RelayStore struct {
-    db *sql.DB
+    db       *sql.DB
+    cursorID string // identifier for this relay instance
+}
+
+func NewRelayStore(db *sql.DB, cursorID string) *RelayStore {
+    return &RelayStore{db: db, cursorID: cursorID}
 }
 
 func (s *RelayStore) GetOutboxCursor(ctx context.Context) (string, error) {
-    var cursor sql.NullString
-    err := s.db.QueryRowContext(ctx, `
-        SELECT id FROM outbox WHERE sent_time IS NULL ORDER BY id LIMIT 1
-    `).Scan(&cursor)
+    // Try to get stored cursor first
+    var lastID sql.NullString
+    err := s.db.QueryRowContext(ctx, `SELECT last_id FROM outbox_cursor WHERE id = ?`, s.cursorID).Scan(&lastID)
+    if err == nil && lastID.Valid {
+        return lastID.String, nil
+    }
+    if err != nil && err != sql.ErrNoRows {
+        return "", err
+    }
+
+    // Fallback: get first pending message ID
+    err = s.db.QueryRowContext(ctx, `
+        SELECT id FROM outbox_messages WHERE sent_time IS NULL ORDER BY id LIMIT 1
+    `).Scan(&lastID)
     if err == sql.ErrNoRows {
         return "", nil
     }
-    return cursor.String, err
+    return lastID.String, err
+}
+
+func (s *RelayStore) SaveOutboxCursor(ctx context.Context, cursor string) error {
+    _, err := s.db.ExecContext(ctx, `
+        INSERT INTO outbox_cursor (id, last_id) VALUES (?, ?)
+        ON DUPLICATE KEY UPDATE last_id = VALUES(last_id)
+    `, s.cursorID, cursor)
+    return err
 }
 
 func (s *RelayStore) ListPendingOutboxMessages(ctx context.Context, cursor string, limit int) ([]*outbox.Message, error) {
     query := `
-        SELECT id, metadata, data, create_time FROM outbox
+        SELECT id, metadata, data, create_time FROM outbox_messages
         WHERE sent_time IS NULL AND id >= ?
         ORDER BY id LIMIT ?
     `
@@ -332,7 +357,7 @@ func (s *RelayStore) UpdateOutboxMessagesSentTime(ctx context.Context, t time.Ti
         args = append(args, id)
     }
 
-    query := fmt.Sprintf(`UPDATE outbox SET sent_time = ? WHERE id IN (%s)`, strings.Join(placeholders, ","))
+    query := fmt.Sprintf(`UPDATE outbox_messages SET sent_time = ? WHERE id IN (%s)`, strings.Join(placeholders, ","))
     _, err := s.db.ExecContext(ctx, query, args...)
     return err
 }
@@ -349,7 +374,7 @@ func (s *RelayStore) DeleteOutboxMessages(ctx context.Context, ids ...string) er
         args = append(args, id)
     }
 
-    query := fmt.Sprintf(`DELETE FROM outbox WHERE id IN (%s)`, strings.Join(placeholders, ","))
+    query := fmt.Sprintf(`DELETE FROM outbox_messages WHERE id IN (%s)`, strings.Join(placeholders, ","))
     _, err := s.db.ExecContext(ctx, query, args...)
     return err
 }
@@ -414,16 +439,26 @@ package main
 
 import (
     "context"
+    "database/sql"
     "log"
     "time"
 
     "github.com/quarks-tech/amqpx"
-    "github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+    "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
     "github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
+
+    "yourapp/storage" // your storage package with RelayStore implementation
 )
 
 func main() {
     ctx := context.Background()
+
+    // Database connection
+    db, err := sql.Open("mysql", "user:pass@tcp(localhost:4000)/mydb")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
 
     // RabbitMQ sender as downstream transport
     amqpClient := amqpx.NewClient(&amqpx.Config{
@@ -432,46 +467,268 @@ func main() {
         Username: "guest",
         Password: "guest",
     })
+    defer amqpClient.Close()
     sender := rabbitmq.NewSender(amqpClient)
 
+    // Create relay store
+    relayStore := storage.NewRelayStore(db, "outbox-relay")
+
     // Create relay
-    relay := outbox.NewRelay(relayStore, sender,
-        outbox.WithBatchSize(100),
-        outbox.WithPollInterval(time.Second),
-        outbox.WithBatchProcessing(),
-        outbox.WithProcessingMode(outbox.ProcessingModeDelete),
-        outbox.WithRetentionHours(2), // keep last 2 hours, truncate older partitions
+    r := relay.NewRelay(relayStore, sender,
+        relay.WithBatchSize(100),
+        relay.WithPollInterval(time.Second),
+        relay.WithBatchProcessing(),
+        relay.WithProcessingMode(relay.ProcessingModeDelete),
+        relay.WithRetentionHours(2), // keep last 2 hours, truncate older partitions
     )
 
     // Run relay (blocks until context cancelled)
-    if err := relay.Run(ctx); err != nil {
+    if err := r.Run(ctx); err != nil {
         log.Fatal(err)
     }
+}
+```
+
+#### Message Relay with Leader Election
+
+For running multiple relay instances with automatic failover, enable leader election.
+Only one instance will be active at a time, ensuring strict FIFO ordering.
+All pods use identical configuration - the leader is elected automatically via database lock.
+
+```go
+// Create relay with leader election
+// relayStore must implement relay.LeaderStore interface
+r := relay.NewRelay(relayStore, sender,
+    relay.WithBatchSize(100),
+    relay.WithPollInterval(time.Second),
+    relay.WithLeaderElection("outbox-relay"), // lock name
+    relay.WithLeaseTTL(30*time.Second),       // lock expires after 30s if not renewed
+)
+
+// Run relay (blocks until context cancelled)
+// Only the leader instance will process messages
+if err := r.Run(ctx); err != nil {
+    log.Fatal(err)
+}
+```
+
+#### Message Relay with Parking Lot (Retry + Dead Letter)
+
+For automatic retry with backoff and dead letter support, use the parkinglot relay.
+Failed messages are moved to a wait queue, then retried after backoff.
+After max retries, messages are moved to the parking lot for manual inspection.
+
+```go
+import "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/parkinglot"
+
+// Create relay with parking lot support
+// relayStore must implement parkinglot.Store interface
+r := parkinglot.NewRelay(relayStore, sender,
+    parkinglot.WithBatchSize(100),
+    parkinglot.WithPollInterval(time.Second),
+    parkinglot.WithMaxRetries(3),
+    parkinglot.WithMinRetryBackoff(15*time.Second),
+    parkinglot.WithLeaderElection("outbox-relay-pl"), // optional
+)
+
+if err := r.Run(ctx); err != nil {
+    log.Fatal(err)
+}
+```
+
+#### Implement Parking Lot Store (TiDB)
+
+```go
+func (s *RelayStore) IncrementOutboxMessageRetryCount(ctx context.Context, id string) (int, error) {
+    // Single statement - returns new count via subsequent query
+    _, err := s.db.ExecContext(ctx, `
+        UPDATE outbox_messages SET retry_count = retry_count + 1 WHERE id = ?
+    `, id)
+    if err != nil {
+        return 0, err
+    }
+
+    var count int
+    err = s.db.QueryRowContext(ctx, `SELECT retry_count FROM outbox_messages WHERE id = ?`, id).Scan(&count)
+    return count, err
+}
+
+func (s *RelayStore) GetOutboxMessageRetryCount(ctx context.Context, id string) (int, error) {
+    var count int
+    err := s.db.QueryRowContext(ctx, `SELECT retry_count FROM outbox_messages WHERE id = ?`, id).Scan(&count)
+    return count, err
+}
+
+func (s *RelayStore) MoveOutboxMessageToWait(ctx context.Context, id string, retryTime time.Time) error {
+    tx, err := s.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
+
+    _, err = tx.ExecContext(ctx, `
+        INSERT INTO outbox_messages_wait (id, metadata, data, create_time, retry_count, retry_time)
+        SELECT id, metadata, data, create_time, retry_count, ? FROM outbox_messages WHERE id = ?
+    `, retryTime, id)
+    if err != nil {
+        return err
+    }
+
+    _, err = tx.ExecContext(ctx, `DELETE FROM outbox_messages WHERE id = ?`, id)
+    if err != nil {
+        return err
+    }
+
+    return tx.Commit()
+}
+
+func (s *RelayStore) MoveWaitingMessagesToOutbox(ctx context.Context) (int, error) {
+    tx, err := s.db.BeginTx(ctx, nil)
+    if err != nil {
+        return 0, err
+    }
+    defer tx.Rollback()
+
+    result, err := tx.ExecContext(ctx, `
+        INSERT INTO outbox_messages (id, metadata, data, create_time, retry_count)
+        SELECT id, metadata, data, create_time, retry_count FROM outbox_messages_wait WHERE retry_time <= NOW()
+    `)
+    if err != nil {
+        return 0, err
+    }
+
+    _, err = tx.ExecContext(ctx, `DELETE FROM outbox_messages_wait WHERE retry_time <= NOW()`)
+    if err != nil {
+        return 0, err
+    }
+
+    if err := tx.Commit(); err != nil {
+        return 0, err
+    }
+
+    count, _ := result.RowsAffected()
+    return int(count), nil
+}
+
+func (s *RelayStore) MoveOutboxMessageToParkingLot(ctx context.Context, id string, reason string) error {
+    tx, err := s.db.BeginTx(ctx, nil)
+    if err != nil {
+        return err
+    }
+    defer tx.Rollback()
+
+    _, err = tx.ExecContext(ctx, `
+        INSERT INTO outbox_messages_pl (id, metadata, data, create_time, retry_count, reason, park_time)
+        SELECT id, metadata, data, create_time, retry_count, ?, NOW() FROM outbox_messages WHERE id = ?
+    `, reason, id)
+    if err != nil {
+        return err
+    }
+
+    _, err = tx.ExecContext(ctx, `DELETE FROM outbox_messages WHERE id = ?`, id)
+    if err != nil {
+        return err
+    }
+
+    return tx.Commit()
+}
+```
+
+#### Implement LeaderStore (TiDB)
+
+```go
+func (s *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, leaseTTL time.Duration) (bool, error) {
+    holderUUID, err := uuid.Parse(holderID)
+    if err != nil {
+        return false, fmt.Errorf("parse holder ID: %w", err)
+    }
+    holderBytes := holderUUID[:]
+    expireTime := time.Now().Add(leaseTTL)
+
+    // Try to acquire or renew the lock
+    _, err = s.db.ExecContext(ctx, `
+        INSERT INTO relay_lock (name, holder_id, expire_time) VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+            holder_id = CASE
+                WHEN expire_time < NOW() THEN VALUES(holder_id)
+                WHEN holder_id = VALUES(holder_id) THEN holder_id
+                ELSE holder_id
+            END,
+            expire_time = CASE
+                WHEN expire_time < NOW() THEN VALUES(expire_time)
+                WHEN holder_id = VALUES(holder_id) THEN VALUES(expire_time)
+                ELSE expire_time
+            END
+    `, name, holderBytes, expireTime)
+    if err != nil {
+        return false, fmt.Errorf("upsert lock: %w", err)
+    }
+
+    // Check if we hold the lock
+    var currentHolder []byte
+    err = s.db.QueryRowContext(ctx, `SELECT holder_id FROM relay_lock WHERE name = ?`, name).Scan(&currentHolder)
+    if err != nil {
+        return false, fmt.Errorf("check lock holder: %w", err)
+    }
+
+    return bytes.Equal(currentHolder, holderBytes), nil
 }
 ```
 
 ## SQL Schema for Outbox (TiDB)
 
 ```sql
-CREATE TABLE outbox
+CREATE TABLE outbox_messages
 (
   id          BINARY(16),                                -- UUID v7 (time-sortable)
   metadata    JSON                             NOT NULL, -- CloudEvents metadata
   data        VARBINARY(your-max-message-size) NOT NULL, -- Serialized event payload
   create_time DATETIME                         NOT NULL,
   sent_time   DATETIME,                                  -- NULL until relayed
+  retry_count INT DEFAULT 0,                             -- for parking lot relay
   PRIMARY KEY (id, create_time)                          -- create_time required for partitioning
 )
   PARTITION BY HASH(HOUR(create_time)) PARTITIONS 24; -- p0-p23 for each hour
 
 CREATE TABLE outbox_cursor
 (
-  cursor BINARY(16) NOT NULL -- last processed message ID
+  id      VARCHAR(255) PRIMARY KEY, -- cursor identifier (e.g., relay instance name)
+  last_id BINARY(16) NOT NULL       -- last processed message ID
+);
+
+-- For leader election (optional, required for WithLeaderElection)
+CREATE TABLE relay_lock
+(
+  name        VARCHAR(255) PRIMARY KEY, -- lock name (e.g., "outbox-relay")
+  holder_id   BINARY(16) NOT NULL,      -- UUID of the current leader
+  expire_time DATETIME NOT NULL         -- lock expires after this time
+);
+
+-- For parking lot relay (optional, required for parkinglot.Relay)
+CREATE TABLE outbox_messages_wait
+(
+  id          BINARY(16) PRIMARY KEY,
+  metadata    JSON                             NOT NULL,
+  data        VARBINARY(your-max-message-size) NOT NULL,
+  create_time DATETIME                         NOT NULL,
+  retry_count INT                              NOT NULL,
+  retry_time    DATETIME                         NOT NULL  -- when to retry
+);
+CREATE INDEX idx_outbox_messages_wait_retry_time ON outbox_messages_wait (retry_time);
+
+CREATE TABLE outbox_messages_pl
+(
+  id          BINARY(16) PRIMARY KEY,
+  metadata    JSON                             NOT NULL,
+  data        VARBINARY(your-max-message-size) NOT NULL,
+  create_time DATETIME                         NOT NULL,
+  retry_count INT                              NOT NULL,
+  reason      TEXT                             NOT NULL, -- why message was parked
+  park_time   DATETIME                         NOT NULL  -- when message was parked
 );
 
 -- Optional: for monitoring/cleanup queries
-CREATE
-INDEX idx_outbox_sent_time ON outbox (sent_time);
+CREATE INDEX idx_outbox_messages_sent_time ON outbox_messages (sent_time);
 ```
 
 ### Typical Queries
@@ -479,45 +736,65 @@ INDEX idx_outbox_sent_time ON outbox (sent_time);
 **Store (transactional):**
 ```sql
 -- CreateMessage
-INSERT INTO outbox (id, metadata, data, create_time) VALUES (?, ?, ?, ?);
+INSERT INTO outbox_messages (id, metadata, data, create_time) VALUES (?, ?, ?, ?);
 ```
 
 **RelayStore:**
 ```sql
--- GetOutboxCursor: get stored cursor or first pending message ID
-SELECT cursor FROM outbox_cursor LIMIT 1;
+-- GetOutboxCursor: get stored cursor for this relay instance
+SELECT last_id FROM outbox_cursor WHERE id = ?;
 -- fallback if no cursor stored:
-SELECT id FROM outbox WHERE sent_time IS NULL ORDER BY id LIMIT 1;
+SELECT id FROM outbox_messages WHERE sent_time IS NULL ORDER BY id LIMIT 1;
 
--- SaveOutboxCursor: persist cursor position (single row table)
-DELETE FROM outbox_cursor;
-INSERT INTO outbox_cursor (cursor) VALUES (?);
+-- SaveOutboxCursor: persist cursor position (upsert)
+INSERT INTO outbox_cursor (id, last_id) VALUES (?, ?)
+ON DUPLICATE KEY UPDATE last_id = VALUES(last_id);
 
 -- ListPendingOutboxMessages: paginate through pending messages
-SELECT id, metadata, data, create_time, sent_time FROM outbox WHERE id >= ? AND sent_time IS NULL ORDER BY id LIMIT ?;
+SELECT id, metadata, data, create_time, sent_time FROM outbox_messages WHERE id >= ? AND sent_time IS NULL ORDER BY id LIMIT ?;
 
 -- UpdateOutboxMessagesSentTime: mark as sent (ProcessingModeMarkSent)
-UPDATE outbox SET sent_time = ? WHERE id IN (?...);
+UPDATE outbox_messages SET sent_time = ? WHERE id IN (?...);
 
 -- DeleteOutboxMessages: remove after sending (ProcessingModeDelete)
-DELETE FROM outbox WHERE id IN (?...);
+DELETE FROM outbox_messages WHERE id IN (?...);
 
 -- TruncateOutboxPartitions: fast cleanup of hourly partitions (p0-p23)
-ALTER TABLE outbox TRUNCATE PARTITION p0, p1, p2;  -- partitions passed as arguments
+ALTER TABLE outbox_messages TRUNCATE PARTITION p0, p1, p2;  -- partitions passed as arguments
+```
+
+**LeaderStore (optional):**
+```sql
+-- TryAcquireLeaderLock: acquire or renew leader lock
+INSERT INTO relay_lock (name, holder_id, expire_time) VALUES (?, ?, ?)
+ON DUPLICATE KEY UPDATE
+    holder_id = CASE
+        WHEN expire_time < NOW() THEN VALUES(holder_id)
+        WHEN holder_id = VALUES(holder_id) THEN holder_id
+        ELSE holder_id
+    END,
+    expire_time = CASE
+        WHEN expire_time < NOW() THEN VALUES(expire_time)
+        WHEN holder_id = VALUES(holder_id) THEN VALUES(expire_time)
+        ELSE expire_time
+    END;
+
+-- Check current lock holder
+SELECT holder_id FROM relay_lock WHERE name = ?;
 ```
 
 **Operational (optional):**
 ```sql
 -- Count pending messages
-SELECT COUNT(*) FROM outbox WHERE sent_time IS NULL;
+SELECT COUNT(*) FROM outbox_messages WHERE sent_time IS NULL;
 
 -- Oldest pending message age
-SELECT MIN(create_time) FROM outbox WHERE sent_time IS NULL;
+SELECT MIN(create_time) FROM outbox_messages WHERE sent_time IS NULL;
 
 -- Truncate old partitions (instant cleanup)
 -- Example: if current hour is 11 and retention is 2 hours, truncate p0-p8
 -- Keep p9, p10, p11 (current hour and 2 hours back)
-ALTER TABLE outbox TRUNCATE PARTITION p0, p1, p2, p3, p4, p5, p6, p7, p8;
+ALTER TABLE outbox_messages TRUNCATE PARTITION p0, p1, p2, p3, p4, p5, p6, p7, p8;
 ```
 
 ## License
