@@ -701,7 +701,7 @@ CREATE TABLE relay_lock
 (
   name        VARCHAR(255) PRIMARY KEY, -- lock name (e.g., "outbox-relay")
   holder_id   BINARY(16) NOT NULL,      -- UUID of the current leader
-  expire_time DATETIME NOT NULL         -- lock expires after this time
+  expire_time DATETIME   NOT NULL       -- lock expires after this time
 );
 
 -- For parking lot relay (optional, required for parkinglot.Relay)
@@ -712,9 +712,10 @@ CREATE TABLE outbox_messages_wait
   data        VARBINARY(your-max-message-size) NOT NULL,
   create_time DATETIME                         NOT NULL,
   retry_count INT                              NOT NULL,
-  retry_time    DATETIME                         NOT NULL  -- when to retry
+  retry_time  DATETIME                         NOT NULL -- when to retry
 );
-CREATE INDEX idx_outbox_messages_wait_retry_time ON outbox_messages_wait (retry_time);
+CREATE
+INDEX idx_outbox_messages_wait_retry_time ON outbox_messages_wait (retry_time);
 
 CREATE TABLE outbox_messages_pl
 (
@@ -723,12 +724,13 @@ CREATE TABLE outbox_messages_pl
   data        VARBINARY(your-max-message-size) NOT NULL,
   create_time DATETIME                         NOT NULL,
   retry_count INT                              NOT NULL,
-  reason      TEXT                             NOT NULL, -- why message was parked
+  reason      VARCHAR(256)                     NOT NULL, -- why message was parked
   park_time   DATETIME                         NOT NULL  -- when message was parked
 );
 
 -- Optional: for monitoring/cleanup queries
-CREATE INDEX idx_outbox_messages_sent_time ON outbox_messages (sent_time);
+CREATE
+INDEX idx_outbox_messages_sent_time ON outbox_messages (sent_time);
 ```
 
 ### Typical Queries
