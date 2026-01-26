@@ -305,13 +305,17 @@ func (s *RelayStore) SaveOutboxCursor(ctx context.Context, cursor string) error 
     return err
 }
 
-func (s *RelayStore) ListPendingOutboxMessages(ctx context.Context, cursor string, limit int) ([]*outbox.Message, error) {
+func (s *RelayStore) ListPendingOutboxMessages(ctx context.Context, cursor string, limit int, visibilityDelay time.Duration) ([]*outbox.Message, error) {
+    // The visibility delay prevents race conditions when multiple app instances
+    // generate UUID v7 IDs concurrently: a message with an earlier UUID may be
+    // inserted after one with a later UUID. The delay ensures all concurrent
+    // writes have completed before processing.
     query := `
         SELECT id, metadata, data, create_time FROM outbox_messages
-        WHERE sent_time IS NULL AND id >= ?
+        WHERE sent_time IS NULL AND id >= ? AND create_time < DATE_SUB(NOW(), INTERVAL ? SECOND)
         ORDER BY id LIMIT ?
     `
-    rows, err := s.db.QueryContext(ctx, query, cursor, limit)
+    rows, err := s.db.QueryContext(ctx, query, cursor, int(visibilityDelay.Seconds()), limit)
     if err != nil {
         return nil, err
     }
@@ -479,7 +483,8 @@ func main() {
         relay.WithPollInterval(time.Second),
         relay.WithBatchProcessing(),
         relay.WithProcessingMode(relay.ProcessingModeDelete),
-        relay.WithRetentionHours(2), // keep last 2 hours, truncate older partitions
+        relay.WithRetentionHours(2),           // keep last 2 hours, truncate older partitions
+        relay.WithVisibilityDelay(3*time.Second), // wait 3s before processing (handles UUID v7 ordering)
     )
 
     // Run relay (blocks until context cancelled)
@@ -488,6 +493,31 @@ func main() {
     }
 }
 ```
+
+#### Visibility Delay (UUID v7 Ordering)
+
+The relay uses a **visibility delay** (default: 3 seconds) to handle race conditions with UUID v7 ordering
+across multiple application instances. Here's the problem it solves:
+
+1. Instance A generates UUID v7 at T1: `019bf596-b3cd-...` (earlier UUID)
+2. Instance B generates UUID v7 at T1: `019bf596-b3d7-...` (later UUID)
+3. Instance B's INSERT completes first, relay processes it, cursor advances
+4. Instance A's INSERT completes later but has an earlier UUID - **would be skipped!**
+
+The visibility delay ensures messages are only processed after `create_time < NOW() - delay`,
+giving all concurrent writes time to complete before the relay processes them.
+
+```go
+// Configure visibility delay (default is 3 seconds)
+r := relay.NewRelay(relayStore, sender,
+    relay.WithVisibilityDelay(5*time.Second), // increase for high-latency environments
+)
+```
+
+**Recommendations:**
+- Default 3 seconds is sufficient for most deployments
+- Increase to 5-10 seconds for high-latency or geo-distributed environments
+- Set to 0 to disable (not recommended in distributed environments)
 
 #### Message Relay with Leader Election
 
@@ -528,6 +558,7 @@ r := parkinglot.NewRelay(relayStore, sender,
     parkinglot.WithPollInterval(time.Second),
     parkinglot.WithMaxRetries(3),
     parkinglot.WithMinRetryBackoff(15*time.Second),
+    parkinglot.WithVisibilityDelay(3*time.Second),    // wait 3s before processing
     parkinglot.WithLeaderElection("outbox-relay-pl"), // optional
 )
 
@@ -582,32 +613,39 @@ func (s *RelayStore) MoveOutboxMessageToWait(ctx context.Context, id string, ret
     return tx.Commit()
 }
 
-func (s *RelayStore) MoveWaitingMessagesToOutbox(ctx context.Context) (int, error) {
+func (s *RelayStore) MoveWaitingMessagesToOutbox(ctx context.Context) (int, string, error) {
     tx, err := s.db.BeginTx(ctx, nil)
     if err != nil {
-        return 0, err
+        return 0, "", err
     }
     defer tx.Rollback()
+
+    // Get minimum ID before moving (for cursor reset)
+    var minID sql.NullString
+    err = tx.QueryRowContext(ctx, `SELECT MIN(id) FROM outbox_messages_wait WHERE retry_time <= NOW()`).Scan(&minID)
+    if err != nil {
+        return 0, "", err
+    }
 
     result, err := tx.ExecContext(ctx, `
         INSERT INTO outbox_messages (id, metadata, data, create_time, retry_count)
         SELECT id, metadata, data, create_time, retry_count FROM outbox_messages_wait WHERE retry_time <= NOW()
     `)
     if err != nil {
-        return 0, err
+        return 0, "", err
     }
 
     _, err = tx.ExecContext(ctx, `DELETE FROM outbox_messages_wait WHERE retry_time <= NOW()`)
     if err != nil {
-        return 0, err
+        return 0, "", err
     }
 
     if err := tx.Commit(); err != nil {
-        return 0, err
+        return 0, "", err
     }
 
     count, _ := result.RowsAffected()
-    return int(count), nil
+    return int(count), minID.String, nil
 }
 
 func (s *RelayStore) MoveOutboxMessageToParkingLot(ctx context.Context, id string, reason string) error {
@@ -753,7 +791,12 @@ INSERT INTO outbox_cursor (id, last_id) VALUES (?, ?)
 ON DUPLICATE KEY UPDATE last_id = VALUES(last_id);
 
 -- ListPendingOutboxMessages: paginate through pending messages
-SELECT id, metadata, data, create_time, sent_time FROM outbox_messages WHERE id >= ? AND sent_time IS NULL ORDER BY id LIMIT ?;
+-- The visibility delay (e.g., 3 seconds) prevents race conditions when multiple app instances
+-- generate UUID v7 IDs concurrently: a message with an earlier UUID may be inserted after
+-- one with a later UUID. The delay ensures all concurrent writes have completed.
+SELECT id, metadata, data, create_time, sent_time FROM outbox_messages
+WHERE id >= ? AND sent_time IS NULL AND create_time < DATE_SUB(NOW(), INTERVAL 3 SECOND)
+ORDER BY id LIMIT ?;
 
 -- UpdateOutboxMessagesSentTime: mark as sent (ProcessingModeMarkSent)
 UPDATE outbox_messages SET sent_time = ? WHERE id IN (?...);

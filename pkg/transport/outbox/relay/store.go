@@ -21,7 +21,13 @@ type Store interface {
 	// starting from the given cursor ID (or from the beginning if cursor is empty),
 	// ordered by id (FIFO). Returns up to 'limit' messages.
 	// Uses UUID v7 IDs which are time-sortable.
-	ListPendingOutboxMessages(ctx context.Context, cursor string, limit int) ([]*outbox.Message, error)
+	//
+	// The visibilityDelay parameter filters out messages created within that duration.
+	// This prevents race conditions when multiple writers generate UUID v7 IDs concurrently:
+	// a message with an earlier UUID may be inserted after one with a later UUID.
+	// The delay ensures all concurrent writes have completed before processing.
+	// Pass 0 to disable the visibility delay (not recommended in distributed environments).
+	ListPendingOutboxMessages(ctx context.Context, cursor string, limit int, visibilityDelay time.Duration) ([]*outbox.Message, error)
 
 	// UpdateOutboxMessagesSentTime updates the sent_time timestamp for the given message IDs.
 	// Used when ProcessingModeMarkSent is configured.

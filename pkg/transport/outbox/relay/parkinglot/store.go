@@ -17,8 +17,10 @@ type Store interface {
 	MoveOutboxMessageToWait(ctx context.Context, id string, retryTime time.Time) error
 
 	// MoveWaitingMessagesToOutbox moves messages from outbox_messages_wait back to outbox_messages
-	// where retry_time <= now. Returns the number of messages moved.
-	MoveWaitingMessagesToOutbox(ctx context.Context) (int, error)
+	// where retry_time <= now. Returns the number of messages moved and the minimum ID of moved messages.
+	// The relay uses minID to reset the cursor so moved messages are picked up again.
+	// Returns empty minID if no messages were moved.
+	MoveWaitingMessagesToOutbox(ctx context.Context) (count int, minID string, err error)
 
 	// MoveOutboxMessageToParkingLot moves a message from outbox_messages to outbox_messages_pl.
 	// Used when max retries exceeded.

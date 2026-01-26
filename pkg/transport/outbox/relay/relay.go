@@ -33,6 +33,7 @@ type options struct {
 	processingMode  ProcessingMode
 	batchProcessing bool
 	retentionHours  int
+	visibilityDelay time.Duration
 	logger          Logger
 	errorHandler    func(ctx context.Context, msg *outbox.Message, err error)
 
@@ -47,7 +48,8 @@ func defaultOptions() options {
 		pollInterval:    time.Second,
 		processingMode:  ProcessingModeMarkSent,
 		batchProcessing: false,
-		retentionHours:  0, // disabled by default
+		retentionHours:  0,               // disabled by default
+		visibilityDelay: 3 * time.Second, // default 3 seconds to handle concurrent UUID v7 generation
 		leaseTTL:        30 * time.Second,
 	}
 }
@@ -107,6 +109,17 @@ func WithLogger(l Logger) Option {
 func WithErrorHandler(handler func(ctx context.Context, msg *outbox.Message, err error)) Option {
 	return func(o *options) {
 		o.errorHandler = handler
+	}
+}
+
+// WithVisibilityDelay sets the delay before messages become visible for processing.
+// This prevents race conditions when multiple application instances generate UUID v7 IDs
+// concurrently: a message with an earlier UUID may be inserted after one with a later UUID.
+// The delay ensures all concurrent writes have completed before processing.
+// Default is 3 seconds. Set to 0 to disable (not recommended in distributed environments).
+func WithVisibilityDelay(d time.Duration) Option {
+	return func(o *options) {
+		o.visibilityDelay = d
 	}
 }
 
@@ -241,7 +254,7 @@ func (r *Relay) tryAcquireLeadership(ctx context.Context) (bool, error) {
 }
 
 func (r *Relay) processBatch(ctx context.Context, cursor string) (string, error) {
-	messages, err := r.store.ListPendingOutboxMessages(ctx, cursor, r.options.batchSize)
+	messages, err := r.store.ListPendingOutboxMessages(ctx, cursor, r.options.batchSize, r.options.visibilityDelay)
 	if err != nil {
 		return cursor, fmt.Errorf("list pending messages: %w", err)
 	}
