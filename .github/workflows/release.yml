@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+
+env:
+  # The workflow will use max(MIN_VERSION, latest_tag) and increment patch from there.
+  MIN_VERSION: "v0.3.1"
+
+jobs:
+  tag:
+    runs-on: self-hosted
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest version
+        id: version
+        run: |
+          # Get latest tag for main module (without submodule prefix)
+          LATEST=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+
+          # Use v0.0.0 if no tags exist
+          if [ -z "$LATEST" ]; then
+            LATEST="v0.0.0"
+          fi
+
+          MIN="${{ env.MIN_VERSION }}"
+
+          # Function to convert version to comparable number (v1.2.3 -> 1002003)
+          version_to_num() {
+            echo "$1" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d", $1, $2, $3 }'
+          }
+
+          LATEST_NUM=$(version_to_num "$LATEST")
+          MIN_NUM=$(version_to_num "$MIN")
+
+          # Use the higher version as base
+          if [ "$MIN_NUM" -gt "$LATEST_NUM" ]; then
+            BASE="$MIN"
+            echo "Using MIN_VERSION ($MIN) as base (higher than latest tag $LATEST)"
+          else
+            BASE="$LATEST"
+            echo "Using latest tag ($LATEST) as base (higher than or equal to MIN_VERSION $MIN)"
+          fi
+
+          # Increment patch version
+          MAJOR=$(echo $BASE | sed 's/^v//' | cut -d. -f1)
+          MINOR=$(echo $BASE | cut -d. -f2)
+          PATCH=$(echo $BASE | cut -d. -f3)
+          NEXT="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+
+          echo "version=$NEXT" >> $GITHUB_OUTPUT
+          echo "Next version: $NEXT"
+
+      - name: Create tag
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Tag main module
+          git tag "$VERSION"
+          echo "Created tag: $VERSION"
+
+      - name: Push tags
+        run: git push --tags
