@@ -7,7 +7,7 @@ on:
 
 env:
   # The workflow will use max(MIN_VERSION, latest_tag) and increment patch from there.
-  MIN_VERSION: "v0.3.1"
+  MIN_VERSION: "v0.4.0"
 
 jobs:
   tag:

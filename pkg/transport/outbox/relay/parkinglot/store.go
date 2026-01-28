@@ -8,30 +8,42 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
-// Store defines operations for parking lot functionality with wait queue support.
+// Store defines operations for the parking lot relay with four tables:
+//   - outbox_pending: messages waiting to be sent
+//   - outbox_wait: messages in retry backoff
+//   - outbox_parking_lot: permanently failed messages
+//   - outbox_completed: successfully sent messages (optional, for audit)
+//
+// This eliminates cursor management and prevents race conditions with UUID v7 ordering.
+//
+// Note: Method signatures are intentionally consistent with relay.Store for batch operations.
+// The retry count is obtained from Message.RetryCount (populated by ListPendingMessages).
 type Store interface {
-	relay.Store
+	// ListPendingMessages retrieves messages from the pending table,
+	// ordered by id (FIFO). Returns up to 'limit' messages.
+	// Must populate Message.RetryCount for retry tracking.
+	ListPendingMessages(ctx context.Context, limit int) ([]*outbox.Message, error)
 
-	// MoveOutboxMessageToWait moves a message from outbox_messages to outbox_messages_wait.
-	// The message will be available for retry after the specified wait duration.
-	MoveOutboxMessageToWait(ctx context.Context, id string, retryTime time.Time) error
+	// DeletePendingMessages removes messages from the pending table.
+	// Called after messages are successfully sent (when no audit trail is needed).
+	DeletePendingMessages(ctx context.Context, ids ...string) error
 
-	// MoveWaitingMessagesToOutbox moves messages from outbox_messages_wait back to outbox_messages
-	// where retry_time <= now. Returns the number of messages moved and the minimum ID of moved messages.
-	// The relay uses minID to reset the cursor so moved messages are picked up again.
-	// Returns empty minID if no messages were moved.
-	MoveWaitingMessagesToOutbox(ctx context.Context) (count int, minID string, err error)
+	// MovePendingToCompleted moves messages from pending to completed table.
+	// Used when audit trail is needed. The completed table stores sent_time.
+	MovePendingToCompleted(ctx context.Context, sentTime time.Time, ids ...string) error
 
-	// MoveOutboxMessageToParkingLot moves a message from outbox_messages to outbox_messages_pl.
-	// Used when max retries exceeded.
-	MoveOutboxMessageToParkingLot(ctx context.Context, id, reason string) error
+	// MovePendingToWait moves a message from pending to wait table for retry.
+	// The message will be moved back to pending after retryTime passes.
+	// The retryCount should be stored in the wait table for tracking.
+	MovePendingToWait(ctx context.Context, id string, retryTime time.Time, retryCount int) error
 
-	// GetOutboxMessageRetryCount returns the current retry count for a message.
-	GetOutboxMessageRetryCount(ctx context.Context, id string) (int, error)
+	// MoveWaitToPending moves messages from wait table back to pending table
+	// where retry_time <= now.
+	MoveWaitToPending(ctx context.Context) error
 
-	// IncrementOutboxMessageRetryCount increments the retry count in message metadata.
-	// Returns the new retry count.
-	IncrementOutboxMessageRetryCount(ctx context.Context, id string) (int, error)
+	// MovePendingToParkingLot moves a message from pending to parking lot table.
+	// Used when max retries are exceeded. The reason describes why it was parked.
+	MovePendingToParkingLot(ctx context.Context, id, reason string) error
 }
 
 // LeaderStore combines Store with leader election support.
@@ -39,12 +51,3 @@ type LeaderStore interface {
 	Store
 	relay.LeaderStore
 }
-
-// PartitionedStore combines Store with partition truncation support.
-type PartitionedStore interface {
-	Store
-	relay.PartitionedStore
-}
-
-// Message re-exports outbox.Message for convenience.
-type Message = outbox.Message

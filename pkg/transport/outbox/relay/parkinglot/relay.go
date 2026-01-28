@@ -12,98 +12,73 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
-// Logger interface for relay error logging.
-type Logger interface {
-	Errorf(format string, args ...any)
+// ParkingLotOptions extends relay.Options with retry-specific configuration.
+type ParkingLotOptions struct {
+	relay.Options
+	MaxRetries      int
+	MinRetryBackoff time.Duration
 }
 
-type options struct {
-	batchSize       int
-	pollInterval    time.Duration
-	maxRetries      int
-	minRetryBackoff time.Duration
-	retentionHours  int
-	visibilityDelay time.Duration
-	logger          Logger
-	errorHandler    func(ctx context.Context, msg *outbox.Message, err error)
-
-	// Leader election options
-	leaderLockName string
-	leaseTTL       time.Duration
-}
-
-func defaultOptions() options {
-	return options{
-		batchSize:       100,
-		pollInterval:    time.Second,
-		maxRetries:      3,
-		minRetryBackoff: 15 * time.Second,
-		retentionHours:  0,
-		visibilityDelay: 3 * time.Second, // default 3 seconds to handle concurrent UUID v7 generation
-		leaseTTL:        30 * time.Second,
+// DefaultParkingLotOptions returns the default parking lot relay configuration.
+func DefaultParkingLotOptions() ParkingLotOptions {
+	return ParkingLotOptions{
+		Options:         relay.DefaultOptions(),
+		MaxRetries:      3,
+		MinRetryBackoff: 15 * time.Second,
 	}
 }
 
-// Option configures the Relay.
-type Option func(*options)
+// Option configures parking lot relay options.
+type Option func(*ParkingLotOptions)
 
 // WithBatchSize sets the maximum number of messages to fetch per poll.
 func WithBatchSize(size int) Option {
-	return func(o *options) {
-		o.batchSize = size
+	return func(o *ParkingLotOptions) {
+		o.BatchSize = size
 	}
 }
 
-// WithPollInterval sets the interval between polling the outbox table.
+// WithPollInterval sets the interval between polling the pending table.
 func WithPollInterval(d time.Duration) Option {
-	return func(o *options) {
-		o.pollInterval = d
+	return func(o *ParkingLotOptions) {
+		o.PollInterval = d
+	}
+}
+
+// WithProcessingMode sets how messages are handled after successful relay.
+// relay.ProcessingModeDelete removes messages from pending table (default).
+// relay.ProcessingModeMove moves messages to completed table for audit trail.
+func WithProcessingMode(mode relay.ProcessingMode) Option {
+	return func(o *ParkingLotOptions) {
+		o.ProcessingMode = mode
 	}
 }
 
 // WithMaxRetries sets the maximum number of retry attempts before moving a message to parking lot.
 func WithMaxRetries(maxRetries int) Option {
-	return func(o *options) {
-		o.maxRetries = maxRetries
+	return func(o *ParkingLotOptions) {
+		o.MaxRetries = maxRetries
 	}
 }
 
 // WithMinRetryBackoff sets the minimum wait time before retrying a failed message.
 func WithMinRetryBackoff(d time.Duration) Option {
-	return func(o *options) {
-		o.minRetryBackoff = d
-	}
-}
-
-// WithRetentionHours sets the number of hours to retain messages before truncating partitions.
-func WithRetentionHours(hours int) Option {
-	return func(o *options) {
-		o.retentionHours = hours
+	return func(o *ParkingLotOptions) {
+		o.MinRetryBackoff = d
 	}
 }
 
 // WithLogger sets the logger for relay errors.
-func WithLogger(l Logger) Option {
-	return func(o *options) {
-		o.logger = l
+func WithLogger(l relay.Logger) Option {
+	return func(o *ParkingLotOptions) {
+		o.Logger = l
 	}
 }
 
 // WithErrorHandler sets a custom error handler for failed message sends.
 func WithErrorHandler(handler func(ctx context.Context, msg *outbox.Message, err error)) Option {
-	return func(o *options) {
-		o.errorHandler = handler
-	}
-}
-
-// WithVisibilityDelay sets the delay before messages become visible for processing.
-// This prevents race conditions when multiple application instances generate UUID v7 IDs
-// concurrently: a message with an earlier UUID may be inserted after one with a later UUID.
-// The delay ensures all concurrent writes have completed before processing.
-// Default is 3 seconds. Set to 0 to disable (not recommended in distributed environments).
-func WithVisibilityDelay(d time.Duration) Option {
-	return func(o *options) {
-		o.visibilityDelay = d
+	return func(o *ParkingLotOptions) {
+		o.ErrorHandler = handler
 	}
 }
 
@@ -111,32 +86,40 @@ func WithVisibilityDelay(d time.Duration) Option {
 // Only one instance will be active at a time. Requires the store to implement LeaderStore.
 // The lockName should be unique per relay group (e.g., "outbox-relay-parkinglot").
 func WithLeaderElection(lockName string) Option {
-	return func(o *options) {
-		o.leaderLockName = lockName
+	return func(o *ParkingLotOptions) {
+		o.LeaderLockName = lockName
 	}
 }
 
 // WithLeaseTTL sets the leader lock lease duration.
 // The lock expires after this duration if not renewed. Default is 30 seconds.
 func WithLeaseTTL(ttl time.Duration) Option {
-	return func(o *options) {
-		o.leaseTTL = ttl
+	return func(o *ParkingLotOptions) {
+		o.LeaseTTL = ttl
 	}
 }
 
 // Relay processes outbox messages with retry and parking lot support.
-// Failed messages are moved to a wait queue and retried after backoff.
+// Failed messages are moved to a wait table and retried after backoff.
 // After max retries, messages are moved to the parking lot.
+//
+// The relay uses a four-table approach:
+//   - Pending table: messages waiting to be sent
+//   - Wait table: messages in retry backoff
+//   - Parking lot table: permanently failed messages
+//   - Completed table: successfully sent messages (optional, for audit)
+//
+// This eliminates cursor management and prevents race conditions with UUID v7 ordering.
 type Relay struct {
 	store    Store
 	sender   eventbus.Sender
-	options  options
+	options  ParkingLotOptions
 	holderID string
 }
 
 // NewRelay creates a new message relay with parking lot support.
 func NewRelay(store Store, sender eventbus.Sender, opts ...Option) *Relay {
-	options := defaultOptions()
+	options := DefaultParkingLotOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -151,15 +134,8 @@ func NewRelay(store Store, sender eventbus.Sender, opts ...Option) *Relay {
 
 // Run starts the relay loop with parking lot support.
 func (r *Relay) Run(ctx context.Context) error {
-	cursor, err := r.store.GetOutboxCursor(ctx)
-	if err != nil {
-		return fmt.Errorf("get initial cursor: %w", err)
-	}
-
-	ticker := time.NewTicker(r.options.pollInterval)
+	ticker := time.NewTicker(r.options.PollInterval)
 	defer ticker.Stop()
-
-	lastTruncateHour := -1
 
 	for {
 		select {
@@ -167,11 +143,11 @@ func (r *Relay) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			// If leader election is enabled, try to acquire/renew the lock
-			if r.options.leaderLockName != "" {
+			if r.options.LeaderLockName != "" {
 				isLeader, err := r.tryAcquireLeadership(ctx)
 				if err != nil {
-					if r.options.logger != nil {
-						r.options.logger.Errorf("leader election failed: %v", err)
+					if r.options.Logger != nil {
+						r.options.Logger.Errorf("leader election failed: %v", err)
 					}
 					continue
 				}
@@ -180,42 +156,30 @@ func (r *Relay) Run(ctx context.Context) error {
 				}
 			}
 
-			// Move waiting messages back to outbox if their wait time has passed
-			_, minID, err := r.store.MoveWaitingMessagesToOutbox(ctx)
-			if err != nil {
-				if r.options.logger != nil {
-					r.options.logger.Errorf("failed to move waiting messages to outbox: %v", err)
+			// Move waiting messages back to pending if their wait time has passed
+			if err := r.store.MoveWaitToPending(ctx); err != nil {
+				if r.options.Logger != nil {
+					r.options.Logger.Errorf("failed to move waiting messages to pending: %v", err)
 				}
-			} else if minID != "" && minID < cursor {
-				// Reset cursor to pick up moved messages
-				cursor = minID
 			}
 
-			// Truncate old partitions once per hour
-			currentHour := time.Now().Hour()
-			if currentHour != lastTruncateHour {
-				r.truncateOldPartitions(ctx)
-				lastTruncateHour = currentHour
-			}
-
-			newCursor, err := r.processBatch(ctx, cursor)
-			if err != nil {
-				if r.options.logger != nil {
-					r.options.logger.Errorf("relay batch processing failed: %v", err)
+			if err := r.processBatch(ctx); err != nil {
+				if r.options.Logger != nil {
+					r.options.Logger.Errorf("relay batch processing failed: %v", err)
 				}
-				continue
-			}
-
-			if newCursor != cursor {
-				if err := r.store.SaveOutboxCursor(ctx, newCursor); err != nil {
-					if r.options.logger != nil {
-						r.options.logger.Errorf("failed to save cursor: %v", err)
-					}
-				}
-				cursor = newCursor
 			}
 		}
 	}
+}
+
+// RunOnce processes a single batch of messages and returns.
+// Useful for testing or manual triggering.
+func (r *Relay) RunOnce(ctx context.Context) error {
+	// Move waiting messages back to pending first
+	if err := r.store.MoveWaitToPending(ctx); err != nil {
+		return fmt.Errorf("move waiting messages: %w", err)
+	}
+	return r.processBatch(ctx)
 }
 
 func (r *Relay) tryAcquireLeadership(ctx context.Context) (bool, error) {
@@ -224,124 +188,79 @@ func (r *Relay) tryAcquireLeadership(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("store does not implement LeaderStore")
 	}
 
-	return leaderStore.TryAcquireLeaderLock(ctx, r.options.leaderLockName, r.holderID, r.options.leaseTTL)
+	return leaderStore.TryAcquireLeaderLock(ctx, r.options.LeaderLockName, r.holderID, r.options.LeaseTTL)
 }
 
-func (r *Relay) processBatch(ctx context.Context, cursor string) (string, error) {
-	messages, err := r.store.ListPendingOutboxMessages(ctx, cursor, r.options.batchSize, r.options.visibilityDelay)
+func (r *Relay) processBatch(ctx context.Context) error {
+	messages, err := r.store.ListPendingMessages(ctx, r.options.BatchSize)
 	if err != nil {
-		return cursor, fmt.Errorf("list pending messages: %w", err)
+		return fmt.Errorf("list pending messages: %w", err)
 	}
 
 	if len(messages) == 0 {
-		return cursor, nil
+		return nil
 	}
 
 	for _, msg := range messages {
 		select {
 		case <-ctx.Done():
-			return cursor, nil
+			return nil
 		default:
-			if msg.SentTime != nil {
-				cursor = msg.ID
-				continue
-			}
-
 			if err := r.sender.Send(ctx, msg.Metadata, msg.Data); err != nil {
 				r.handleError(ctx, msg, err)
-				cursor = msg.ID
 				continue
 			}
 
-			if err := r.store.UpdateOutboxMessagesSentTime(ctx, time.Now(), msg.ID); err != nil {
-				if r.options.logger != nil {
-					r.options.logger.Errorf("failed to mark message %s as sent: %v", msg.ID, err)
+			if err := r.markProcessed(ctx, msg); err != nil {
+				if r.options.Logger != nil {
+					r.options.Logger.Errorf("failed to mark message %s as processed: %v", msg.ID, err)
 				}
 			}
-			cursor = msg.ID
 		}
 	}
 
-	return cursor, nil
+	return nil
+}
+
+func (r *Relay) markProcessed(ctx context.Context, msg *outbox.Message) error {
+	switch r.options.ProcessingMode {
+	case relay.ProcessingModeDelete:
+		return r.store.DeletePendingMessages(ctx, msg.ID)
+	case relay.ProcessingModeMove:
+		return r.store.MovePendingToCompleted(ctx, time.Now(), msg.ID)
+	}
+	return nil
 }
 
 func (r *Relay) handleError(ctx context.Context, msg *outbox.Message, err error) {
-	if r.options.errorHandler != nil {
-		r.options.errorHandler(ctx, msg, err)
+	if r.options.ErrorHandler != nil {
+		r.options.ErrorHandler(ctx, msg, err)
 	}
 
-	if r.options.logger != nil {
-		r.options.logger.Errorf("failed to send message %s: %v", msg.ID, err)
+	if r.options.Logger != nil {
+		r.options.Logger.Errorf("failed to send message %s: %v", msg.ID, err)
 	}
 
-	retryCount, incErr := r.store.IncrementOutboxMessageRetryCount(ctx, msg.ID)
-	if incErr != nil {
-		if r.options.logger != nil {
-			r.options.logger.Errorf("failed to increment retry count for message %s: %v", msg.ID, incErr)
-		}
-		return
-	}
+	// Use retry count from the message (populated by ListPendingMessages)
+	retryCount := msg.RetryCount + 1
 
-	if retryCount >= r.options.maxRetries {
-		reason := fmt.Sprintf("max retries (%d) exceeded: %v", r.options.maxRetries, err)
-		if moveErr := r.store.MoveOutboxMessageToParkingLot(ctx, msg.ID, reason); moveErr != nil {
-			if r.options.logger != nil {
-				r.options.logger.Errorf("failed to move message %s to parking lot: %v", msg.ID, moveErr)
+	if retryCount >= r.options.MaxRetries {
+		reason := fmt.Sprintf("max retries (%d) exceeded: %v", r.options.MaxRetries, err)
+		if moveErr := r.store.MovePendingToParkingLot(ctx, msg.ID, reason); moveErr != nil {
+			if r.options.Logger != nil {
+				r.options.Logger.Errorf("failed to move message %s to parking lot: %v", msg.ID, moveErr)
 			}
-		} else if r.options.logger != nil {
-			r.options.logger.Errorf("message %s moved to parking lot: %s", msg.ID, reason)
+		} else if r.options.Logger != nil {
+			r.options.Logger.Errorf("message %s moved to parking lot: %s", msg.ID, reason)
 		}
 		return
 	}
 
-	// Move to wait queue for retry
-	retryTime := time.Now().Add(r.options.minRetryBackoff)
-	if moveErr := r.store.MoveOutboxMessageToWait(ctx, msg.ID, retryTime); moveErr != nil {
-		if r.options.logger != nil {
-			r.options.logger.Errorf("failed to move message %s to wait queue: %v", msg.ID, moveErr)
+	// Move to wait table for retry
+	retryTime := time.Now().Add(r.options.MinRetryBackoff)
+	if moveErr := r.store.MovePendingToWait(ctx, msg.ID, retryTime, retryCount); moveErr != nil {
+		if r.options.Logger != nil {
+			r.options.Logger.Errorf("failed to move message %s to wait: %v", msg.ID, moveErr)
 		}
 	}
-}
-
-func (r *Relay) truncateOldPartitions(ctx context.Context) {
-	if r.options.retentionHours <= 0 || r.options.retentionHours >= 24 {
-		return
-	}
-
-	partitionedStore, ok := r.store.(relay.PartitionedStore)
-	if !ok {
-		return
-	}
-
-	currentHour := time.Now().Hour()
-	partitions := getPartitionsToTruncate(currentHour, r.options.retentionHours)
-
-	if len(partitions) == 0 {
-		return
-	}
-
-	if err := partitionedStore.TruncateOutboxPartitions(ctx, partitions...); err != nil {
-		if r.options.logger != nil {
-			r.options.logger.Errorf("failed to truncate partitions: %v", err)
-		}
-	}
-}
-
-func getPartitionsToTruncate(currentHour, retentionHours int) []int {
-	const totalPartitions = 24
-
-	keep := make(map[int]struct{}, retentionHours+1)
-	for i := range retentionHours + 1 {
-		hour := (currentHour - i + totalPartitions) % totalPartitions
-		keep[hour] = struct{}{}
-	}
-
-	toTruncate := make([]int, 0, totalPartitions-len(keep))
-	for p := range totalPartitions {
-		if _, ok := keep[p]; !ok {
-			toTruncate = append(toTruncate, p)
-		}
-	}
-
-	return toTruncate
 }
