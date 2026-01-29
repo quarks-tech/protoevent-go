@@ -328,16 +328,20 @@ func (s *RelayStore) ListPendingMessages(ctx context.Context, limit int) ([]*out
     return messages, rows.Err()
 }
 
-func (s *RelayStore) DeletePendingMessages(ctx context.Context, ids ...string) error {
+// CompletePendingMessages marks messages as sent.
+// Choose ONE of the implementations below based on your needs.
+
+// Option A: Delete (no audit trail, simpler)
+func (s *RelayStore) CompletePendingMessages(ctx context.Context, sentTime time.Time, ids ...string) error {
     if len(ids) == 0 {
         return nil
     }
 
     placeholders := make([]string, len(ids))
-    args := make([]any, 0, len(ids))
+    args := make([]any, len(ids))
     for i, id := range ids {
         placeholders[i] = "?"
-        args = append(args, id)
+        args[i] = id
     }
 
     query := fmt.Sprintf(`DELETE FROM outbox_pending WHERE id IN (%s)`, strings.Join(placeholders, ","))
@@ -345,7 +349,8 @@ func (s *RelayStore) DeletePendingMessages(ctx context.Context, ids ...string) e
     return err
 }
 
-func (s *RelayStore) MovePendingToCompleted(ctx context.Context, sentTime time.Time, ids ...string) error {
+// Option B: Move to completed table (audit trail)
+func (s *RelayStore) CompletePendingMessages(ctx context.Context, sentTime time.Time, ids ...string) error {
     if len(ids) == 0 {
         return nil
     }
@@ -357,13 +362,14 @@ func (s *RelayStore) MovePendingToCompleted(ctx context.Context, sentTime time.T
     defer tx.Rollback()
 
     placeholders := make([]string, len(ids))
-    args := make([]any, 0, len(ids)+1)
-    args = append(args, sentTime)
+    args := make([]any, len(ids)+1)
+    args[0] = sentTime
     for i, id := range ids {
         placeholders[i] = "?"
-        args = append(args, id)
+        args[i+1] = id
     }
 
+    // Move to completed table
     insertQuery := fmt.Sprintf(`
         INSERT INTO outbox_completed (id, metadata, data, create_time, sent_time)
         SELECT id, metadata, data, create_time, ? FROM outbox_pending WHERE id IN (%s)
@@ -372,6 +378,7 @@ func (s *RelayStore) MovePendingToCompleted(ctx context.Context, sentTime time.T
         return err
     }
 
+    // Delete from pending
     deleteQuery := fmt.Sprintf(`DELETE FROM outbox_pending WHERE id IN (%s)`, strings.Join(placeholders, ","))
     if _, err := tx.ExecContext(ctx, deleteQuery, args[1:]...); err != nil {
         return err
@@ -406,14 +413,14 @@ type Store interface {
 }
 
 func main() {
-    // Create publisher factory
-    publisherFactory := outbox.NewPublisherFactory(
+    // Create typed publisher factory with generated constructor
+    booksFactory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
         eventbus.WithDefaultPublishOptions(
             eventbus.WithEventSource("books-service"),
         ),
     )
 
-    // Use within transaction
+    // Use within transaction - clean one-liner for publishing
     err := txStore.WithTransaction(ctx, func(ctx context.Context, store Store) error {
         // Business logic
         if err := store.CreateBook(ctx, book); err != nil {
@@ -421,8 +428,7 @@ func main() {
         }
 
         // Publish event (saved to outbox in same transaction)
-        publisher := publisherFactory.Create(store)
-        return bookspb.NewEventPublisher(publisher).PublishBookCreatedEvent(ctx,
+        return booksFactory.Create(store).PublishBookCreatedEvent(ctx,
             &bookspb.BookCreatedEvent{
                 Id:     book.ID,
                 Title:  book.Title,
@@ -478,7 +484,6 @@ func main() {
     r := relay.NewRelay(relayStore, sender,
         relay.WithBatchSize(100),
         relay.WithPollInterval(time.Second),
-        relay.WithProcessingMode(relay.ProcessingModeDelete), // or ProcessingModeMove for audit trail
     )
 
     // Run relay (blocks until context cancelled)
@@ -507,39 +512,6 @@ r := relay.NewRelay(relayStore, sender,
 // Run relay (blocks until context cancelled)
 // Only the leader instance will process messages
 if err := r.Run(ctx); err != nil {
-    log.Fatal(err)
-}
-```
-
-#### Partition Cleanup (Optional)
-
-When using `ProcessingModeMove` to keep an audit trail, the completed table can grow large.
-Use `PartitionCleaner` alongside the relay in an errgroup for automatic cleanup of old partitions.
-
-Requires the completed table to be partitioned by `HASH(HOUR(sent_time)) PARTITIONS 24`.
-
-```go
-import (
-    "golang.org/x/sync/errgroup"
-    "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
-)
-
-// relayStore must implement relay.PartitionedStore interface
-r := relay.NewRelay(relayStore, sender,
-    relay.WithProcessingMode(relay.ProcessingModeMove), // keep audit trail
-)
-
-cleaner := relay.NewPartitionCleaner(relayStore,
-    relay.WithRetentionHours(2),          // keep last 2 hours
-    relay.WithCheckInterval(time.Hour),   // check once per hour
-)
-
-// Run both in an errgroup
-g, ctx := errgroup.WithContext(ctx)
-g.Go(func() error { return r.Run(ctx) })
-g.Go(func() error { return cleaner.Run(ctx) })
-
-if err := g.Wait(); err != nil {
     log.Fatal(err)
 }
 ```
@@ -585,26 +557,6 @@ func (s *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID st
 }
 ```
 
-#### Implement PartitionedStore (TiDB)
-
-```go
-func (s *RelayStore) TruncateCompletedPartitions(ctx context.Context, partitions ...int) error {
-    if len(partitions) == 0 {
-        return nil
-    }
-
-    // Build partition names: p0, p1, p2, ...
-    names := make([]string, len(partitions))
-    for i, p := range partitions {
-        names[i] = fmt.Sprintf("p%d", p)
-    }
-
-    query := fmt.Sprintf("ALTER TABLE outbox_completed TRUNCATE PARTITION %s", strings.Join(names, ", "))
-    _, err := s.db.ExecContext(ctx, query)
-    return err
-}
-```
-
 ## SQL Schema for Outbox (TiDB)
 
 The outbox uses a **two-table approach** for simplicity and reliability:
@@ -621,7 +573,7 @@ CREATE TABLE outbox_pending
 );
 
 -- Completed messages (optional, for audit trail)
--- Use ProcessingModeMove to keep sent messages here
+-- Used if your CompletePendingMessages implementation moves messages here
 CREATE TABLE outbox_completed
 (
   id          BINARY(16) PRIMARY KEY,
@@ -629,8 +581,7 @@ CREATE TABLE outbox_completed
   data        VARBINARY(your-max-message-size) NOT NULL,
   create_time DATETIME(6)                      NOT NULL,
   sent_time   DATETIME(6)                      NOT NULL
-)
-  PARTITION BY HASH(HOUR(sent_time)) PARTITIONS 24; -- p0-p23 for fast cleanup
+);
 
 -- For leader election (optional, required for WithLeaderElection)
 CREATE TABLE relay_lock
@@ -654,10 +605,11 @@ INSERT INTO outbox_pending (id, metadata, data, create_time) VALUES (?, ?, ?, ?)
 -- ListPendingMessages: get messages to process (always from beginning, no cursor!)
 SELECT id, metadata, data, create_time FROM outbox_pending ORDER BY id LIMIT ?;
 
--- DeletePendingMessages: remove after successful send (ProcessingModeDelete)
+-- CompletePendingMessages: implementation decides what "complete" means
+-- Option A: Just delete (no audit trail)
 DELETE FROM outbox_pending WHERE id IN (?...);
 
--- MovePendingToCompleted: move to completed table (ProcessingModeMove)
+-- Option B: Move to completed table (audit trail)
 INSERT INTO outbox_completed (id, metadata, data, create_time, sent_time)
 SELECT id, metadata, data, create_time, ? FROM outbox_pending WHERE id IN (?...);
 DELETE FROM outbox_pending WHERE id IN (?...);
@@ -681,13 +633,6 @@ ON DUPLICATE KEY UPDATE
 
 -- Check current lock holder
 SELECT holder_id FROM relay_lock WHERE name = ?;
-```
-
-**PartitionedStore (optional - for partition cleanup):**
-```sql
--- TruncateCompletedPartitions: fast cleanup of hourly partitions (p0-p23)
--- Example: truncate partitions outside retention window
-ALTER TABLE outbox_completed TRUNCATE PARTITION p0, p1, p2, p3, p4, p5, p6, p7, p8;
 ```
 
 **Operational (monitoring):**
