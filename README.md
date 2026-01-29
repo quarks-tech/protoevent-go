@@ -231,28 +231,16 @@ The outbox transport implements the transactional outbox pattern for reliable ev
 
 #### Architecture
 
-The relay uses a **multi-table approach** that eliminates cursor management and prevents race conditions:
+The relay uses a **two-table approach** that eliminates cursor management and prevents race conditions:
 
 ```
 ┌─────────────────┐     send ok      ┌─────────────────┐
 │ outbox_pending  │ ───────────────► │outbox_completed │
-│  (to be sent)   │     (delete or   │   (optional)    │
-└────────┬────────┘       move)      └─────────────────┘
-         │
-         │ send failed
-         ▼
-┌─────────────────┐  retry_time passed  ┌─────────────────┐
-│   outbox_wait   │ ◄──────────────────►│ outbox_pending  │
-│  (retry queue)  │                     │                 │
-└────────┬────────┘                     └─────────────────┘
-         │
-         │ max retries exceeded
-         ▼
-┌─────────────────┐
-│outbox_parking_lot│
-│  (dead letter)  │
-└─────────────────┘
+│  (to be sent)   │   (delete or     │   (optional)    │
+└─────────────────┘      move)       └─────────────────┘
 ```
+
+If the message broker is unavailable, messages stay in pending and are retried on next poll.
 
 **Benefits:**
 - **No cursor management** - always read from beginning of pending table
@@ -523,34 +511,6 @@ if err := r.Run(ctx); err != nil {
 }
 ```
 
-#### Message Relay with Parking Lot (Retry + Dead Letter)
-
-For automatic retry with backoff and dead letter support, use the parkinglot relay.
-Failed messages are moved to a wait table, then retried after backoff.
-After max retries, messages are moved to the parking lot for manual inspection.
-
-```go
-import (
-    "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
-    "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/parkinglot"
-)
-
-// Create relay with parking lot support
-// relayStore must implement parkinglot.Store interface
-r := parkinglot.NewRelay(relayStore, sender,
-    parkinglot.WithBatchSize(100),
-    parkinglot.WithPollInterval(time.Second),
-    parkinglot.WithMaxRetries(3),
-    parkinglot.WithMinRetryBackoff(15*time.Second),
-    parkinglot.WithProcessingMode(relay.ProcessingModeDelete), // or relay.ProcessingModeMove
-    parkinglot.WithLeaderElection("outbox-relay-pl"),          // optional
-)
-
-if err := r.Run(ctx); err != nil {
-    log.Fatal(err)
-}
-```
-
 #### Partition Cleanup (Optional)
 
 When using `ProcessingModeMove` to keep an audit trail, the completed table can grow large.
@@ -581,177 +541,6 @@ g.Go(func() error { return cleaner.Run(ctx) })
 
 if err := g.Wait(); err != nil {
     log.Fatal(err)
-}
-```
-
-#### Implement Parking Lot Store (TiDB)
-
-```go
-// ParkingLotStore implements parkinglot.Store for the four-table approach.
-type ParkingLotStore struct {
-    db *sql.DB
-}
-
-func NewParkingLotStore(db *sql.DB) *ParkingLotStore {
-    return &ParkingLotStore{db: db}
-}
-
-func (s *ParkingLotStore) ListPendingMessages(ctx context.Context, limit int) ([]*outbox.Message, error) {
-    query := `SELECT id, metadata, data, create_time, retry_count FROM outbox_pending ORDER BY id LIMIT ?`
-    rows, err := s.db.QueryContext(ctx, query, limit)
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
-
-    var messages []*outbox.Message
-    for rows.Next() {
-        var (
-            id           []byte
-            metadataJSON []byte
-            data         []byte
-            createTime   time.Time
-            retryCount   int
-        )
-        if err := rows.Scan(&id, &metadataJSON, &data, &createTime, &retryCount); err != nil {
-            return nil, err
-        }
-
-        var metadata event.Metadata
-        if err := json.Unmarshal(metadataJSON, &metadata); err != nil {
-            return nil, fmt.Errorf("unmarshal metadata: %w", err)
-        }
-
-        messages = append(messages, &outbox.Message{
-            ID:         string(id),
-            Metadata:   &metadata,
-            Data:       data,
-            CreateTime: createTime,
-            RetryCount: retryCount,
-        })
-    }
-    return messages, rows.Err()
-}
-
-func (s *ParkingLotStore) DeletePendingMessages(ctx context.Context, ids ...string) error {
-    if len(ids) == 0 {
-        return nil
-    }
-    placeholders := make([]string, len(ids))
-    args := make([]any, len(ids))
-    for i, id := range ids {
-        placeholders[i] = "?"
-        args[i] = id
-    }
-    query := fmt.Sprintf(`DELETE FROM outbox_pending WHERE id IN (%s)`, strings.Join(placeholders, ","))
-    _, err := s.db.ExecContext(ctx, query, args...)
-    return err
-}
-
-func (s *ParkingLotStore) MovePendingToCompleted(ctx context.Context, sentTime time.Time, ids ...string) error {
-    if len(ids) == 0 {
-        return nil
-    }
-    tx, err := s.db.BeginTx(ctx, nil)
-    if err != nil {
-        return err
-    }
-    defer tx.Rollback()
-
-    placeholders := make([]string, len(ids))
-    args := make([]any, len(ids)+1)
-    args[0] = sentTime
-    for i, id := range ids {
-        placeholders[i] = "?"
-        args[i+1] = id
-    }
-
-    insertQuery := fmt.Sprintf(`
-        INSERT INTO outbox_completed (id, metadata, data, create_time, sent_time)
-        SELECT id, metadata, data, create_time, ? FROM outbox_pending WHERE id IN (%s)
-    `, strings.Join(placeholders, ","))
-    if _, err := tx.ExecContext(ctx, insertQuery, args...); err != nil {
-        return err
-    }
-
-    deleteQuery := fmt.Sprintf(`DELETE FROM outbox_pending WHERE id IN (%s)`, strings.Join(placeholders, ","))
-    if _, err := tx.ExecContext(ctx, deleteQuery, args[1:]...); err != nil {
-        return err
-    }
-
-    return tx.Commit()
-}
-
-// Note: GetPendingMessageRetryCount is no longer needed - retry count is populated
-// by ListPendingMessages into Message.RetryCount
-
-func (s *ParkingLotStore) MovePendingToWait(ctx context.Context, id string, retryTime time.Time, retryCount int) error {
-    tx, err := s.db.BeginTx(ctx, nil)
-    if err != nil {
-        return err
-    }
-    defer tx.Rollback()
-
-    _, err = tx.ExecContext(ctx, `
-        INSERT INTO outbox_wait (id, metadata, data, create_time, retry_count, retry_time)
-        SELECT id, metadata, data, create_time, ?, ? FROM outbox_pending WHERE id = ?
-    `, retryCount, retryTime, id)
-    if err != nil {
-        return err
-    }
-
-    _, err = tx.ExecContext(ctx, `DELETE FROM outbox_pending WHERE id = ?`, id)
-    if err != nil {
-        return err
-    }
-
-    return tx.Commit()
-}
-
-func (s *ParkingLotStore) MoveWaitToPending(ctx context.Context) error {
-    tx, err := s.db.BeginTx(ctx, nil)
-    if err != nil {
-        return err
-    }
-    defer tx.Rollback()
-
-    _, err = tx.ExecContext(ctx, `
-        INSERT INTO outbox_pending (id, metadata, data, create_time, retry_count)
-        SELECT id, metadata, data, create_time, retry_count FROM outbox_wait WHERE retry_time <= NOW()
-    `)
-    if err != nil {
-        return err
-    }
-
-    _, err = tx.ExecContext(ctx, `DELETE FROM outbox_wait WHERE retry_time <= NOW()`)
-    if err != nil {
-        return err
-    }
-
-    return tx.Commit()
-}
-
-func (s *ParkingLotStore) MovePendingToParkingLot(ctx context.Context, id string, reason string) error {
-    tx, err := s.db.BeginTx(ctx, nil)
-    if err != nil {
-        return err
-    }
-    defer tx.Rollback()
-
-    _, err = tx.ExecContext(ctx, `
-        INSERT INTO outbox_parking_lot (id, metadata, data, create_time, retry_count, reason, park_time)
-        SELECT id, metadata, data, create_time, retry_count, ?, NOW() FROM outbox_pending WHERE id = ?
-    `, reason, id)
-    if err != nil {
-        return err
-    }
-
-    _, err = tx.ExecContext(ctx, `DELETE FROM outbox_pending WHERE id = ?`, id)
-    if err != nil {
-        return err
-    }
-
-    return tx.Commit()
 }
 ```
 
@@ -818,7 +607,7 @@ func (s *RelayStore) TruncateCompletedPartitions(ctx context.Context, partitions
 
 ## SQL Schema for Outbox (TiDB)
 
-The outbox uses a **multi-table approach** for simplicity and reliability:
+The outbox uses a **two-table approach** for simplicity and reliability:
 
 ```sql
 -- Pending messages (messages waiting to be sent)
@@ -828,8 +617,7 @@ CREATE TABLE outbox_pending
   id          BINARY(16) PRIMARY KEY,                    -- UUID v7 (time-sortable)
   metadata    JSON                             NOT NULL, -- CloudEvents metadata
   data        VARBINARY(your-max-message-size) NOT NULL, -- Serialized event payload
-  create_time DATETIME(6)                      NOT NULL,
-  retry_count INT DEFAULT 0                              -- for parking lot relay
+  create_time DATETIME(6)                      NOT NULL
 );
 
 -- Completed messages (optional, for audit trail)
@@ -843,30 +631,6 @@ CREATE TABLE outbox_completed
   sent_time   DATETIME(6)                      NOT NULL
 )
   PARTITION BY HASH(HOUR(sent_time)) PARTITIONS 24; -- p0-p23 for fast cleanup
-
--- Wait queue (for parking lot relay - messages awaiting retry)
-CREATE TABLE outbox_wait
-(
-  id          BINARY(16) PRIMARY KEY,
-  metadata    JSON                             NOT NULL,
-  data        VARBINARY(your-max-message-size) NOT NULL,
-  create_time DATETIME(6)                      NOT NULL,
-  retry_count INT                              NOT NULL,
-  retry_time  DATETIME(6)                      NOT NULL  -- when to retry
-);
-CREATE INDEX idx_outbox_wait_retry_time ON outbox_wait (retry_time);
-
--- Parking lot (for parking lot relay - permanently failed messages)
-CREATE TABLE outbox_parking_lot
-(
-  id          BINARY(16) PRIMARY KEY,
-  metadata    JSON                             NOT NULL,
-  data        VARBINARY(your-max-message-size) NOT NULL,
-  create_time DATETIME(6)                      NOT NULL,
-  retry_count INT                              NOT NULL,
-  reason      TEXT                             NOT NULL, -- why message was parked
-  park_time   DATETIME(6)                      NOT NULL  -- when message was parked
-);
 
 -- For leader election (optional, required for WithLeaderElection)
 CREATE TABLE relay_lock
@@ -897,24 +661,6 @@ DELETE FROM outbox_pending WHERE id IN (?...);
 INSERT INTO outbox_completed (id, metadata, data, create_time, sent_time)
 SELECT id, metadata, data, create_time, ? FROM outbox_pending WHERE id IN (?...);
 DELETE FROM outbox_pending WHERE id IN (?...);
-```
-
-**ParkingLotStore:**
-```sql
--- MovePendingToWait: move failed message to wait queue
-INSERT INTO outbox_wait (id, metadata, data, create_time, retry_count, retry_time)
-SELECT id, metadata, data, create_time, ?, ? FROM outbox_pending WHERE id = ?;
-DELETE FROM outbox_pending WHERE id = ?;
-
--- MoveWaitToPending: move messages back when retry time passes
-INSERT INTO outbox_pending (id, metadata, data, create_time, retry_count)
-SELECT id, metadata, data, create_time, retry_count FROM outbox_wait WHERE retry_time <= NOW();
-DELETE FROM outbox_wait WHERE retry_time <= NOW();
-
--- MovePendingToParkingLot: move to parking lot after max retries
-INSERT INTO outbox_parking_lot (id, metadata, data, create_time, retry_count, reason, park_time)
-SELECT id, metadata, data, create_time, retry_count, ?, NOW() FROM outbox_pending WHERE id = ?;
-DELETE FROM outbox_pending WHERE id = ?;
 ```
 
 **LeaderStore (optional):**
@@ -951,12 +697,6 @@ SELECT COUNT(*) FROM outbox_pending;
 
 -- Oldest pending message age
 SELECT MIN(create_time) FROM outbox_pending;
-
--- Messages in wait queue
-SELECT COUNT(*) FROM outbox_wait;
-
--- Messages in parking lot (need manual intervention)
-SELECT COUNT(*) FROM outbox_parking_lot;
 ```
 
 ## License

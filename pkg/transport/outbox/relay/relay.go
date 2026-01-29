@@ -2,7 +2,6 @@ package relay
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,14 +10,116 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 )
 
-// Relay reads messages from the pending table and forwards them to another transport.
-// It processes messages in FIFO order and handles deleting or moving them after successful send.
+// Store defines operations needed by the message relay.
+// This is typically implemented by a non-transactional store instance.
 //
 // The relay uses a two-table approach:
-//   - Pending table: messages waiting to be sent
-//   - Completed table: messages that have been sent (optional, for audit)
+//   - outbox_pending: messages waiting to be sent
+//   - outbox_completed: messages that have been sent (optional, for audit)
 //
-// This eliminates cursor management and prevents race conditions with UUID v7 ordering.
+// This eliminates the need for cursor management and prevents race conditions
+// where messages with earlier UUIDs are inserted after later ones.
+type Store interface {
+	// ListPendingMessages retrieves messages from the pending table,
+	// ordered by id (FIFO). Returns up to 'limit' messages.
+	// Uses UUID v7 IDs which are time-sortable.
+	ListPendingMessages(ctx context.Context, limit int) ([]*outbox.Message, error)
+
+	// CompletePendingMessages marks messages as successfully sent.
+	// The implementation decides what "complete" means:
+	//   - Delete from pending table (no audit trail)
+	//   - Move to completed table with sentTime (audit trail)
+	//   - Any other completion strategy
+	CompletePendingMessages(ctx context.Context, sentTime time.Time, ids ...string) error
+}
+
+// LeaderStore is an optional interface for stores that support leader election.
+// Implement this interface to enable running multiple relay instances with automatic failover.
+// Only one instance will be active at a time, ensuring strict FIFO ordering.
+type LeaderStore interface {
+	// TryAcquireLeaderLock attempts to acquire or renew the leader lock.
+	// Returns true if this instance (identified by holderID) holds the lock after the call.
+	// The lock expires after leaseTTL if not renewed.
+	TryAcquireLeaderLock(ctx context.Context, name, holderID string, leaseTTL time.Duration) (bool, error)
+}
+
+// Logger interface for relay error logging.
+type Logger interface {
+	Errorf(format string, args ...any)
+}
+
+// Options contains configuration for relay instances.
+type Options struct {
+	BatchSize    int
+	PollInterval time.Duration
+	Logger       Logger
+	ErrorHandler func(ctx context.Context, msg *outbox.Message, err error)
+
+	// Leader election options
+	LeaderLockName string
+	LeaseTTL       time.Duration
+}
+
+// DefaultOptions returns the default relay configuration.
+func DefaultOptions() Options {
+	return Options{
+		BatchSize:    100,
+		PollInterval: time.Second,
+		LeaseTTL:     30 * time.Second,
+	}
+}
+
+// Option configures relay options.
+type Option func(*Options)
+
+// WithBatchSize sets the maximum number of messages to fetch per poll.
+func WithBatchSize(size int) Option {
+	return func(o *Options) {
+		o.BatchSize = size
+	}
+}
+
+// WithPollInterval sets the interval between polling the pending table.
+func WithPollInterval(d time.Duration) Option {
+	return func(o *Options) {
+		o.PollInterval = d
+	}
+}
+
+// WithLogger sets the logger for relay errors.
+func WithLogger(l Logger) Option {
+	return func(o *Options) {
+		o.Logger = l
+	}
+}
+
+// WithErrorHandler sets a custom error handler for failed message sends.
+// If not set, errors are logged and the relay continues with the next message.
+func WithErrorHandler(handler func(ctx context.Context, msg *outbox.Message, err error)) Option {
+	return func(o *Options) {
+		o.ErrorHandler = handler
+	}
+}
+
+// WithLeaderElection enables leader election for running multiple relay instances.
+// Only one instance will be active at a time. Requires the store to implement LeaderStore.
+// The lockName should be unique per relay group (e.g., "outbox-relay").
+func WithLeaderElection(lockName string) Option {
+	return func(o *Options) {
+		o.LeaderLockName = lockName
+	}
+}
+
+// WithLeaseTTL sets the leader lock lease duration.
+// The lock expires after this duration if not renewed. Default is 30 seconds.
+func WithLeaseTTL(ttl time.Duration) Option {
+	return func(o *Options) {
+		o.LeaseTTL = ttl
+	}
+}
+
+// Relay reads messages from the pending table and forwards them to another transport.
+// It processes messages in FIFO order and marks them as completed after successful send.
 type Relay struct {
 	store    Store
 	sender   eventbus.Sender
@@ -43,127 +144,5 @@ func NewRelay(store Store, sender eventbus.Sender, opts ...Option) *Relay {
 		sender:   sender,
 		options:  options,
 		holderID: uuid.NewString(),
-	}
-}
-
-// Run starts the relay loop. It polls the pending table for messages
-// and forwards them to the configured sender.
-//
-// The relay stops when the context is cancelled.
-// Returns nil on graceful shutdown.
-func (r *Relay) Run(ctx context.Context) error {
-	ticker := time.NewTicker(r.options.PollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			// If leader election is enabled, try to acquire/renew the lock
-			if r.options.LeaderLockName != "" {
-				isLeader, err := r.tryAcquireLeadership(ctx)
-				if err != nil {
-					if r.options.Logger != nil {
-						r.options.Logger.Errorf("leader election failed: %v", err)
-					}
-					continue
-				}
-				if !isLeader {
-					continue
-				}
-			}
-
-			if err := r.processBatch(ctx); err != nil {
-				if r.options.Logger != nil {
-					r.options.Logger.Errorf("relay batch processing failed: %v", err)
-				}
-			}
-		}
-	}
-}
-
-// RunOnce processes a single batch of messages and returns.
-// Useful for testing or manual triggering.
-func (r *Relay) RunOnce(ctx context.Context) error {
-	return r.processBatch(ctx)
-}
-
-func (r *Relay) tryAcquireLeadership(ctx context.Context) (bool, error) {
-	leaderStore, ok := r.store.(LeaderStore)
-	if !ok {
-		return false, fmt.Errorf("store does not implement LeaderStore")
-	}
-
-	return leaderStore.TryAcquireLeaderLock(ctx, r.options.LeaderLockName, r.holderID, r.options.LeaseTTL)
-}
-
-func (r *Relay) processBatch(ctx context.Context) error {
-	messages, err := r.store.ListPendingMessages(ctx, r.options.BatchSize)
-	if err != nil {
-		return fmt.Errorf("list pending messages: %w", err)
-	}
-
-	if len(messages) == 0 {
-		return nil
-	}
-
-	var sentIDs []string
-
-	for _, msg := range messages {
-		select {
-		case <-ctx.Done():
-			// Process any successfully sent messages before returning
-			if len(sentIDs) > 0 {
-				if err := r.markProcessed(ctx, sentIDs...); err != nil {
-					return fmt.Errorf("mark processed on context done: %w", err)
-				}
-			}
-
-			return nil
-		default:
-			if err := r.sender.Send(ctx, msg.Metadata, msg.Data); err != nil {
-				// Process successfully sent messages before handling the error
-				if len(sentIDs) > 0 {
-					if batchErr := r.markProcessed(ctx, sentIDs...); batchErr != nil {
-						return fmt.Errorf("mark processed before error: %w", batchErr)
-					}
-				}
-
-				r.handleError(ctx, msg, fmt.Errorf("send message %s: %w", msg.ID, err))
-				// Stop processing to maintain FIFO order
-				return nil
-			}
-			sentIDs = append(sentIDs, msg.ID)
-		}
-	}
-
-	// Batch process all successfully sent messages
-	if len(sentIDs) > 0 {
-		if err := r.markProcessed(ctx, sentIDs...); err != nil {
-			return fmt.Errorf("mark processed: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (r *Relay) markProcessed(ctx context.Context, ids ...string) error {
-	switch r.options.ProcessingMode {
-	case ProcessingModeDelete:
-		return r.store.DeletePendingMessages(ctx, ids...)
-	case ProcessingModeMove:
-		return r.store.MovePendingToCompleted(ctx, time.Now(), ids...)
-	}
-	return nil
-}
-
-func (r *Relay) handleError(ctx context.Context, msg *outbox.Message, err error) {
-	if r.options.ErrorHandler != nil {
-		r.options.ErrorHandler(ctx, msg, err)
-	}
-
-	if r.options.Logger != nil {
-		r.options.Logger.Errorf("failed to process message %s: %v", msg.ID, err)
 	}
 }

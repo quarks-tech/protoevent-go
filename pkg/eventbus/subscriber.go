@@ -3,7 +3,6 @@ package eventbus
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"strings"
 	"sync"
 
@@ -21,12 +20,23 @@ type Setuper interface {
 
 type Processor func(md *event.Metadata, data []byte) error
 
+// EventHandler handles a single event. The handler implementation is captured
+// in the closure, so no interface{} is passed at runtime.
+//
+// Parameters:
+//   - ctx: request context
+//   - md: event metadata (CloudEvents)
+//   - dec: decoder function to unmarshal event data
+//   - inter: optional interceptor chain (may be nil)
+type EventHandler func(ctx context.Context, md *event.Metadata, dec func(any) error, inter SubscriberInterceptor) error
+
+// EventDesc describes a single event type.
 type EventDesc struct {
-	Name        string
-	HandlerType interface{}
-	Handler     eventHandler
+	Name string
 }
 
+// ServiceDesc describes a service and its events.
+// Used for topology setup (e.g., RabbitMQ exchanges/queues).
 type ServiceDesc struct {
 	ServiceName string
 	Events      []EventDesc
@@ -44,19 +54,12 @@ func (sd ServiceDesc) getEventDesc(name string) (EventDesc, bool) {
 }
 
 type eventInfo struct {
-	handler     eventHandler
-	handlerImpl interface{}
+	handler EventHandler
 }
 
 type serviceInfo struct {
 	events map[string]*eventInfo
 	mdata  string
-}
-
-type eventHandler func(h interface{}, md *event.Metadata, ctx context.Context, dec func(interface{}) error, inter SubscriberInterceptor) error
-
-type EventHandlerRegistrar interface {
-	RegisterEventHandler(desc *ServiceDesc, event string, impl interface{})
 }
 
 type subscriberOptions struct {
@@ -96,29 +99,30 @@ func NewSubscriber(name string, opts ...SubscriberOption) *Subscriber {
 	return s
 }
 
-func (s *Subscriber) RegisterEventHandler(sd *ServiceDesc, eventName string, h interface{}) {
+// RegisterHandler registers an event handler for the given service and event.
+// Type safety is ensured at compile time by the generated registration functions.
+//
+// This method is typically called by generated code like:
+//
+//	bookspb.RegisterBookCreatedEventHandler(subscriber, &MyHandler{})
+//
+// The generated function creates a closure that captures the typed handler,
+// eliminating the need for runtime type checking.
+func (s *Subscriber) RegisterHandler(sd *ServiceDesc, eventName string, h EventHandler) {
 	ed, ok := sd.getEventDesc(eventName)
 	if !ok {
 		panicf("event not found: %s", eventName)
 	}
 
-	if h != nil {
-		sht := reflect.TypeOf(ed.HandlerType).Elem()
-		ht := reflect.TypeOf(h)
-		if !ht.Implements(sht) {
-			panicf("Subscriber.RegisterSubscription found the handlerImpl of type %v that does not satisfy %v", ht, sht)
-		}
-	}
-
 	s.register(sd, ed, h)
 }
 
-func (s *Subscriber) register(sd *ServiceDesc, ed EventDesc, h interface{}) {
+func (s *Subscriber) register(sd *ServiceDesc, ed EventDesc, h EventHandler) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
 	if s.serve {
-		panicf("Subscriber.RegisterEventHandler after Subscriber.Subscribe for %q", ed.Name)
+		panicf("Subscriber.RegisterHandler after Subscriber.Subscribe for %q", ed.Name)
 	}
 
 	if _, ok := s.services[sd.ServiceName]; !ok {
@@ -129,12 +133,11 @@ func (s *Subscriber) register(sd *ServiceDesc, ed EventDesc, h interface{}) {
 	}
 
 	if _, ok := s.services[sd.ServiceName].events[ed.Name]; ok {
-		panicf("Subscriber.RegisterEventHandler found duplicate service registration for %q", ed.Name)
+		panicf("Subscriber.RegisterHandler found duplicate service registration for %q", ed.Name)
 	}
 
 	s.services[sd.ServiceName].events[ed.Name] = &eventInfo{
-		handler:     ed.Handler,
-		handlerImpl: h,
+		handler: h,
 	}
 }
 
@@ -194,7 +197,7 @@ func (s *Subscriber) process(md *event.Metadata, data []byte) error {
 		return NewUnprocessableEventError(fmt.Errorf("subscription not found: %s", md.Type))
 	}
 
-	df := func(v interface{}) error {
+	df := func(v any) error {
 		contentSubtype, valid := event.ContentSubtype(md.DataContentType)
 		if !valid {
 			return NewUnprocessableEventError(fmt.Errorf("invalid content type: %s", md.DataContentType))
@@ -214,9 +217,9 @@ func (s *Subscriber) process(md *event.Metadata, data []byte) error {
 
 	ctx = event.NewIncomingContext(ctx, md)
 
-	return ei.handler(ei.handlerImpl, md, ctx, df, s.opts.interceptor)
+	return ei.handler(ctx, md, df, s.opts.interceptor)
 }
 
-func panicf(format string, a ...interface{}) {
+func panicf(format string, a ...any) {
 	panic(fmt.Sprintf("eventbus: "+format, a...))
 }

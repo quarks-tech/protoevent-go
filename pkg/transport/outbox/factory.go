@@ -4,7 +4,7 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 )
 
-// PublisherFactory creates eventbus.Publisher instances bound to a specific store.
+// PublisherFactory creates typed publisher instances bound to a specific store.
 // This is used to create transaction-scoped publishers within WithTransaction callbacks.
 //
 // Example usage:
@@ -14,30 +14,38 @@ import (
 //	    // ... other methods
 //	}
 //
-//	factory := outbox.NewPublisherFactory(publisherOpts...)
+//	factory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
+//	    eventbus.WithDefaultPublishOptions(
+//	        eventbus.WithEventSource("books-service"),
+//	    ),
+//	)
 //
 //	err := txStore.WithTransaction(ctx, func(ctx context.Context, store MyStore) error {
 //	    // Business logic...
-//
-//	    publisher := factory.Create(store)
-//	    return publisher.Publish(ctx, event, opts...)
+//	    return factory.Create(store).PublishBookCreatedEvent(ctx, &bookspb.BookCreatedEvent{...})
 //	})
-type PublisherFactory struct {
+type PublisherFactory[T any] struct {
 	options []eventbus.PublisherOption
+	create  func(eventbus.Publisher) T
 }
 
-// NewPublisherFactory creates a new factory with the given publisher options.
+// NewPublisherFactory creates a new factory with the given typed publisher constructor
+// and publisher options. The constructor is typically a generated function like
+// bookspb.NewEventPublisher.
+//
 // These options will be applied to all publishers created by this factory.
-func NewPublisherFactory(opts ...eventbus.PublisherOption) *PublisherFactory {
-	return &PublisherFactory{options: opts}
+func NewPublisherFactory[T any](create func(eventbus.Publisher) T, opts ...eventbus.PublisherOption) *PublisherFactory[T] {
+	return &PublisherFactory[T]{
+		options: opts,
+		create:  create,
+	}
 }
 
-// Create returns a new eventbus.Publisher that uses the provided store
+// Create returns a new typed publisher that uses the provided store
 // for persisting events to the outbox.
 //
 // The store should be transaction-scoped (e.g., passed into WithTransaction callback)
 // to ensure the event is saved atomically with business operations.
-func (f *PublisherFactory) Create(store Store) *eventbus.PublisherImpl {
-	sender := NewSender(store)
-	return eventbus.NewPublisher(sender, f.options...)
+func (f *PublisherFactory[T]) Create(store Store) T {
+	return f.create(eventbus.NewPublisher(NewSender(store), f.options...))
 }

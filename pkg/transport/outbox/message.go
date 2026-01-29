@@ -22,7 +22,4 @@ type Message struct {
 
 	// SentTime is when the message was successfully relayed (nil if not sent yet).
 	SentTime *time.Time
-
-	// RetryCount is the number of failed delivery attempts.
-	RetryCount int
 }
