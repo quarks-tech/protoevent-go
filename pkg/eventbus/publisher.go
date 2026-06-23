@@ -96,6 +96,12 @@ func WithEventExtension(name string, value interface{}) PublishOption {
 	}
 }
 
+func WithEventTime(t time.Time) PublishOption {
+	return func(m *event.Metadata) {
+		m.Time = t
+	}
+}
+
 func WithPublisherContentType(t string) PublisherOption {
 	return WithDefaultPublishOptions(WithEventContentType(t))
 }
