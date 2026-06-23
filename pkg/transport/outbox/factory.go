@@ -15,8 +15,13 @@ import (
 //	}
 //
 //	factory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
-//	    eventbus.WithDefaultPublishOptions(
-//	        eventbus.WithEventSource("books-service"),
+//	    outbox.WithPublisherOptions(
+//	        eventbus.WithDefaultPublishOptions(
+//	            eventbus.WithEventSource("books-service"),
+//	        ),
+//	    ),
+//	    outbox.WithSenderOptions(
+//	        outbox.WithIDGenerator(outbox.ReuseMetadataID),
 //	    ),
 //	)
 //
@@ -24,19 +29,50 @@ import (
 //	    // Business logic...
 //	    return factory.Create(store).PublishBookCreatedEvent(ctx, &bookspb.BookCreatedEvent{...})
 //	})
+type factoryOptions struct {
+	publisherOptions []eventbus.PublisherOption
+	senderOptions    []SenderOption
+}
+
+// FactoryOption configures a PublisherFactory.
+type FactoryOption func(*factoryOptions)
+
+// WithPublisherOptions applies the given publisher options to every publisher
+// the factory creates.
+func WithPublisherOptions(opts ...eventbus.PublisherOption) FactoryOption {
+	return func(o *factoryOptions) {
+		o.publisherOptions = append(o.publisherOptions, opts...)
+	}
+}
+
+// WithSenderOptions applies the given sender options to the outbox sender behind
+// every publisher the factory creates. Use this to reach, for example,
+// WithIDGenerator(ReuseMetadataID).
+func WithSenderOptions(opts ...SenderOption) FactoryOption {
+	return func(o *factoryOptions) {
+		o.senderOptions = append(o.senderOptions, opts...)
+	}
+}
+
 type PublisherFactory[T any] struct {
-	options []eventbus.PublisherOption
+	options factoryOptions
 	create  func(eventbus.Publisher) T
 }
 
 // NewPublisherFactory creates a new factory with the given typed publisher constructor
-// and publisher options. The constructor is typically a generated function like
+// and factory options. The constructor is typically a generated function like
 // bookspb.NewEventPublisher.
 //
-// These options will be applied to all publishers created by this factory.
-func NewPublisherFactory[T any](create func(eventbus.Publisher) T, opts ...eventbus.PublisherOption) *PublisherFactory[T] {
+// Use WithPublishOptions for publisher-level options and WithSenderOptions for
+// outbox sender options; both are applied to every publisher the factory creates.
+func NewPublisherFactory[T any](create func(eventbus.Publisher) T, opts ...FactoryOption) *PublisherFactory[T] {
+	options := factoryOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	return &PublisherFactory[T]{
-		options: opts,
+		options: options,
 		create:  create,
 	}
 }
@@ -47,5 +83,7 @@ func NewPublisherFactory[T any](create func(eventbus.Publisher) T, opts ...event
 // The store should be transaction-scoped (e.g., passed into WithTransaction callback)
 // to ensure the event is saved atomically with business operations.
 func (f *PublisherFactory[T]) Create(store Store) T {
-	return f.create(eventbus.NewPublisher(NewSender(store), f.options...))
+	sender := NewSender(store, f.options.senderOptions...)
+
+	return f.create(eventbus.NewPublisher(sender, f.options.publisherOptions...))
 }

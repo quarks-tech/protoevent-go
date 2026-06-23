@@ -24,17 +24,43 @@ type Publisher interface {
 
 type PublishOption func(m *event.Metadata)
 
+// IDGenerator produces a fresh event ID. The publisher has no pre-existing ID,
+// so the generator takes no input. It is invoked only when the caller did not
+// supply an ID via WithEventID.
+type IDGenerator func() (string, error)
+
+// generateUUIDv4 is the default IDGenerator. UUID v4 is random and unique, a
+// sensible default for an event identifier. Producers that want a time-ordered
+// or otherwise deterministic ID can supply one via WithEventID or WithIDGenerator.
+func generateUUIDv4() (string, error) {
+	id, err := uuid.NewRandom()
+	if err != nil {
+		return "", err
+	}
+
+	return id.String(), nil
+}
+
 type publisherOptions struct {
 	publishOptions    []PublishOption
 	chainInterceptors []PublisherInterceptor
 	interceptor       PublisherInterceptor
+	idGenerator       IDGenerator
 }
 
 func defaultPublisherOptions() publisherOptions {
-	return publisherOptions{}
+	return publisherOptions{
+		idGenerator: generateUUIDv4,
+	}
 }
 
 type PublisherOption func(opts *publisherOptions)
+
+func WithEventID(id string) PublishOption {
+	return func(m *event.Metadata) {
+		m.ID = id
+	}
+}
 
 func WithEventContentType(contentType string) PublishOption {
 	return func(m *event.Metadata) {
@@ -72,6 +98,14 @@ func WithEventExtension(name string, value interface{}) PublishOption {
 
 func WithPublisherContentType(t string) PublisherOption {
 	return WithDefaultPublishOptions(WithEventContentType(t))
+}
+
+// WithIDGenerator sets the generator used to produce event IDs when the caller
+// does not supply one via WithEventID. Defaults to UUID v4.
+func WithIDGenerator(gen IDGenerator) PublisherOption {
+	return func(opts *publisherOptions) {
+		opts.idGenerator = gen
+	}
 }
 
 func WithDefaultPublishOptions(pos ...PublishOption) PublisherOption {
@@ -117,6 +151,15 @@ func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, 
 
 	for _, opt := range opts {
 		opt(md)
+	}
+
+	if md.ID == "" {
+		id, err := p.options.idGenerator()
+		if err != nil {
+			return fmt.Errorf("generate event id : %w", err)
+		}
+
+		md.ID = id
 	}
 
 	completeMetadata(md)
@@ -165,10 +208,6 @@ func completeMetadata(md *event.Metadata) {
 
 	if md.Source == "" {
 		md.Source = "protoevent-go"
-	}
-
-	if md.ID == "" {
-		md.ID = uuid.New().String()
 	}
 
 	if md.Time.IsZero() {

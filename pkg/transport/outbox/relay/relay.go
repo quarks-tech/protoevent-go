@@ -18,11 +18,11 @@ import (
 //   - outbox_completed: messages that have been sent (optional, for audit)
 //
 // This eliminates the need for cursor management and prevents race conditions
-// where messages with earlier UUIDs are inserted after later ones.
+// where a message committed late (with an earlier timestamp) would be skipped:
+// the relay always reads from the beginning of the pending table.
 type Store interface {
 	// ListPendingMessages retrieves messages from the pending table,
-	// ordered by id (FIFO). Returns up to 'limit' messages.
-	// Uses UUID v7 IDs which are time-sortable.
+	// ordered by create_time (FIFO). Returns up to 'limit' messages.
 	ListPendingMessages(ctx context.Context, limit int) ([]*outbox.Message, error)
 
 	// CompletePendingMessages marks messages as successfully sent.

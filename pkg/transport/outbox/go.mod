@@ -7,4 +7,4 @@ require (
 	github.com/quarks-tech/protoevent-go v0.2.2
 )
 
-require google.golang.org/protobuf v1.36.11 // indirect
+require google.golang.org/protobuf v1.36.11

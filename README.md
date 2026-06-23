@@ -12,6 +12,7 @@ A Go library for building event-driven applications using Protocol Buffers with 
   - Transactional Outbox (`pkg/transport/outbox`)
 - Code generation from proto definitions
 - Interceptor chains for cross-cutting concerns
+- Pluggable event ID generation (UUID v4 by default)
 
 ## Installation
 
@@ -115,6 +116,29 @@ func (h *BookHandler) Handle(ctx context.Context, event *bookspb.BookCreatedEven
     return nil
 }
 ```
+
+### Event ID Generation
+
+Every published event gets an ID written to its CloudEvents metadata. By default
+the publisher mints a random **UUID v4**. You can override how IDs are
+generated, or supply an ID explicitly per publish:
+
+```go
+// Custom generator for all events from this publisher
+publisher := eventbus.NewPublisher(transport,
+    eventbus.WithIDGenerator(func() (string, error) {
+        return ulid.Make().String(), nil
+    }),
+)
+
+// Or supply an ID for a single event (skips the generator)
+booksPublisher.PublishBookCreatedEvent(ctx, event,
+    eventbus.WithEventID("my-explicit-id"),
+)
+```
+
+A caller-supplied `WithEventID` always wins; the generator only runs when no ID
+was provided.
 
 ### RabbitMQ Transport
 
@@ -244,7 +268,7 @@ If the message broker is unavailable, messages stay in pending and are retried o
 
 **Benefits:**
 - **No cursor management** - always read from beginning of pending table
-- **No race conditions** - messages are never skipped, even with concurrent UUID v7 generation
+- **No race conditions** - messages are never skipped, even when a transaction commits late (with an earlier `create_time`)
 - **Simpler queries** - no cursor comparisons needed
 - **Smaller working set** - pending table stays small
 
@@ -294,7 +318,7 @@ func NewRelayStore(db *sql.DB) *RelayStore {
 }
 
 func (s *RelayStore) ListPendingMessages(ctx context.Context, limit int) ([]*outbox.Message, error) {
-    query := `SELECT id, metadata, data, create_time FROM outbox_pending ORDER BY id LIMIT ?`
+    query := `SELECT id, metadata, data, create_time FROM outbox_pending ORDER BY create_time LIMIT ?`
     rows, err := s.db.QueryContext(ctx, query, limit)
     if err != nil {
         return nil, err
@@ -413,10 +437,14 @@ type Store interface {
 }
 
 func main() {
-    // Create typed publisher factory with generated constructor
+    // Create typed publisher factory with generated constructor.
+    // Publisher options are passed via WithPublisherOptions; outbox sender
+    // options (e.g. ID generation) via WithSenderOptions.
     booksFactory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
-        eventbus.WithDefaultPublishOptions(
-            eventbus.WithEventSource("books-service"),
+        outbox.WithPublisherOptions(
+            eventbus.WithDefaultPublishOptions(
+                eventbus.WithEventSource("books-service"),
+            ),
         ),
     )
 
@@ -438,6 +466,33 @@ func main() {
     })
 }
 ```
+
+##### Outbox Row IDs
+
+Each outbox row has its own ID — the table's primary key. The relay orders
+delivery by `create_time`, not by this ID, so the ID only needs to be unique.
+By default the sender mints a fresh random **UUID v4** (`outbox.GenerateV4`),
+keeping the row ID independent of the caller-controlled `Metadata.ID`.
+
+> A random key is intentional: on TiDB a time-ordered primary key (UUID v7,
+> `AUTO_INCREMENT`) concentrates inserts on a single Region — a write hotspot.
+> Since the relay orders by `create_time`, the row ID gains nothing from being
+> time-ordered, so v4 scatters writes at no cost.
+
+To key the row on the event's own ID instead — giving the row and the event a
+single identity end to end — use `outbox.ReuseMetadataID`:
+
+```go
+booksFactory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
+    outbox.WithSenderOptions(
+        outbox.WithIDGenerator(outbox.ReuseMetadataID),
+    ),
+)
+```
+
+> Because the relay orders by `create_time`, `ReuseMetadataID` does not affect
+> delivery order regardless of the event ID's format — it only requires the
+> event ID to be unique (it becomes the row's primary key).
 
 #### Message Relay
 
@@ -566,7 +621,7 @@ The outbox uses a **two-table approach** for simplicity and reliability:
 -- This table stays small as messages are deleted/moved after successful send
 CREATE TABLE outbox_pending
 (
-  id          BINARY(16) PRIMARY KEY,                    -- UUID v7 (time-sortable)
+  id          BINARY(16) PRIMARY KEY,                    -- unique row id (random UUID v4 by default)
   metadata    JSON                             NOT NULL, -- CloudEvents metadata
   data        VARBINARY(your-max-message-size) NOT NULL, -- Serialized event payload
   create_time DATETIME(6)                      NOT NULL
@@ -603,7 +658,7 @@ INSERT INTO outbox_pending (id, metadata, data, create_time) VALUES (?, ?, ?, ?)
 **RelayStore:**
 ```sql
 -- ListPendingMessages: get messages to process (always from beginning, no cursor!)
-SELECT id, metadata, data, create_time FROM outbox_pending ORDER BY id LIMIT ?;
+SELECT id, metadata, data, create_time FROM outbox_pending ORDER BY create_time LIMIT ?;
 
 -- CompletePendingMessages: implementation decides what "complete" means
 -- Option A: Just delete (no audit trail)
