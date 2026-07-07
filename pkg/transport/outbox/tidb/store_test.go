@@ -109,16 +109,27 @@ func TestSequenceAssignsDenseContiguousSeq(t *testing.T) {
 	if n != 5 {
 		t.Fatalf("sequenced %d, want 5", n)
 	}
-	rows, _ := testDB.Query("SELECT seq FROM outbox ORDER BY seq")
+	rows, err := testDB.Query("SELECT seq FROM outbox ORDER BY seq")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer func() { _ = rows.Close() }()
 	var want int64 = 1
 	for rows.Next() {
 		var seq int64
-		_ = rows.Scan(&seq)
+		if err := rows.Scan(&seq); err != nil {
+			t.Fatal(err)
+		}
 		if seq != want {
 			t.Fatalf("seq = %d, want %d (dense contiguous)", seq, want)
 		}
 		want++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if want != 6 {
+		t.Fatalf("consumed %d rows, want 5", want-1)
 	}
 }
 
@@ -176,7 +187,10 @@ func TestCommitOffsetIsMonotone(t *testing.T) {
 	if err := st.CommitOffset(ctx, "c", 5); err != nil { // must not rewind
 		t.Fatal(err)
 	}
-	off, _ := st.Offset(ctx, "c")
+	off, err := st.Offset(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if off != 10 {
 		t.Fatalf("offset = %d, want 10 (GREATEST must not rewind)", off)
 	}
@@ -194,14 +208,20 @@ func TestLeaderLockMutualExclusionAndRelease(t *testing.T) {
 	if err != nil || !okA {
 		t.Fatalf("A acquire = %v, %v; want true", okA, err)
 	}
-	okB, _ := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	okB, err := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if okB {
 		t.Fatal("B acquired while A holds the lock")
 	}
 	if err := st.ReleaseLeaderLock(ctx, "lock", "A"); err != nil {
 		t.Fatal(err)
 	}
-	okB2, _ := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	okB2, err := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !okB2 {
 		t.Fatal("B failed to acquire after A released")
 	}
