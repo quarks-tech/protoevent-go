@@ -112,6 +112,11 @@ type Relay struct {
 	sender   eventbus.Sender
 	options  Options
 	holderID string
+
+	// Runtime state, populated by Run/RunOnce (pkg/.../stream/run.go).
+	isLeader    bool
+	stream      Stream
+	committedCT time.Time
 }
 
 // NewRelay creates a stream relay for the named consumer group. It returns an
