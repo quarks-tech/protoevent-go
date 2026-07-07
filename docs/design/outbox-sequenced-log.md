@@ -1,6 +1,6 @@
 # Design: Sequenced-Log Outbox Relay
 
-Status: DRAFT
+Status: IMPLEMENTED (see docs/superpowers/plans/2026-07-07-outbox-v2-sequenced-log.md)
 Date: 2026-07-07
 Owner: @filenko
 Supersedes: two-table (`outbox_pending` / `outbox_completed`) relay model in `pkg/transport/outbox/relay`
