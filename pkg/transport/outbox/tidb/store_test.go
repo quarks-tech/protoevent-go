@@ -55,7 +55,7 @@ func truncate(t *testing.T) {
 	}
 }
 
-func publish(t *testing.T, subject string) {
+func publish(t *testing.T, subject string) string {
 	t.Helper()
 	tx, err := testDB.Begin()
 	if err != nil {
@@ -75,6 +75,7 @@ func publish(t *testing.T, subject string) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
+	return md.ID
 }
 
 func TestPublishInsertsUnsequencedRow(t *testing.T) {
