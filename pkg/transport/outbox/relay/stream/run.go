@@ -19,6 +19,10 @@ var ErrStreamInvalidated = errors.New("stream: change stream invalidated")
 // (ChangeStreamHistoryLost). Fatal in v1 — invoke the break-glass runbook.
 var ErrHistoryLost = errors.New("stream: change stream history lost (resume token off oplog)")
 
+// errLaneStopped signals that drainWindow stopped the lane on a send failure
+// and closed the stream so the next RunOnce reopens and redelivers.
+var errLaneStopped = errors.New("stream: lane stopped on send failure; will reopen and redeliver")
+
 // Run drives the relay until ctx is canceled (returns ctx.Err()) or a fatal
 // stream condition occurs (returns ErrStreamInvalidated / ErrHistoryLost).
 // Releases leadership on exit so a planned shutdown fails over quickly.
@@ -34,6 +38,11 @@ func (r *Relay) Run(ctx context.Context) error {
 		switch {
 		case err == nil:
 			// keep looping; RunOnce already blocked ~one drain window
+		case errors.Is(err, errLaneStopped):
+			// Stream already closed by drainWindow; back off, then reopen and
+			// redeliver next iteration. The send failure was already observed
+			// via handleError, so don't re-observe here.
+			r.sleep(ctx)
 		case errors.Is(err, ErrStreamInvalidated), errors.Is(err, ErrHistoryLost):
 			return err // fatal
 		default:
@@ -122,8 +131,19 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		}
 	}
 
-	more := processed == r.options.TokenBatchSize && !stopped
+	more := stopped || processed == r.options.TokenBatchSize
 	r.options.Observer.ObserveDrained(r.name, processed, r.committedTokenAge(), more)
+
+	if stopped {
+		// A change-stream cursor cannot rewind, so to actually redeliver the
+		// failed event we must reopen from the last-persisted token. Close the
+		// stream (next RunOnce reopens via LoadToken+Watch) and signal Run to
+		// back off. Persisted state is already correct: processed>0 saved the
+		// last success (reopen resumes just after it, at the failed event);
+		// processed==0 saved nothing (reopen resumes from the prior token).
+		r.closeStream(ctx)
+		return errLaneStopped
+	}
 	return nil
 }
 

@@ -45,14 +45,17 @@ func TestNewRelayAcceptsValidWindow(t *testing.T) {
 // senderFunc adapts a func to eventbus.Sender.
 type senderFunc func(context.Context, *event.Metadata, []byte) error
 
-func (f senderFunc) Send(ctx context.Context, md *event.Metadata, d []byte) error { return f(ctx, md, d) }
+func (f senderFunc) Send(ctx context.Context, md *event.Metadata, d []byte) error {
+	return f(ctx, md, d)
+}
 
 // fakeStream serves a scripted list of events, then empty windows.
 type fakeStream struct {
-	events []*stream.Event
-	i      int
-	pbrt   string
-	pbrtCT time.Time
+	events     []*stream.Event
+	i          int
+	pbrt       string
+	pbrtCT     time.Time
+	closeCount int
 }
 
 func (s *fakeStream) Next(context.Context) (*stream.Event, bool, error) {
@@ -63,19 +66,23 @@ func (s *fakeStream) Next(context.Context) (*stream.Event, bool, error) {
 	}
 	return nil, false, nil // window empty
 }
-func (s *fakeStream) PBRT() (string, time.Time)   { return s.pbrt, s.pbrtCT }
-func (s *fakeStream) Close(context.Context) error { return nil }
+func (s *fakeStream) PBRT() (string, time.Time) { return s.pbrt, s.pbrtCT }
+func (s *fakeStream) Close(context.Context) error {
+	s.closeCount++
+	return nil
+}
 
 // fakeStreamStore hands out one fakeStream and records saved tokens.
 type fakeStreamStore struct {
-	mu        sync.Mutex
-	stream    *fakeStream
-	loadTok   string
-	loadCT    time.Time
-	savedTok  string
-	savedCT   time.Time
-	saveCount int
-	leader    string
+	mu         sync.Mutex
+	stream     *fakeStream
+	loadTok    string
+	loadCT     time.Time
+	savedTok   string
+	savedCT    time.Time
+	saveCount  int
+	watchCount int
+	leader     string
 }
 
 func (s *fakeStreamStore) LoadToken(context.Context, string) (string, time.Time, error) {
@@ -87,7 +94,12 @@ func (s *fakeStreamStore) SaveToken(_ context.Context, _ string, tok string, ct 
 	s.savedTok, s.savedCT, s.saveCount = tok, ct, s.saveCount+1
 	return nil
 }
-func (s *fakeStreamStore) Watch(context.Context, string) (stream.Stream, error) { return s.stream, nil }
+func (s *fakeStreamStore) Watch(context.Context, string) (stream.Stream, error) {
+	s.mu.Lock()
+	s.watchCount++
+	s.mu.Unlock()
+	return s.stream, nil
+}
 func (s *fakeStreamStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, _ time.Duration) (bool, error) {
 	if s.leader == "" || s.leader == holderID {
 		s.leader = holderID
@@ -185,5 +197,65 @@ func TestRunOnceNonLeaderIdles(t *testing.T) {
 	}
 	if sent != 0 {
 		t.Fatalf("non-leader sent %d, want 0", sent)
+	}
+}
+
+func TestRunOnceStopClosesStreamForRedelivery(t *testing.T) {
+	fs := &fakeStream{events: []*stream.Event{ev(1, "a", false), ev(2, "b", false), ev(3, "c", false)}}
+	st := &fakeStreamStore{stream: fs}
+	var got []string
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if md.ID == "b" {
+			return errors.New("boom")
+		}
+		got = append(got, md.ID)
+		return nil
+	})
+	r, _ := stream.NewRelay("c", st, sender)
+	// RunOnce returns errLaneStopped, which is unexported and unreferenceable
+	// here; assert the observable effects instead.
+	_ = r.RunOnce(context.Background())
+
+	if len(got) != 1 || got[0] != "a" {
+		t.Fatalf("delivered %v, want [a] (stop before b)", got)
+	}
+	if fs.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (stream must be closed so next RunOnce reopens and redelivers b)", fs.closeCount)
+	}
+	if st.savedTok != "a" {
+		t.Fatalf("saved token = %q, want a (last success)", st.savedTok)
+	}
+}
+
+func TestRunOncePicksUpWhereItLeftOff(t *testing.T) {
+	fs := &fakeStream{events: []*stream.Event{ev(1, "a", false), ev(2, "b", false), ev(3, "c", false)}}
+	st := &fakeStreamStore{stream: fs}
+	var got []string
+	var parked []string
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if md.ID == "b" {
+			return errors.New("boom")
+		}
+		got = append(got, md.ID)
+		return nil
+	})
+	r, _ := stream.NewRelay("c", st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+		parked = append(parked, msg.ID)
+	}))
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Fatalf("delivered %v, want [a c] (b parked, not delivered)", got)
+	}
+	if len(parked) != 1 || parked[0] != "b" {
+		t.Fatalf("parked %v, want [b]", parked)
+	}
+	if st.savedTok != "c" {
+		t.Fatalf("saved token = %q, want c (advanced past the parked event)", st.savedTok)
+	}
+	if fs.closeCount != 0 {
+		t.Fatalf("closeCount = %d, want 0 (park-and-continue keeps draining the same cursor)", fs.closeCount)
 	}
 }
