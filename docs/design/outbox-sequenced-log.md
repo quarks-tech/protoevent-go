@@ -98,7 +98,7 @@ CREATE TABLE outbox (
 );
 
 CREATE TABLE outbox_sequencer (
-    name     VARCHAR(64) NOT NULL,   -- 'default'; one row per partition if partitioning is added later
+    name     VARCHAR(64) NOT NULL,   -- 'default': the single counter for THIS table (each topic/partition is its own table with its own counter row — §9)
     next_seq BIGINT      NOT NULL,
     PRIMARY KEY (name)
 );
@@ -141,9 +141,9 @@ monotonic) both take writes at the high end → append hotspot on the last Regio
 is hot at two ends (publish inserts in the NULL-prefix, sequencing `UPDATE`s moving entries to the
 high-`seq` end). This is inherent to a log table and matches the precedent (markerry txoutbox uses
 a monotonic `seq` clustered PK). Acceptable up to ~one Region's write ceiling; TiDB auto-splits hot
-Regions. If publish throughput saturates a Region, reach for `SHARD_ROW_ID_BITS` or partition lanes
-(§9) — **not** `AUTO_RANDOM` on `id`, which would destroy the within-tx monotonicity the tiebreak
-relies on.
+Regions. If publish throughput saturates a Region, reach for `SHARD_ROW_ID_BITS` or split the stream
+into partition tables (§9) — **not** `AUTO_RANDOM` on `id`, which would destroy the within-tx
+monotonicity the tiebreak relies on.
 
 ## 5. SQL lifecycle
 
@@ -359,25 +359,47 @@ markerry-iam `pkg/txoutbox` is the closest ancestor (log + offsets + row-count b
 migrates by adopting the sequencer and dropping `WithBackStep`, and can then delete its local
 framework in favor of this package.
 
-## 9. Topics & partitions
+## 9. Topics & partitions — both are table-routing
 
-Two orthogonal scaling axes, Kafka-mapped:
+Two orthogonal scaling axes, and **both are the same physical mechanism: choose a table.** There is
+**no `partition_key` column** — partitioning is done by routing to a table, exactly like topics.
 
-- **Topics ≈ separate outbox tables** (per domain / event stream). Counter, offsets, lock, and
-  sequencer are all per-table already — a store instance just points at a different table name.
-  Ordering scoped per table. **Ships fully in v2** (config, not new code): one relay stack per
-  table.
-- **Partitions ≈ one table + `partition_key`** from a stable hash. **v2 ships the schema, not the
-  lanes:** `partition_key` column is present and stamped `hash(subject)` at publish (CloudEvents
-  `subject` = aggregate id; overridable via a key-extractor option), but runtime treats the whole
-  table as a single partition. Rationale: backfilling a partition column later would force a
-  history rewrite or a v3 ordering discontinuity, so the column must exist from day one; the
-  parallel-drain machinery is pure runtime and lands later without touching stored data.
+- **Topics ≈ separate outbox tables** (per domain / event stream), chosen by the event's domain.
+  Counter, offsets, lock, and sequencer are all per-table already — a store instance just points at
+  a different table name. Ordering scoped per table. **Ships fully in v2** (config, not new code):
+  one relay stack per table.
+- **Partitions ≈ separate outbox tables within one stream** (`outbox_<stream>_0..N`), chosen by a
+  stable `hash(subject)` (CloudEvents `subject` = aggregate id; overridable via a key-extractor).
+  A given key always routes to the same table, so per-key order is preserved; cross-key is
+  unordered — Kafka's exact trade. A consumer group tails all N partition tables as **N independent
+  `sequence.Relay` instances**, each with its own `outbox_sequencer` / `outbox_offsets` / `relay_lock`
+  rows keyed by that table.
 
-Later (partition lanes): one `outbox_sequencer` / `outbox_offsets` row per `(name, partition)`,
-one drainer lane per partition, per-key order preserved, cross-partition unordered. One sequencer
-pass per table sequences all partitions in a single tx (scan `seq IS NULL` once, bump each
-partition's counter) so the §10 latency budget stays one tick regardless of partition count.
+**Why table-routing, not a `partition_key` column** (decision 2026-07-08): partitioning as tables
+reuses the topics machinery wholesale — a partition is just another table with the same
+sequencer/offsets/lock, drained by another relay. It adds **zero new runtime concepts**: no
+partition-aware sequencer, no `(partition_key, seq)` filter index, no per-partition branch in
+`drain`. Crucially it also removes any forward-compatibility pressure on the base schema: v2 ships
+**partition count = 1** (a single `outbox` table); scaling to N is "create more tables + route new
+writes," with **no `ALTER` of existing rows and no history backfill**. A `partition_key` column would
+have required exactly that backfill (or a v3 ordering discontinuity) if omitted at day one — the
+table-routing design sidesteps the column entirely, so the single-table v2 schema is already
+forward-compatible. (This supersedes an earlier draft of this section that proposed a
+`partition_key` column; a whole-branch review had flagged the column's absence as a gap — that gap
+dissolves under table-routing, since there is no column to ship.)
+
+Neither axis escapes the real cost of partitioning: **repartitioning** (changing N re-hashes which
+key lands where, breaking per-key order across the cutover). This is inherent to partitioning (Kafka
+has it too) and is a deliberate, rare, operator-driven event — not something the schema can smooth
+over. Start at N = 1 and split a stream only when single-drainer throughput is the measured limit.
+
+**Implementation status.** The v2 reference TiDB store (`pkg/transport/outbox/tidb`) targets a fixed
+`outbox` table (partition count 1) — the single-table base case. Both topics and partitions need one
+small additive change: a table-name (prefix) parameter on `NewStore`/`NewStoreDB` and the publish
+routing helper, so a store instance and its relay target `outbox_<stream>_<n>`. This is purely
+additive (no schema migration, no change to the single-table deployment) and is deferred until a
+second stream or a throughput split is actually needed. No `partition_key` column is or will be
+required.
 
 ## 10. Latency budget & relay runtime
 
