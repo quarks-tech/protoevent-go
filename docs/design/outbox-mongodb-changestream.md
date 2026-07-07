@@ -149,14 +149,30 @@ loop:
       pipeline = [{$match: {operationType: "insert"}}]     # ignore TTL deletes (§6a)
       resumeAfter = stored token        (or startAtOperationTime="now" for a new group — §6b)
       maxAwaitTimeMS = drain window
-  for each event in this window (stop-the-lane on send failure):
+  for each event in this window:
       msg = decode(event.fullDocument)
       Sender.Send(msg)                  # per-event
+      on send failure, NO error handler → STOP-THE-LANE (see below)
+      on send failure, error handler set → park-and-continue (advance past)
       advance in-memory token = event._id (resume token), clusterTime = event.clusterTime
   persist (token, clusterTime) ONCE for the window   # batch cadence (§6c)
   on invalidate event → fatal: log + ObserveError + stop (§6d)
   on ChangeStreamHistoryLost → break-glass DR (§7)
 ```
+
+**Stop-the-lane must close and reopen the cursor (a change-stream cursor cannot rewind).** Unlike
+the TiDB drain — which re-queries `ListMessages` from the uncommitted offset every tick, so a
+non-advanced offset naturally redelivers the failed row — a change stream holds a *live cursor* that
+has already discarded the failed event. Simply breaking the drain loop and looping on the same
+cursor would fast-forward past the failed event and advance the token, silently dropping it. So on
+stop-the-lane the relay **closes the stream and backs off**; the next window reopens via
+`LoadToken` + `Watch(resumeAfter = last-persisted token)`, which resumes *just after* the last
+successful send — i.e. at the failed event — and redelivers it. Persisted state makes this exact:
+a mid-window stop already saved the last-success token (§6c), and a first-event stop saved nothing
+(reopen resumes from the prior token). Park-and-continue, by contrast, keeps the same cursor open
+and advances past the parked event (order-relaxing by design). The persistence rule alone (§6c) only
+covered crash+restart; this close-on-stop rule is what makes stop-the-lane correct while the process
+stays up.
 
 ### 5.3 Retention
 
