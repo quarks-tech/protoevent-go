@@ -40,8 +40,8 @@ var (
 	_ outbox.Store            = (*Store)(nil)
 	_ sequence.Store          = (*Store)(nil)
 	_ sequence.SequencerStore = (*Store)(nil)
-	_ relay.LeaderStore       = (*Store)(nil)
 	_ sequence.RetentionStore = (*Store)(nil)
+	_ relay.LeaderStore       = (*Store)(nil)
 )
 
 // CreateOutboxMessage inserts an unsequenced row. tx_start_ts is the publishing
