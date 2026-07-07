@@ -67,7 +67,7 @@ LIMIT ?`, afterSeq, limit)
 	if err != nil {
 		return nil, fmt.Errorf("outbox: list: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var out []*outbox.Message
 	for rows.Next() {
