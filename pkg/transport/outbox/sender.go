@@ -47,7 +47,7 @@ type senderOptions struct {
 
 func defaultSenderOptions() senderOptions {
 	return senderOptions{
-		idGenerator: ReuseMetadataID,
+		idGenerator: GenerateV4,
 	}
 }
 
