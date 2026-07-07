@@ -163,19 +163,6 @@ func (s *fakeStore) ReleaseLeaderLock(_ context.Context, _, holderID string) err
 	return nil
 }
 
-// captureSender records what the relay forwards, and can fail on a target seq.
-type captureSender struct {
-	sent    []int64
-	failAt  int64 // Seq to fail on (0 = never)
-	failErr error
-}
-
-func (c *captureSender) Send(_ context.Context, md *event.Metadata, _ []byte) error {
-	// md.ID doubles as a stringified seq marker in these tests; we track by the
-	// Seq the relay drained, captured via a closure in each test instead.
-	return nil
-}
-
 func msg(seq int64) *outbox.Message {
 	return &outbox.Message{ID: "id", Seq: seq, Metadata: event.NewMetadata("t"), CreateTime: time.Now()}
 }
