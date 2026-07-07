@@ -13,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
@@ -51,7 +52,8 @@ type lockDoc struct {
 
 // Store realizes the outbox publish + relay-read contracts over a *mongo.Database.
 type Store struct {
-	db *mongo.Database
+	db       *mongo.Database
+	maxAwait time.Duration
 }
 
 func NewStore(db *mongo.Database) *Store { return &Store{db: db} }
@@ -149,7 +151,18 @@ func (s *Store) ReleaseLeaderLock(ctx context.Context, name, holderID string) er
 	return nil
 }
 
-// decodeMessage, which rebuilds an outbox.Message from a stored outboxDoc,
-// lands in Task 4 alongside Watch (its only caller) — golangci-lint's
-// `unused` linter flags a free function with no caller, and the repo
-// carries zero //nolint directives.
+// decodeMessage rebuilds an outbox.Message from a stored outboxDoc, reversing
+// CreateOutboxMessage's json.Marshal of the CloudEvents metadata. Its only
+// caller is mongoStream.Next (watch.go).
+func decodeMessage(doc outboxDoc) (*outbox.Message, error) {
+	var md event.Metadata
+	if err := json.Unmarshal(doc.Metadata, &md); err != nil {
+		return nil, fmt.Errorf("outbox: unmarshal metadata: %w", err)
+	}
+	return &outbox.Message{
+		ID:         doc.ID,
+		Metadata:   &md,
+		Data:       doc.Data,
+		CreateTime: doc.CreateTime,
+	}, nil
+}
