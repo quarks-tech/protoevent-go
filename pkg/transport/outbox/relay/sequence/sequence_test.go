@@ -251,3 +251,35 @@ func TestNonLeaderDoesNothing(t *testing.T) {
 		t.Fatalf("non-leader sent %d, want 0", sent)
 	}
 }
+
+func TestParkAndContinueAdvancesPastFailure(t *testing.T) {
+	st := newFakeStore()
+	for i := 0; i < 5; i++ {
+		st.append(msg(0))
+	}
+	var got []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if mdSeq(md) == 3 {
+			return errors.New("boom")
+		}
+		got = append(got, mdSeq(md))
+		return nil
+	})
+	var parked []int64
+	r := sequence.NewRelay("c", st, sender, sequence.WithErrorHandler(
+		func(_ context.Context, m *outbox.Message, _ error) { parked = append(parked, m.Seq) },
+	))
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	// 3 parked; 1,2,4,5 delivered; offset advances to 5.
+	if off := st.offsets["c"]; off != 5 {
+		t.Fatalf("offset = %d, want 5 (park-and-continue advances past failure)", off)
+	}
+	if len(parked) != 1 || parked[0] != 3 {
+		t.Fatalf("parked = %v, want [3]", parked)
+	}
+	if len(got) != 4 {
+		t.Fatalf("delivered = %v, want 4 messages", got)
+	}
+}
