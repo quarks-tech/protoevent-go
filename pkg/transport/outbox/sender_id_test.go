@@ -28,7 +28,7 @@ func newMetadata(id string) *event.Metadata {
 	return md
 }
 
-func TestSenderDefaultIDIsUUIDv4(t *testing.T) {
+func TestSenderDefaultReusesMetadataID(t *testing.T) {
 	store := &captureStore{}
 	sender := outbox.NewSender(store)
 
@@ -36,17 +36,31 @@ func TestSenderDefaultIDIsUUIDv4(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 
+	// Default reuses the metadata ID: the relay persists this as event_id and
+	// reconstructs the emitted CloudEvents Metadata.ID from it, so the row and
+	// the event must share one identity end to end.
+	if store.msg.ID != "event-id" {
+		t.Fatalf("default message ID = %q, want event-id (reused from metadata)", store.msg.ID)
+	}
+}
+
+func TestSenderGenerateV4Option(t *testing.T) {
+	store := &captureStore{}
+	sender := outbox.NewSender(store, outbox.WithIDGenerator(outbox.GenerateV4))
+
+	if err := sender.Send(context.Background(), newMetadata("event-id"), nil); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
 	id, err := uuid.Parse(store.msg.ID)
 	if err != nil {
-		t.Fatalf("default message ID is not a valid UUID: %v", err)
+		t.Fatalf("GenerateV4 message ID is not a valid UUID: %v", err)
 	}
-	// v4 (random): the relay orders by create_time, not by row ID, so a
-	// time-ordered ID buys nothing — and a monotonic PK hotspots TiDB inserts.
 	if id.Version() != 4 {
-		t.Fatalf("default message ID version = %d, want 4", id.Version())
+		t.Fatalf("GenerateV4 message ID version = %d, want 4", id.Version())
 	}
 	if store.msg.ID == "event-id" {
-		t.Fatal("default generator reused metadata ID, want freshly minted")
+		t.Fatal("GenerateV4 reused metadata ID, want freshly minted")
 	}
 }
 
