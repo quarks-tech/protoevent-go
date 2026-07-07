@@ -12,3 +12,9 @@ func TestNewStoreCompiles(t *testing.T) {
 		t.Fatal("NewStore returned nil")
 	}
 }
+
+func TestStoreDBConstructs(t *testing.T) {
+	if tidb.NewStoreDB(nil) == nil {
+		t.Fatal("NewStoreDB returned nil")
+	}
+}

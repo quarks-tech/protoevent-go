@@ -11,6 +11,7 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/sequence"
 )
 
@@ -25,14 +26,22 @@ type Runner interface {
 // Store implements the outbox publish path and the relay read/offset/sequencer/
 // retention/leader contracts over TiDB.
 type Store struct {
-	r Runner
+	r  Runner
+	db *sql.DB // non-nil only when built via NewStoreDB; needed by SequenceMessages
 }
 
 func NewStore(r Runner) *Store { return &Store{r: r} }
 
+// NewStoreDB builds a store over a *sql.DB, enabling the sequencer, leader, and
+// retention paths (which manage their own transactions / run on the pool).
+func NewStoreDB(db *sql.DB) *Store { return &Store{r: db, db: db} }
+
 var (
-	_ outbox.Store   = (*Store)(nil)
-	_ sequence.Store = (*Store)(nil)
+	_ outbox.Store            = (*Store)(nil)
+	_ sequence.Store          = (*Store)(nil)
+	_ sequence.SequencerStore = (*Store)(nil)
+	_ relay.LeaderStore       = (*Store)(nil)
+	_ sequence.RetentionStore = (*Store)(nil)
 )
 
 // CreateOutboxMessage inserts an unsequenced row. tx_start_ts is the publishing
@@ -130,6 +139,111 @@ ON DUPLICATE KEY UPDATE
 		return fmt.Errorf("outbox: commit offset: %w", err)
 	}
 	return nil
+}
+
+// SequenceMessages assigns dense seq values to committed pending rows in
+// (tx_start_ts, id) order. The counter row is locked FOR UPDATE for the whole
+// pass, so concurrent sequencers serialize and can never double-assign.
+func (s *Store) SequenceMessages(ctx context.Context, limit int) (int, error) {
+	if s.db == nil {
+		return 0, fmt.Errorf("outbox: SequenceMessages requires a *sql.DB store (use NewStoreDB)")
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("outbox: begin sequence tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit
+
+	var next int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT next_seq FROM outbox_sequencer WHERE name = 'default' FOR UPDATE`,
+	).Scan(&next); err != nil {
+		return 0, fmt.Errorf("outbox: lock sequencer: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+UPDATE outbox o
+JOIN (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY tx_start_ts, id) AS rn
+    FROM outbox
+    WHERE seq IS NULL
+    ORDER BY tx_start_ts, id
+    LIMIT ?
+) b ON b.id = o.id
+SET o.seq = ? + b.rn - 1`, limit, next)
+	if err != nil {
+		return 0, fmt.Errorf("outbox: assign seq: %w", err)
+	}
+	assigned, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("outbox: rows affected: %w", err)
+	}
+
+	if assigned > 0 {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE outbox_sequencer SET next_seq = ? WHERE name = 'default'`, next+assigned,
+		); err != nil {
+			return 0, fmt.Errorf("outbox: bump sequencer: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("outbox: commit sequence tx: %w", err)
+	}
+	return int(assigned), nil
+}
+
+// TryAcquireLeaderLock acquires or renews the lock; the incoming holder wins if
+// the lock is free (expired) or already theirs. TTL is applied via DB clock.
+func (s *Store) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
+	if _, err := s.r.ExecContext(ctx, `
+INSERT INTO relay_lock (name, holder_id, expire_time)
+VALUES (?, ?, NOW(6) + INTERVAL ? MICROSECOND)
+ON DUPLICATE KEY UPDATE
+    holder_id   = IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), VALUES(holder_id), holder_id),
+    expire_time = IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), VALUES(expire_time), expire_time)`,
+		name, holderID, ttl.Microseconds(),
+	); err != nil {
+		return false, fmt.Errorf("outbox: acquire lock: %w", err)
+	}
+
+	var holder string
+	if err := s.r.QueryRowContext(ctx,
+		`SELECT holder_id FROM relay_lock WHERE name = ?`, name,
+	).Scan(&holder); err != nil {
+		return false, fmt.Errorf("outbox: read lock holder: %w", err)
+	}
+	return holder == holderID, nil
+}
+
+// ReleaseLeaderLock drops the lock if still held by holderID.
+func (s *Store) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
+	_, err := s.r.ExecContext(ctx,
+		`DELETE FROM relay_lock WHERE name = ? AND holder_id = ?`, name, holderID)
+	if err != nil {
+		return fmt.Errorf("outbox: release lock: %w", err)
+	}
+	return nil
+}
+
+// SweepMessages deletes sequenced rows at or below the minimum committed offset
+// across all consumers and older than `before`, bounded to `limit`. If no
+// offsets exist yet, MIN(last_seq) is NULL and nothing is deleted.
+func (s *Store) SweepMessages(ctx context.Context, before time.Time, limit int) (int, error) {
+	res, err := s.r.ExecContext(ctx, `
+DELETE FROM outbox
+WHERE seq IS NOT NULL
+  AND seq <= (SELECT MIN(last_seq) FROM outbox_offsets)
+  AND occurred_at < ?
+LIMIT ?`, before.UTC(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("outbox: sweep: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("outbox: sweep rows affected: %w", err)
+	}
+	return int(n), nil
 }
 
 // sqlTime scans a DATETIME(6). The DSN must set parseTime=true (see tidbtest).
