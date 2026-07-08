@@ -2,7 +2,6 @@ package sequence
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
@@ -21,9 +20,13 @@ func (r *Relay) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if err := r.RunOnce(ctx); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					// Planned shutdown: ctx.Done() will fire and exit the loop; don't
-					// report a spurious error metric/log for it.
+				if ctx.Err() != nil {
+					// Planned shutdown (ctx is genuinely done): ctx.Done() will
+					// fire and exit the loop; don't report a spurious error
+					// metric/log for it. Gated on run-context liveness, not
+					// error identity — an op-level context.DeadlineExceeded
+					// while ctx is still alive is a real, recurring timeout and
+					// must be observed below.
 					continue
 				}
 				r.options.Observer.ObserveError(r.name, err)

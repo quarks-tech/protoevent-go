@@ -42,9 +42,13 @@ func (r *Relay) Run(ctx context.Context) error {
 			r.sleep(ctx)
 		case errors.Is(err, ErrStreamInvalidated), errors.Is(err, ErrHistoryLost):
 			return err // fatal
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			// Planned shutdown: the ctx.Err() check at the top of the loop will
-			// return next iteration; don't report a spurious error metric/log.
+		case ctx.Err() != nil:
+			// Planned shutdown (ctx is genuinely done): the ctx.Err() check at
+			// the top of the loop will return next iteration; don't report a
+			// spurious error metric/log. Gated on run-context liveness, not
+			// error identity — the mongo v2 driver's own operation timeouts
+			// also surface as context.DeadlineExceeded, and those must still
+			// be observed as real errors while ctx is alive (default branch).
 			r.closeStream(ctx)
 			r.sleep(ctx)
 		default:

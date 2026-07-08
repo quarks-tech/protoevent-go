@@ -402,6 +402,55 @@ func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
 	}
 }
 
+// signalingObserver notifies a channel (non-blocking) on every ObserveError,
+// so a test can wait for the first occurrence without polling.
+type signalingObserver struct {
+	ch chan struct{}
+}
+
+func (o *signalingObserver) ObserveDrained(string, int, time.Duration, bool) {}
+func (o *signalingObserver) ObserveSequenced(string, int)                    {}
+func (o *signalingObserver) ObserveError(string, error) {
+	select {
+	case o.ch <- struct{}{}:
+	default:
+	}
+}
+
+// TestRunObservesOpLevelDeadlineExceededWhileCtxAlive proves the shutdown-quiet
+// path is gated on run-context liveness, not error identity: a genuine
+// op-level context.DeadlineExceeded returned by the store while ctx is still
+// alive must be observed as a real, recurring error — not silently swallowed
+// as a planned shutdown.
+func TestRunObservesOpLevelDeadlineExceededWhileCtxAlive(t *testing.T) {
+	st := newFakeStore()
+	st.seqErr = context.DeadlineExceeded
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	obs := &signalingObserver{ch: make(chan struct{}, 1)}
+
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithObserver(obs), sequence.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	select {
+	case <-obs.ch:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("ObserveError was not called for an op-level DeadlineExceeded while ctx was alive")
+	}
+
+	cancel()
+	if runErr := <-done; !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run err = %v, want context.Canceled", runErr)
+	}
+}
+
 // TestNewGroupStartsAtLatestByDefault proves parity with the stream runtime's
 // start-at-now: a brand-new consumer group (no committed offset) must not
 // replay the retained log. Only events sequenced AFTER the group's first

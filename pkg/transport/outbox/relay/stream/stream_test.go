@@ -56,9 +56,13 @@ type fakeStream struct {
 	pbrt       string
 	pbrtCT     time.Time
 	closeCount int
+	nextErr    error // when set, Next always returns this error instead of draining events
 }
 
 func (s *fakeStream) Next(context.Context) (*stream.Event, bool, error) {
+	if s.nextErr != nil {
+		return nil, false, s.nextErr
+	}
 	if s.i < len(s.events) {
 		e := s.events[s.i]
 		s.i++
@@ -318,6 +322,55 @@ func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
 	defer obs.mu.Unlock()
 	if obs.errObserved {
 		t.Fatal("ObserveError called on planned shutdown, want none")
+	}
+}
+
+// signalingObserver notifies a channel (non-blocking) on every ObserveError,
+// so a test can wait for the first occurrence without polling.
+type signalingObserver struct {
+	ch chan struct{}
+}
+
+func (o *signalingObserver) ObserveDrained(string, int, time.Duration, bool) {}
+func (o *signalingObserver) ObserveError(string, error) {
+	select {
+	case o.ch <- struct{}{}:
+	default:
+	}
+}
+
+// TestRunObservesOpLevelDeadlineExceededWhileCtxAlive proves the shutdown-quiet
+// path is gated on run-context liveness, not error identity: a genuine
+// op-level context.DeadlineExceeded (e.g. the mongo v2 driver's own operation
+// timeout) returned by the stream while ctx is still alive must be observed
+// as a real, recurring error — not silently swallowed as a planned shutdown.
+func TestRunObservesOpLevelDeadlineExceededWhileCtxAlive(t *testing.T) {
+	fs := &fakeStream{nextErr: context.DeadlineExceeded}
+	st := &fakeStreamStore{stream: fs}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	obs := &signalingObserver{ch: make(chan struct{}, 1)}
+
+	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(obs),
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(50*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	select {
+	case <-obs.ch:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("ObserveError was not called for an op-level DeadlineExceeded while ctx was alive")
+	}
+
+	cancel()
+	if runErr := <-done; !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run err = %v, want context.Canceled", runErr)
 	}
 }
 
