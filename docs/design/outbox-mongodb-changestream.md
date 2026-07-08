@@ -297,8 +297,13 @@ package stream
 // The resume token crosses this boundary as an opaque string, NOT bson.Raw —
 // Go strings hold arbitrary bytes, so a BSON token fits, and string gives
 // immutability (callers can't mutate a held token), comparability (==, map keys),
-// and a clean API value. The mongo store casts string(rawToken)/bson.Raw(token)
-// internally, keeping the engine `relay/stream` package free of the mongo driver
+// and a clean API value. The mongo store *persists* the token as []byte binary
+// (offsetDoc.ResumeToken, §4) — never as bson.Raw, which requires valid
+// BSON-document bytes and would reject an opaque token. bson.Raw appears only
+// transiently at the driver API surface — SetResumeAfter(bson.Raw(token)) when
+// opening Watch, and decoding a change event's _id — cast to/from string right
+// at that edge; it is never the stored or StreamStore-crossing representation.
+// This keeps the engine `relay/stream` package free of the mongo driver
 // (dependency-free core) and the vocabulary backend-neutral (§10 Kafka note).
 // "No stored token → start now" is token == "".
 type StreamStore interface {
