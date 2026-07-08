@@ -1,6 +1,6 @@
 # Design: Change-Stream Outbox Relay (MongoDB)
 
-Status: DRAFT
+Status: IMPLEMENTED (see docs/superpowers/plans/2026-07-07-outbox-v2-mongodb-changestream.md)
 Date: 2026-07-07
 Owner: @filenko
 Companion to: `docs/design/outbox-sequenced-log.md` (TiDB sequenced-log relay)
