@@ -21,6 +21,9 @@ type Message struct {
 	// Data is the serialized event payload.
 	Data []byte
 
-	// CreateTime is when the message was created (used for lag observability).
+	// CreateTime is when the message was inserted into the outbox (stamped by
+	// the Sender at publish). Distinct from Metadata.Time (the event's
+	// occurred-at, which publishers may backdate). Used as the age anchor for
+	// drain-lag observability and insert-time retention.
 	CreateTime time.Time
 }

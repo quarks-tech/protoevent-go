@@ -13,6 +13,10 @@ import (
 type Observer interface {
 	// ObserveDrained reports a drain/forward pass: count sent, age of the oldest
 	// event handled (lag), and whether more work is immediately waiting.
+	// oldestAge is measured from the runtime's committed anchor: insert-time
+	// (Message.CreateTime) age of the oldest event in the page for the
+	// sequence runtime, and committed-token (clusterTime) age for the stream
+	// runtime.
 	ObserveDrained(name string, count int, oldestAge time.Duration, more bool)
 	// ObserveError reports a pass-level error (leadership, read, forward, sweep).
 	ObserveError(name string, err error)

@@ -89,10 +89,14 @@ func TestLatePublishGetsHigherSeq(t *testing.T) {
 	}
 
 	var earlySeq, lateSeq int64
-	if err := testDB.QueryRow("SELECT seq FROM outbox WHERE subject = 'early'").Scan(&earlySeq); err != nil {
+	if err := testDB.QueryRow(
+		`SELECT seq FROM outbox WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.Subject')) = 'early'`,
+	).Scan(&earlySeq); err != nil {
 		t.Fatal(err)
 	}
-	if err := testDB.QueryRow("SELECT seq FROM outbox WHERE subject = 'late'").Scan(&lateSeq); err != nil {
+	if err := testDB.QueryRow(
+		`SELECT seq FROM outbox WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.Subject')) = 'late'`,
+	).Scan(&lateSeq); err != nil {
 		t.Fatal(err)
 	}
 	if lateSeq <= earlySeq {

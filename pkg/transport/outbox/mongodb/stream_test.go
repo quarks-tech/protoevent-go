@@ -2,9 +2,13 @@ package mongodb_test
 
 import (
 	"context"
+	"net/url"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/quarks-tech/protoevent-go/pkg/event"
 	mongodbstore "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/mongodb"
 )
 
@@ -122,6 +126,84 @@ func TestPBRTNonEmptyImmediatelyAfterWatch(t *testing.T) {
 	}
 	if ct.IsZero() {
 		t.Fatal("PBRT returned a zero clusterTime immediately after Watch")
+	}
+}
+
+// TestMetadataFullFidelityRoundTrip proves the mongo store round-trips the
+// FULL CloudEvents envelope — Extensions and DataSchema in particular — the
+// same way the TiDB store now does (pkg/transport/outbox/tidb), so both
+// backends honor the same envelope contract. Read back through the change
+// stream, since decodeMessage is package-internal.
+func TestMetadataFullFidelityRoundTrip(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	st.SetMaxAwaitTime(300 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	strm, err := st.Watch(ctx, "")
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	defer func() { _ = strm.Close(context.Background()) }()
+
+	md := event.NewMetadata("books.created")
+	md.ID = uuid.NewString()
+	md.SpecVersion = "1.0"
+	md.Source = "books-service"
+	md.Subject = "fidelity"
+	md.DataContentType = "application/proto"
+	md.Time = time.Now().UTC()
+	md.Extensions = map[string]interface{}{"partitionkey": "k1"}
+	schema, err := url.Parse("https://schemas.example.com/books/created/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	md.DataSchema = schema
+
+	id := publishMetadata(t, md, []byte("payload"))
+
+	var got *event.Metadata
+	for got == nil {
+		e, ok, err := strm.Next(ctx)
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if !ok {
+			continue
+		}
+		if e.Message.ID == id {
+			got = e.Message.Metadata
+		}
+	}
+
+	if got.SpecVersion != "1.0" {
+		t.Fatalf("SpecVersion = %q, want %q", got.SpecVersion, "1.0")
+	}
+	if got.Type != md.Type {
+		t.Fatalf("Type = %q, want %q", got.Type, md.Type)
+	}
+	if got.Source != md.Source {
+		t.Fatalf("Source = %q, want %q", got.Source, md.Source)
+	}
+	if got.Subject != md.Subject {
+		t.Fatalf("Subject = %q, want %q", got.Subject, md.Subject)
+	}
+	if got.DataContentType != md.DataContentType {
+		t.Fatalf("DataContentType = %q, want %q", got.DataContentType, md.DataContentType)
+	}
+	if v, ok := got.Extensions["partitionkey"]; !ok || v != "k1" {
+		t.Fatalf("Extensions[partitionkey] = %v, ok=%v; want k1, true", v, ok)
+	}
+	if got.DataSchema == nil {
+		t.Fatal("DataSchema is nil, want round-tripped URL")
+	}
+	if got.DataSchema.String() != schema.String() {
+		t.Fatalf("DataSchema = %q, want %q", got.DataSchema.String(), schema.String())
 	}
 }
 

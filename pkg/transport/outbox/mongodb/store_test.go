@@ -59,13 +59,21 @@ func reset(t *testing.T) {
 
 func publish(t *testing.T, subject string) string {
 	t.Helper()
-	st := mongodbstore.NewStore(testDB)
 	md := event.NewMetadata("books.created")
 	md.ID = uuid.NewString()
 	md.Source = "books-service"
 	md.Subject = subject
 	md.DataContentType = "application/proto"
 	md.Time = time.Now().UTC()
+	return publishMetadata(t, md, []byte("x"))
+}
+
+// publishMetadata publishes a caller-prepared *event.Metadata through the
+// production Sender (mirrors production: same session-txn helper as publish).
+// Returns the outbox row/event ID.
+func publishMetadata(t *testing.T, md *event.Metadata, data []byte) string {
+	t.Helper()
+	st := mongodbstore.NewStore(testDB)
 	// Publish in a transaction (mirrors production; requires the replica set).
 	sess, err := testDB.Client().StartSession()
 	if err != nil {
@@ -75,7 +83,7 @@ func publish(t *testing.T, subject string) string {
 	_, err = sess.WithTransaction(context.Background(), func(sc context.Context) (any, error) {
 		// Go through the production Sender so the default ReuseMetadataID
 		// generator (no explicit Message.ID) derives the row id from md.ID.
-		return nil, outbox.NewSender(st).Send(sc, md, []byte("x"))
+		return nil, outbox.NewSender(st).Send(sc, md, data)
 	})
 	if err != nil {
 		t.Fatalf("publish: %v", err)

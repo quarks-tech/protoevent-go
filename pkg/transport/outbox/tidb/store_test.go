@@ -3,6 +3,7 @@ package tidb_test
 import (
 	"context"
 	"database/sql"
+	"net/url"
 	"os"
 	"sync"
 	"testing"
@@ -57,18 +58,26 @@ func truncate(t *testing.T) {
 
 func publish(t *testing.T, subject string) string {
 	t.Helper()
-	tx, err := testDB.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	st := tidb.NewStore(tx)
 	md := event.NewMetadata("books.created")
 	md.ID = uuid.NewString()
 	md.Source = "books-service"
 	md.Subject = subject
 	md.DataContentType = "application/proto"
 	md.Time = time.Now().UTC()
-	if err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: md.ID, Metadata: md, Data: []byte("x")}); err != nil {
+	return publishMetadata(t, md, []byte("x"))
+}
+
+// publishMetadata publishes a caller-prepared *event.Metadata through the
+// production Sender (so CreateTime is stamped like a real publish), within a
+// transaction-scoped Runner. Returns the outbox row/event ID.
+func publishMetadata(t *testing.T, md *event.Metadata, data []byte) string {
+	t.Helper()
+	tx, err := testDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := tidb.NewStore(tx)
+	if err := outbox.NewSender(st).Send(context.Background(), md, data); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("publish: %v", err)
 	}
@@ -225,5 +234,69 @@ func TestLeaderLockMutualExclusionAndRelease(t *testing.T) {
 	}
 	if !okB2 {
 		t.Fatal("B failed to acquire after A released")
+	}
+}
+
+// TestMetadataFullFidelityRoundTrip proves the TiDB store now round-trips the
+// FULL CloudEvents envelope through the metadata JSON column — Extensions and
+// DataSchema in particular, which the old scalar-column schema dropped.
+func TestMetadataFullFidelityRoundTrip(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+
+	md := event.NewMetadata("books.created")
+	md.ID = uuid.NewString()
+	md.SpecVersion = "1.0"
+	md.Source = "books-service"
+	md.Subject = "fidelity"
+	md.DataContentType = "application/proto"
+	md.Time = time.Now().UTC()
+	md.Extensions = map[string]interface{}{"partitionkey": "k1"}
+	schema, err := url.Parse("https://schemas.example.com/books/created/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	md.DataSchema = schema
+
+	publishMetadata(t, md, []byte("payload"))
+
+	st := tidb.NewStoreDB(testDB)
+	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+	msgs, err := st.ListMessages(context.Background(), 0, 10)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("got %d messages, want 1", len(msgs))
+	}
+	got := msgs[0].Metadata
+
+	if got.SpecVersion != "1.0" {
+		t.Fatalf("SpecVersion = %q, want %q", got.SpecVersion, "1.0")
+	}
+	if got.Type != md.Type {
+		t.Fatalf("Type = %q, want %q", got.Type, md.Type)
+	}
+	if got.Source != md.Source {
+		t.Fatalf("Source = %q, want %q", got.Source, md.Source)
+	}
+	if got.Subject != md.Subject {
+		t.Fatalf("Subject = %q, want %q", got.Subject, md.Subject)
+	}
+	if got.DataContentType != md.DataContentType {
+		t.Fatalf("DataContentType = %q, want %q", got.DataContentType, md.DataContentType)
+	}
+	if v, ok := got.Extensions["partitionkey"]; !ok || v != "k1" {
+		t.Fatalf("Extensions[partitionkey] = %v, ok=%v; want k1, true", v, ok)
+	}
+	if got.DataSchema == nil {
+		t.Fatal("DataSchema is nil, want round-tripped URL")
+	}
+	if got.DataSchema.String() != schema.String() {
+		t.Fatalf("DataSchema = %q, want %q", got.DataSchema.String(), schema.String())
 	}
 }

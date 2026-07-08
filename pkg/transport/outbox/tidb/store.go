@@ -3,6 +3,7 @@ package tidb
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -54,10 +55,14 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 		return fmt.Errorf("outbox: parse message ID %q: %w", m.ID, err)
 	}
 	md := m.Metadata
+	meta, err := json.Marshal(md)
+	if err != nil {
+		return fmt.Errorf("outbox: marshal metadata: %w", err)
+	}
 	_, err = s.r.ExecContext(ctx, `
-INSERT INTO outbox (seq, tx_start_ts, event_id, `+"`type`"+`, source, subject, content_type, data, occurred_at)
-VALUES (NULL, @@tidb_current_ts, ?, ?, ?, ?, ?, ?, ?)`,
-		id[:], md.Type, md.Source, md.Subject, md.DataContentType, m.Data, md.Time.UTC(),
+INSERT INTO outbox (seq, tx_start_ts, event_id, metadata, data, create_time, occurred_at)
+VALUES (NULL, @@tidb_current_ts, ?, ?, ?, ?, ?)`,
+		id[:], meta, m.Data, m.CreateTime.UTC(), md.Time.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("outbox: insert: %w", err)
@@ -68,7 +73,7 @@ VALUES (NULL, @@tidb_current_ts, ?, ?, ?, ?, ?, ?, ?)`,
 // ListMessages returns sequenced rows with seq > afterSeq in seq order.
 func (s *Store) ListMessages(ctx context.Context, afterSeq int64, limit int) ([]*outbox.Message, error) {
 	rows, err := s.r.QueryContext(ctx, `
-SELECT seq, event_id, `+"`type`"+`, source, subject, content_type, data, occurred_at
+SELECT seq, event_id, metadata, data, create_time
 FROM outbox
 WHERE seq > ?
 ORDER BY seq
@@ -81,34 +86,29 @@ LIMIT ?`, afterSeq, limit)
 	var out []*outbox.Message
 	for rows.Next() {
 		var (
-			seq                               int64
-			eventID                           []byte
-			typ, source, subject, contentType string
-			data                              []byte
+			seq     int64
+			eventID []byte
+			meta    []byte
+			data    []byte
 		)
-		var occurredAt = new(sqlTime)
-		if err := rows.Scan(&seq, &eventID, &typ, &source, &subject, &contentType, &data, occurredAt); err != nil {
+		var createTime = new(sqlTime)
+		if err := rows.Scan(&seq, &eventID, &meta, &data, createTime); err != nil {
 			return nil, fmt.Errorf("outbox: scan: %w", err)
 		}
 		id, err := uuid.FromBytes(eventID)
 		if err != nil {
 			return nil, fmt.Errorf("outbox: event_id not a uuid: %w", err)
 		}
-		md := &event.Metadata{
-			SpecVersion:     "1.0",
-			ID:              id.String(),
-			Type:            typ,
-			Source:          source,
-			Subject:         subject,
-			DataContentType: contentType,
-			Time:            occurredAt.t,
+		var md event.Metadata
+		if err := json.Unmarshal(meta, &md); err != nil {
+			return nil, fmt.Errorf("outbox: unmarshal metadata: %w", err)
 		}
 		out = append(out, &outbox.Message{
 			ID:         id.String(),
 			Seq:        seq,
-			Metadata:   md,
+			Metadata:   &md,
 			Data:       data,
-			CreateTime: occurredAt.t,
+			CreateTime: createTime.t,
 		})
 	}
 	return out, rows.Err()
@@ -227,14 +227,16 @@ func (s *Store) ReleaseLeaderLock(ctx context.Context, name, holderID string) er
 }
 
 // SweepMessages deletes sequenced rows at or below the minimum committed offset
-// across all consumers and older than `before`, bounded to `limit`. If no
-// offsets exist yet, MIN(last_seq) is NULL and nothing is deleted.
+// across all consumers and inserted (create_time) before `before`, bounded to
+// `limit`. Retention is anchored to insert time, not event time, so a
+// backdated WithEventTime event is not swept early. If no offsets exist yet,
+// MIN(last_seq) is NULL and nothing is deleted.
 func (s *Store) SweepMessages(ctx context.Context, before time.Time, limit int) (int, error) {
 	res, err := s.r.ExecContext(ctx, `
 DELETE FROM outbox
 WHERE seq IS NOT NULL
   AND seq <= (SELECT MIN(last_seq) FROM outbox_offsets)
-  AND occurred_at < ?
+  AND create_time < ?
 LIMIT ?`, before.UTC(), limit)
 	if err != nil {
 		return 0, fmt.Errorf("outbox: sweep: %w", err)
