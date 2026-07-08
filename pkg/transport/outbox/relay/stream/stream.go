@@ -107,14 +107,13 @@ func WithErrorHandler(h func(ctx context.Context, msg *outbox.Message, err error
 
 // Relay tails the outbox change stream for one consumer group and forwards to a Sender.
 type Relay struct {
-	name     string
-	store    StreamStore
-	sender   eventbus.Sender
-	options  Options
-	holderID string
+	name    string
+	store   StreamStore
+	sender  eventbus.Sender
+	options Options
+	leader  *relay.LeaderElector
 
 	// Runtime state, populated by Run/RunOnce (pkg/.../stream/run.go).
-	isLeader    bool
 	stream      Stream
 	committedCT time.Time
 }
@@ -147,10 +146,10 @@ func NewRelay(name string, store StreamStore, sender eventbus.Sender, opts ...Op
 	}
 
 	return &Relay{
-		name:     name,
-		store:    store,
-		sender:   sender,
-		options:  options,
-		holderID: uuid.NewString(),
+		name:    name,
+		store:   store,
+		sender:  sender,
+		options: options,
+		leader:  relay.NewLeaderElector(store, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
 	}, nil
 }

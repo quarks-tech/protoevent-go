@@ -5,17 +5,14 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
-
-const releaseTimeout = 5 * time.Second
 
 // Run drives the relay until ctx is canceled, then releases leadership so a
 // planned shutdown fails over in well under LeaseTTL.
 func (r *Relay) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.options.PollInterval)
 	defer ticker.Stop()
-	defer r.releaseLeadership()
+	defer r.leader.Release()
 
 	for {
 		select {
@@ -36,7 +33,7 @@ func (r *Relay) Run(ctx context.Context) error {
 // cadence) sweep. Rows sequenced this tick are drained this tick because the
 // sequencer pass commits before the drain query runs.
 func (r *Relay) RunOnce(ctx context.Context) error {
-	isLeader, err := r.tryAcquireLeadership(ctx)
+	isLeader, err := r.leader.TryAcquire(ctx)
 	if err != nil {
 		return err
 	}
@@ -51,31 +48,6 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 		return err
 	}
 	return r.maybeSweep(ctx)
-}
-
-func (r *Relay) tryAcquireLeadership(ctx context.Context) (bool, error) {
-	ls, ok := r.store.(relay.LeaderStore)
-	if !ok {
-		r.isLeader = true
-		return true, nil
-	}
-	held, err := ls.TryAcquireLeaderLock(ctx, r.options.LeaderLockName, r.holderID, r.options.LeaseTTL)
-	if err != nil {
-		return false, err
-	}
-	r.isLeader = held
-	return held, nil
-}
-
-func (r *Relay) releaseLeadership() {
-	ls, ok := r.store.(relay.LeaderStore)
-	if !ok || !r.isLeader {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
-	defer cancel()
-	_ = ls.ReleaseLeaderLock(ctx, r.options.LeaderLockName, r.holderID)
-	r.isLeader = false
 }
 
 // sequence assigns offsets to committed pending rows, looping while pages are

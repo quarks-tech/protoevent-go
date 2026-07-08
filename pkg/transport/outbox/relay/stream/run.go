@@ -6,10 +6,7 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
-
-const releaseTimeout = 5 * time.Second
 
 // ErrStreamInvalidated is returned when the change stream emits an invalidate
 // event (the outbox collection was dropped/renamed). Fatal.
@@ -28,7 +25,7 @@ var errLaneStopped = errors.New("stream: lane stopped on send failure; will reop
 // Releases leadership on exit so a planned shutdown fails over quickly.
 func (r *Relay) Run(ctx context.Context) error {
 	defer r.closeStream(context.Background())
-	defer r.releaseLeadership()
+	defer r.leader.Release()
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -60,7 +57,7 @@ func (r *Relay) Run(ctx context.Context) error {
 // RunOnce performs one leader-gated drain window. Non-leaders return nil without
 // touching the stream. Exposed for tests; Run calls it in a loop.
 func (r *Relay) RunOnce(ctx context.Context) error {
-	leader, err := r.tryAcquireLeadership(ctx)
+	leader, err := r.leader.TryAcquire(ctx)
 	if err != nil {
 		return err
 	}
@@ -167,31 +164,6 @@ func (r *Relay) committedTokenAge() time.Duration {
 		return 0
 	}
 	return time.Since(r.committedCT)
-}
-
-func (r *Relay) tryAcquireLeadership(ctx context.Context) (bool, error) {
-	ls, ok := r.store.(relay.LeaderStore)
-	if !ok {
-		r.isLeader = true
-		return true, nil
-	}
-	held, err := ls.TryAcquireLeaderLock(ctx, r.options.LeaderLockName, r.holderID, r.options.LeaseTTL)
-	if err != nil {
-		return false, err
-	}
-	r.isLeader = held
-	return held, nil
-}
-
-func (r *Relay) releaseLeadership() {
-	ls, ok := r.store.(relay.LeaderStore)
-	if !ok || !r.isLeader {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
-	defer cancel()
-	_ = ls.ReleaseLeaderLock(ctx, r.options.LeaderLockName, r.holderID)
-	r.isLeader = false
 }
 
 func (r *Relay) closeStream(ctx context.Context) {

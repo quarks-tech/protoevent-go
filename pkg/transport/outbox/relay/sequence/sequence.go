@@ -147,14 +147,13 @@ func WithRetention(window time.Duration, sweepEvery, sweepBatch int) Option {
 // Relay tails the sequenced log for one consumer (identified by name) and
 // forwards messages to another transport in Seq order.
 type Relay struct {
-	name     string
-	store    Store
-	sender   eventbus.Sender
-	options  Options
-	holderID string
+	name    string
+	store   Store
+	sender  eventbus.Sender
+	options Options
+	leader  *relay.LeaderElector
 
-	isLeader  bool // whether this instance currently holds the lock
-	tickCount int  // for retention cadence
+	tickCount int // for retention cadence
 
 	// offsetInitialized latches once InitOffsetLatest has run for this Relay
 	// instance, so a still-empty-log group (offset genuinely 0 with nothing to
@@ -178,10 +177,10 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	}
 
 	return &Relay{
-		name:     name,
-		store:    store,
-		sender:   sender,
-		options:  options,
-		holderID: uuid.NewString(),
+		name:    name,
+		store:   store,
+		sender:  sender,
+		options: options,
+		leader:  relay.NewLeaderElector(store, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
 	}
 }
