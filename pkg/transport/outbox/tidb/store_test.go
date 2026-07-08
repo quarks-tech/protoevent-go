@@ -50,7 +50,9 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func truncate(t *testing.T) {
+// truncate and publish/publishMetadata below take testing.TB (rather than
+// *testing.T) so both tests and benchmarks in this package can share them.
+func truncate(t testing.TB) {
 	t.Helper()
 	for _, q := range []string{
 		"DELETE FROM outbox", "DELETE FROM outbox_offsets", "DELETE FROM relay_lock",
@@ -62,7 +64,7 @@ func truncate(t *testing.T) {
 	}
 }
 
-func publish(t *testing.T, subject string) string {
+func publish(t testing.TB, subject string) string {
 	t.Helper()
 	md := event.NewMetadata("books.created")
 	md.ID = uuid.NewString()
@@ -76,7 +78,7 @@ func publish(t *testing.T, subject string) string {
 // publishMetadata publishes a caller-prepared *event.Metadata through the
 // production Sender (so CreateTime is stamped like a real publish), within a
 // transaction-scoped Runner. Returns the outbox row/event ID.
-func publishMetadata(t *testing.T, md *event.Metadata, data []byte) string {
+func publishMetadata(t testing.TB, md *event.Metadata, data []byte) string {
 	t.Helper()
 	tx, err := testDB.Begin()
 	if err != nil {

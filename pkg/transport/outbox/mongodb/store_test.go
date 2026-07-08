@@ -54,7 +54,9 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func reset(t *testing.T) {
+// reset and publish/publishMetadata below take testing.TB (rather than
+// *testing.T) so both tests and benchmarks in this package can share them.
+func reset(t testing.TB) {
 	t.Helper()
 	for _, c := range []string{"outbox", "outbox_offsets", "relay_lock"} {
 		if err := testDB.Collection(c).Drop(context.Background()); err != nil {
@@ -63,7 +65,7 @@ func reset(t *testing.T) {
 	}
 }
 
-func publish(t *testing.T, subject string) string {
+func publish(t testing.TB, subject string) string {
 	t.Helper()
 	md := event.NewMetadata("books.created")
 	md.ID = uuid.NewString()
@@ -77,7 +79,7 @@ func publish(t *testing.T, subject string) string {
 // publishMetadata publishes a caller-prepared *event.Metadata through the
 // production Sender (mirrors production: same session-txn helper as publish).
 // Returns the outbox row/event ID.
-func publishMetadata(t *testing.T, md *event.Metadata, data []byte) string {
+func publishMetadata(t testing.TB, md *event.Metadata, data []byte) string {
 	t.Helper()
 	st := mongodbstore.NewStore(testDB)
 	// Publish in a transaction (mirrors production; requires the replica set).
