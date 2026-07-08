@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -54,6 +55,19 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 	if err != nil {
 		_ = c.Terminate(ctx)
 		return nil, nil, fmt.Errorf("connect: %w", err)
+	}
+	// Ping so a bad DSN (or a container that never becomes reachable) fails
+	// loudly here, at Start, with a clear error — instead of surfacing as a
+	// confusing timeout on the caller's first real operation. A ping failure
+	// after the container itself started successfully is a genuine harness
+	// bug, not a missing-Docker condition, so it is NOT wrapped in
+	// ErrDockerUnavailable.
+	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := client.Ping(pingCtx, nil); err != nil {
+		_ = client.Disconnect(context.Background())
+		_ = c.Terminate(ctx)
+		return nil, nil, fmt.Errorf("ping mongodb: %w", err)
 	}
 	inst := &Instance{
 		Client:    client,

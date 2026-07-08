@@ -9,7 +9,7 @@ import (
 
 // Observer receives lag/throughput signals common to every relay runtime. It is
 // the dependency-free observability seam: callers wire it to Prometheus etc.
-// Values are derived from data the relay passes already hold — no extra queries.
+// Values are derived from data the relay's passes already hold — no extra queries.
 type Observer interface {
 	// ObserveDrained reports a drain/forward pass: count sent, age of the oldest
 	// event handled (lag), and whether more work is immediately waiting.

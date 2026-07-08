@@ -72,6 +72,10 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 	if err != nil {
 		return fmt.Errorf("outbox: marshal metadata: %w", err)
 	}
+	// occurred_at is kept as a queryable/indexable event-time column for
+	// operators and future event-time features; the engine itself reads event
+	// time from the metadata JSON, and retention (SweepMessages) is
+	// create_time-anchored, not occurred_at-anchored.
 	_, err = s.r.ExecContext(ctx, `
 INSERT INTO outbox (seq, tx_start_ts, event_id, metadata, data, create_time, occurred_at)
 VALUES (NULL, @@tidb_current_ts, ?, ?, ?, ?, ?)`,
@@ -267,6 +271,12 @@ func (s *Store) ReleaseLeaderLock(ctx context.Context, name, holderID string) er
 // `limit`. Retention is anchored to insert time, not event time, so a
 // backdated WithEventTime event is not swept early. If no offsets exist yet,
 // MIN(last_seq) is NULL and nothing is deleted.
+//
+// MIN(last_seq) spans only registered offset rows: a consumer group that was
+// created but never run (or InitOffsetLatest'd) has no outbox_offsets row and
+// so provides no retention protection at all — an unrun group does not hold
+// the sweep back. Consumer groups must run (or call InitOffsetLatest) within
+// the retention window to be protected from the sweep.
 func (s *Store) SweepMessages(ctx context.Context, before time.Time, limit int) (int, error) {
 	res, err := s.r.ExecContext(ctx, `
 DELETE FROM outbox

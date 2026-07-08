@@ -67,16 +67,22 @@ type Store struct {
 type Option func(*Store)
 
 // WithMaxAwaitTime sets the change stream's server-side max await per window;
-// SHOULD match the stream relay's WithDrainWindow. Default 1s.
+// SHOULD match the stream relay's WithDrainWindow. Default 1s. A non-positive
+// d is ignored (mirrors WithLogger/WithObserver's nil-guard style elsewhere
+// in this codebase), leaving the default (or a prior option's value) intact.
 func WithMaxAwaitTime(d time.Duration) Option {
-	return func(s *Store) { s.maxAwait = d }
+	return func(s *Store) {
+		if d > 0 {
+			s.maxAwait = d
+		}
+	}
 }
 
 // NewStore creates a Store realizing the outbox publish + relay-read contracts
 // over db. Use WithMaxAwaitTime to tune the change stream's server-side await
 // window; it defaults to 1s.
 func NewStore(db *mongo.Database, opts ...Option) *Store {
-	s := &Store{db: db}
+	s := &Store{db: db, maxAwait: time.Second}
 	for _, opt := range opts {
 		opt(s)
 	}

@@ -36,6 +36,9 @@ type changeEvent struct {
 func (s *Store) Watch(ctx context.Context, token string) (stream.Stream, error) {
 	await := s.maxAwait
 	if await <= 0 {
+		// Pure defense: NewStore always sets a positive default and
+		// WithMaxAwaitTime ignores non-positive values, so this branch
+		// should be unreachable via the public API.
 		await = time.Second
 	}
 	pipeline := mongo.Pipeline{

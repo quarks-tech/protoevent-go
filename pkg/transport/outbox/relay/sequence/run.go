@@ -69,7 +69,11 @@ func (r *Relay) sequence(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		r.options.Observer.ObserveSequenced(r.name, n)
+		if n > 0 {
+			// Match drain's idle behavior: don't report a signal for an idle
+			// pass that sequenced nothing.
+			r.options.Observer.ObserveSequenced(r.name, n)
+		}
 		if n < r.options.SequenceBatchSize {
 			return nil
 		}

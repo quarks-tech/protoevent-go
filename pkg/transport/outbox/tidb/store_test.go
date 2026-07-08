@@ -161,9 +161,7 @@ func TestConcurrentSequencersNoDuplicateNoGap(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				n, err := st.SequenceMessages(context.Background(), 20)
 				if err != nil {
@@ -174,7 +172,7 @@ func TestConcurrentSequencersNoDuplicateNoGap(t *testing.T) {
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
