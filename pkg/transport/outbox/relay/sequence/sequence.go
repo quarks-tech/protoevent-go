@@ -168,6 +168,9 @@ type Relay struct {
 	options Options
 	leader  *relay.LeaderElector
 
+	sequencer SequencerStore // nil if store lacks the capability or WithoutSequencer
+	retention RetentionStore // nil if store lacks the capability or retention not configured
+
 	tickCount int // for retention cadence
 
 	// offsetInitialized latches once InitOffsetLatest has run for this Relay
@@ -211,11 +214,22 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 			options.RetentionWindow, options.RetentionSweepEvery, options.RetentionSweepBatch)
 	}
 
-	return &Relay{
+	ls, _ := store.(relay.LeaderStore)
+
+	r := &Relay{
 		name:    name,
 		store:   store,
 		sender:  sender,
 		options: options,
-		leader:  relay.NewLeaderElector(store, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
-	}, nil
+		leader:  relay.NewLeaderElector(ls, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
+	}
+
+	if !options.DisableSequencer {
+		r.sequencer, _ = store.(SequencerStore)
+	}
+	if options.RetentionWindow > 0 {
+		r.retention, _ = store.(RetentionStore)
+	}
+
+	return r, nil
 }

@@ -60,12 +60,11 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 // sequence assigns offsets to committed pending rows, looping while pages are
 // full so a burst is fully sequenced within the tick.
 func (r *Relay) sequence(ctx context.Context) error {
-	ss, ok := r.store.(SequencerStore)
-	if !ok || r.options.DisableSequencer {
+	if r.sequencer == nil {
 		return nil
 	}
 	for {
-		n, err := ss.SequenceMessages(ctx, r.options.SequenceBatchSize)
+		n, err := r.sequencer.SequenceMessages(ctx, r.options.SequenceBatchSize)
 		if err != nil {
 			return err
 		}
@@ -147,11 +146,7 @@ func (r *Relay) drain(ctx context.Context) error {
 }
 
 func (r *Relay) maybeSweep(ctx context.Context) error {
-	if r.options.RetentionWindow <= 0 || r.options.RetentionSweepEvery <= 0 {
-		return nil
-	}
-	rs, ok := r.store.(RetentionStore)
-	if !ok {
+	if r.retention == nil {
 		return nil
 	}
 	r.tickCount++
@@ -159,7 +154,7 @@ func (r *Relay) maybeSweep(ctx context.Context) error {
 		return nil
 	}
 	before := time.Now().Add(-r.options.RetentionWindow)
-	_, err := rs.SweepMessages(ctx, before, r.options.RetentionSweepBatch)
+	_, err := r.retention.SweepMessages(ctx, before, r.options.RetentionSweepBatch)
 	return err
 }
 

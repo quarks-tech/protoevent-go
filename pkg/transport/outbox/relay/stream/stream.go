@@ -168,11 +168,13 @@ func NewRelay(name string, store StreamStore, sender eventbus.Sender, opts ...Op
 		return nil, fmt.Errorf("stream: DrainWindow (%v) must be < LeaseTTL/2 (%v)", options.DrainWindow, options.LeaseTTL/2)
 	}
 
+	ls, _ := store.(relay.LeaderStore)
+
 	return &Relay{
 		name:    name,
 		store:   store,
 		sender:  sender,
 		options: options,
-		leader:  relay.NewLeaderElector(store, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
+		leader:  relay.NewLeaderElector(ls, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
 	}, nil
 }

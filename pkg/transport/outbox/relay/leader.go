@@ -21,11 +21,10 @@ type LeaderElector struct {
 	isLeader bool
 }
 
-// NewLeaderElector builds a LeaderElector over store. If store does not
-// implement LeaderStore, the returned elector always reports leadership
-// (single-instance deployments need no lock).
-func NewLeaderElector(store any, lockName, holderID string, ttl time.Duration) *LeaderElector {
-	ls, _ := store.(LeaderStore)
+// NewLeaderElector builds a LeaderElector over ls. ls may be nil: a nil
+// LeaderStore means no election — the elector always reports leadership
+// (single-instance deployments).
+func NewLeaderElector(ls LeaderStore, lockName, holderID string, ttl time.Duration) *LeaderElector {
 	return &LeaderElector{ls: ls, lockName: lockName, holderID: holderID, ttl: ttl}
 }
 
