@@ -5,6 +5,7 @@ package tidbtest
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -20,11 +21,18 @@ import (
 )
 
 const (
-	tidbImage = "pingcap/tidb:v7.5.1"
-	dbName    = "outbox_test"
-	startupTO = 180 * time.Second
-	tidbPort  = "4000/tcp"
+	tidbImage      = "pingcap/tidb:v7.5.1"
+	dbName         = "outbox_test"
+	startupTimeout = 180 * time.Second
+	tidbPort       = "4000/tcp"
 )
+
+// ErrDockerUnavailable marks errors caused by Docker/the container runtime
+// being unavailable, as opposed to a genuine harness bug (e.g. a bad DSN, a
+// failed migration, or a driver API mismatch). Callers should use errors.Is
+// against this sentinel to decide whether a Start failure is an acceptable
+// skip or a real failure.
+var ErrDockerUnavailable = errors.New("docker unavailable")
 
 type Instance struct {
 	DB        *sql.DB
@@ -33,45 +41,53 @@ type Instance struct {
 }
 
 // Start boots TiDB, creates the db, applies migrations, and returns a ready
-// Instance + cleanup. Returns an error (tests should t.Skip on it) when Docker
-// is unavailable.
+// Instance + cleanup. Returns an error wrapping ErrDockerUnavailable (callers
+// should use errors.Is against it to decide whether to skip) when Docker/the
+// container runtime is unavailable; any other error is a genuine harness bug
+// and callers should fail loudly on it.
 func Start(ctx context.Context) (*Instance, func(), error) {
 	req := testcontainers.ContainerRequest{
 		Image:        tidbImage,
 		ExposedPorts: []string{tidbPort},
 		WaitingFor: wait.ForSQL(tidbPort, "mysql", func(host string, port network.Port) string {
 			return fmt.Sprintf("root:@tcp(%s:%s)/", host, port.Port())
-		}).WithStartupTimeout(startupTO),
+		}).WithStartupTimeout(startupTimeout),
 	}
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req, Started: true,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("start tidb (Docker unavailable?): %w", err)
+		return nil, nil, fmt.Errorf("start tidb container: %w", errors.Join(ErrDockerUnavailable, err))
 	}
+
+	// cleanup is disarmed (set to nil) once Start succeeds; until then it
+	// unwinds whatever has been created so far on any error return.
+	cleanup := func() { _ = c.Terminate(context.Background()) }
+	defer func() {
+		if cleanup != nil {
+			cleanup()
+		}
+	}()
+
 	host, err := c.Host(ctx)
 	if err != nil {
-		_ = c.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("get tidb container host: %w", err)
 	}
 	mapped, err := c.MappedPort(ctx, tidbPort)
 	if err != nil {
-		_ = c.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("get tidb mapped port: %w", err)
 	}
 	base := fmt.Sprintf("root:@tcp(%s:%s)/", host, mapped.Port())
 
 	admin, err := sql.Open("mysql", base)
 	if err != nil {
-		_ = c.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("open admin connection: %w", err)
 	}
-	if _, err := admin.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+dbName); err != nil {
-		_ = admin.Close()
-		_ = c.Terminate(ctx)
-		return nil, nil, err
-	}
+	_, execErr := admin.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS "+dbName)
 	_ = admin.Close()
+	if execErr != nil {
+		return nil, nil, fmt.Errorf("create database %s: %w", dbName, execErr)
+	}
 
 	// tidb_skip_isolation_level_check=1: golang-migrate's mysql driver runs
 	// migrations inside a sql.LevelSerializable transaction; TiDB rejects
@@ -79,34 +95,28 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 	dsn := base + dbName + "?parseTime=true&loc=UTC&multiStatements=true&tidb_skip_isolation_level_check=1"
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		_ = c.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("open tidb connection: %w", err)
 	}
+	cleanup = func() { _ = db.Close(); _ = c.Terminate(context.Background()) }
 
 	src, err := iofs.New(tidb.Migrations, "migrations")
 	if err != nil {
-		_ = db.Close()
-		_ = c.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("open migrations source: %w", err)
 	}
 	drv, err := migratemysql.WithInstance(db, &migratemysql.Config{DatabaseName: dbName})
 	if err != nil {
-		_ = db.Close()
-		_ = c.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("create migrate driver: %w", err)
 	}
 	m, err := migrate.NewWithInstance("iofs", src, "mysql", drv)
 	if err != nil {
-		_ = db.Close()
-		_ = c.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("create migrator: %w", err)
 	}
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		_ = db.Close()
-		_ = c.Terminate(ctx)
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("apply migrations: %w", err)
 	}
 
-	inst := &Instance{DB: db, DSN: dsn, terminate: func() { _ = db.Close(); _ = c.Terminate(context.Background()) }}
-	return inst, inst.terminate, nil
+	inst := &Instance{DB: db, DSN: dsn, terminate: cleanup}
+	terminate := cleanup
+	cleanup = nil // disarm the deferred unwind: ownership passes to the caller
+	return inst, terminate, nil
 }

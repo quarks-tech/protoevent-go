@@ -3,6 +3,8 @@ package tidb_test
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"sync"
@@ -35,8 +37,12 @@ var testDB *sql.DB
 func TestMain(m *testing.M) {
 	inst, cleanup, err := tidbtest.Start(context.Background())
 	if err != nil {
-		// Docker unavailable: skip the whole integration suite.
-		os.Exit(0)
+		if errors.Is(err, tidbtest.ErrDockerUnavailable) {
+			fmt.Fprintf(os.Stderr, "skipping tidb integration tests: %v\n", err)
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stderr, "tidb integration setup: %v\n", err)
+		os.Exit(1) // real harness bug, not a missing Docker
 	}
 	testDB = inst.DB
 	code := m.Run()
