@@ -155,6 +155,15 @@ func NewRelay(name string, store StreamStore, sender eventbus.Sender, opts ...Op
 	if options.LeaderLockName == "" {
 		options.LeaderLockName = name
 	}
+	if options.DrainWindow <= 0 {
+		return nil, fmt.Errorf("stream: DrainWindow must be > 0, got %v", options.DrainWindow)
+	}
+	if options.LeaseTTL <= 0 {
+		return nil, fmt.Errorf("stream: LeaseTTL must be > 0, got %v", options.LeaseTTL)
+	}
+	if options.TokenBatchSize <= 0 {
+		return nil, fmt.Errorf("stream: TokenBatchSize must be > 0, got %d", options.TokenBatchSize)
+	}
 	if options.DrainWindow >= options.LeaseTTL/2 {
 		return nil, fmt.Errorf("stream: DrainWindow (%v) must be < LeaseTTL/2 (%v)", options.DrainWindow, options.LeaseTTL/2)
 	}

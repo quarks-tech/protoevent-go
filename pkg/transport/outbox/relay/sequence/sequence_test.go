@@ -94,6 +94,16 @@ func TestNewRelayRejectsZeroLeaseTTL(t *testing.T) {
 	}
 }
 
+func TestNewRelayRejectsRetentionWindowWithoutSweepCadence(t *testing.T) {
+	// A positive RetentionWindow with a zero sweep cadence/batch would make
+	// retention silently non-functional (maybeSweep's `<= 0` guard always
+	// skips it), so it must be rejected at construction time.
+	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithRetention(24*time.Hour, 0, 0))
+	if err == nil {
+		t.Fatal("expected error for RetentionWindow with zero sweep cadence, got nil")
+	}
+}
+
 func TestNewRelayAcceptsDefaults(t *testing.T) {
 	r, err := sequence.NewRelay("c", newFakeStore(), nil)
 	if err != nil || r == nil {

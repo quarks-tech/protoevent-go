@@ -206,6 +206,10 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	if options.LeaseTTL <= 0 {
 		return nil, fmt.Errorf("sequence: LeaseTTL must be > 0, got %v", options.LeaseTTL)
 	}
+	if options.RetentionWindow > 0 && (options.RetentionSweepEvery <= 0 || options.RetentionSweepBatch <= 0) {
+		return nil, fmt.Errorf("sequence: RetentionWindow (%v) requires RetentionSweepEvery > 0 and RetentionSweepBatch > 0, got %d and %d",
+			options.RetentionWindow, options.RetentionSweepEvery, options.RetentionSweepBatch)
+	}
 
 	return &Relay{
 		name:    name,

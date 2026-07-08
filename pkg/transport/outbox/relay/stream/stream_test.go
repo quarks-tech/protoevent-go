@@ -34,6 +34,24 @@ func TestNewRelayRejectsDrainWindowTooLarge(t *testing.T) {
 	}
 }
 
+func TestNewRelayRejectsZeroDrainWindow(t *testing.T) {
+	// A zero DrainWindow would busy-spin r.sleep (time.NewTimer(0) fires
+	// immediately), so it must be rejected at construction time.
+	_, err := stream.NewRelay("c", nil, nil, stream.WithDrainWindow(0))
+	if err == nil {
+		t.Fatal("expected error for zero DrainWindow, got nil")
+	}
+}
+
+func TestNewRelayRejectsZeroTokenBatchSize(t *testing.T) {
+	// A zero TokenBatchSize would make drainWindow's `for range` loop no-op
+	// every call, spinning without ever draining anything.
+	_, err := stream.NewRelay("c", nil, nil, stream.WithTokenBatchSize(0))
+	if err == nil {
+		t.Fatal("expected error for zero TokenBatchSize, got nil")
+	}
+}
+
 func TestNewRelayAcceptsValidWindow(t *testing.T) {
 	r, err := stream.NewRelay("c", nil, nil,
 		stream.WithLeaseTTL(10*time.Second), stream.WithDrainWindow(1*time.Second))
