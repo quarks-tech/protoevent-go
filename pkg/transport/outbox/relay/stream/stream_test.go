@@ -74,29 +74,37 @@ func (s *fakeStream) Close(context.Context) error {
 
 // fakeStreamStore hands out one fakeStream and records saved tokens.
 type fakeStreamStore struct {
-	mu         sync.Mutex
-	stream     *fakeStream
-	loadTok    string
-	loadCT     time.Time
-	savedTok   string
-	savedCT    time.Time
-	saveCount  int
-	watchCount int
-	leader     string
+	mu          sync.Mutex
+	stream      *fakeStream
+	loadTok     string
+	loadCT      time.Time
+	savedTok    string
+	savedCT     time.Time
+	saveCount   int
+	watchCount  int
+	watchTokens []string // token passed to each Watch call, in order
+	leader      string
 }
 
 func (s *fakeStreamStore) LoadToken(context.Context, string) (string, time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.loadTok, s.loadCT, nil
 }
+
+// SaveToken records the save and also updates loadTok/loadCT, mimicking a
+// real store: the next LoadToken reflects what was just persisted.
 func (s *fakeStreamStore) SaveToken(_ context.Context, _ string, tok string, ct time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.savedTok, s.savedCT, s.saveCount = tok, ct, s.saveCount+1
+	s.loadTok, s.loadCT = tok, ct
 	return nil
 }
-func (s *fakeStreamStore) Watch(context.Context, string) (stream.Stream, error) {
+func (s *fakeStreamStore) Watch(_ context.Context, token string) (stream.Stream, error) {
 	s.mu.Lock()
 	s.watchCount++
+	s.watchTokens = append(s.watchTokens, token)
 	s.mu.Unlock()
 	return s.stream, nil
 }
@@ -257,5 +265,48 @@ func TestRunOncePicksUpWhereItLeftOff(t *testing.T) {
 	}
 	if fs.closeCount != 0 {
 		t.Fatalf("closeCount = %d, want 0 (park-and-continue keeps draining the same cursor)", fs.closeCount)
+	}
+}
+
+// TestRunOnceFreshGroupPersistsBaselineBeforeDrain is the regression test for
+// the at-least-once hole: a brand-new consumer group (LoadToken == "") opens
+// its stream at "now", and if the FIRST drained event fails to send under
+// stop-the-lane, drainWindow's processed==0 branch persists nothing. Without
+// a pre-drain baseline persist, the next RunOnce would reopen with LoadToken
+// still "" -> a fresh "now" -> silently skipping the failed event. RunOnce
+// must persist the stream's initial resume token (PBRT, available
+// immediately after Watch, before any Next) as a baseline BEFORE draining, so
+// reopening after the failure resumes from a point preceding the failed
+// event instead of from a fresh "now".
+func TestRunOnceFreshGroupPersistsBaselineBeforeDrain(t *testing.T) {
+	fs := &fakeStream{
+		events: []*stream.Event{ev(1, "a", false)},
+		pbrt:   "baseline",
+		pbrtCT: time.Now(),
+	}
+	st := &fakeStreamStore{stream: fs} // loadTok == "" : fresh consumer group
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+		return errors.New("boom") // first event fails; no ErrorHandler -> stop-the-lane
+	})
+	r, _ := stream.NewRelay("c", st, sender)
+	_ = r.RunOnce(context.Background())
+
+	if len(st.watchTokens) != 1 || st.watchTokens[0] != "" {
+		t.Fatalf("watch tokens = %v, want [\"\"] (fresh group opens at \"now\")", st.watchTokens)
+	}
+	if st.saveCount != 1 {
+		t.Fatalf("saveCount = %d, want 1 (baseline persisted pre-drain; stop-the-lane with processed==0 persists nothing further)", st.saveCount)
+	}
+	if st.savedTok != "baseline" {
+		t.Fatalf("saved token = %q, want %q (baseline persisted despite the first-event failure)", st.savedTok, "baseline")
+	}
+
+	// The next reopen must resume from the baseline, not restart at a fresh "now".
+	tok, _, err := st.LoadToken(context.Background(), "c")
+	if err != nil {
+		t.Fatalf("LoadToken: %v", err)
+	}
+	if tok != "baseline" {
+		t.Fatalf("LoadToken after RunOnce = %q, want %q (baseline persisted, not fresh now)", tok, "baseline")
 	}
 }

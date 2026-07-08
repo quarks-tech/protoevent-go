@@ -122,6 +122,18 @@ type Relay struct {
 // NewRelay creates a stream relay for the named consumer group. It returns an
 // error if DrainWindow is not strictly less than LeaseTTL/2 (the lease must be
 // renewable within a single drain window).
+//
+// Note this guard only bounds the *idle* wait inside a window (the change
+// stream's maxAwaitTime), not the total time a drainWindow call can take: the
+// leader lease is renewed once per RunOnce call, not within a drain window,
+// and a single drainWindow can issue up to TokenBatchSize synchronous
+// Sender.Send calls before returning. A slow Sender can therefore make one
+// drainWindow run longer than LeaseTTL, letting a transient second leader
+// acquire the lease and drain an overlapping range while the first is still
+// mid-window. At-least-once still holds (the consumer's event_id dedup
+// absorbs the overlap), but the single-active-consumer property weakens.
+// Operators should size TokenBatchSize x worst-case Sender.Send latency <
+// LeaseTTL to keep a window inside one lease term (see design doc §8.2).
 func NewRelay(name string, store StreamStore, sender eventbus.Sender, opts ...Option) (*Relay, error) {
 	options := DefaultOptions()
 	for _, opt := range opts {

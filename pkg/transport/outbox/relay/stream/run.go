@@ -79,6 +79,19 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 		}
 		r.stream = s
 		r.committedCT = ct
+		if token == "" {
+			// Fresh consumer group: establish a resume baseline from the stream's
+			// initial resume token BEFORE draining, so a first-window send failure
+			// (stop-the-lane, processed==0, which persists nothing) reopens from a
+			// point preceding the failed event instead of restarting at a fresh
+			// "now" and silently skipping it.
+			if btok, bct := r.stream.PBRT(); btok != "" {
+				if err := r.store.SaveToken(ctx, r.name, btok, bct); err != nil {
+					return err
+				}
+				r.committedCT = bct
+			}
+		}
 	}
 	return r.drainWindow(ctx)
 }

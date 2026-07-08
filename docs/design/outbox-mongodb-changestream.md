@@ -360,6 +360,16 @@ the lease, batch-persist the token, and re-check `ctx`). `NewRelay` **validates
 `DrainWindow < LeaseTTL/2`** (so the lease can always be renewed within a window) and rejects a
 misconfiguration.
 
+**Hardening note — lease renewal is between `RunOnce` calls, not within a drain window.** The lease
+is renewed once per `RunOnce` call (§5.2's "renew leader lease" step), but a single `drainWindow` can
+process up to `TokenBatchSize` events, each sent **synchronously**. If `Sender.Send` is slow, one
+`drainWindow` call can take longer than `LeaseTTL` even though `DrainWindow < LeaseTTL/2` bounds only
+the *idle* wait, not the sum of `TokenBatchSize` synchronous sends. A transient second leader can then
+acquire the lease and drain an overlapping range while the first is still mid-window. This does **not**
+violate at-least-once (the consumer's `event_id` dedup absorbs the overlap), but it weakens the
+single-active-consumer property. Operators should size `TokenBatchSize × worst-case Sender.Send
+latency < LeaseTTL` to keep a single window inside one lease term.
+
 ### 8.3 `pkg/transport/outbox/mongodb` — MongoDB `StreamStore` + publish
 
 - `Store` implementing `outbox.Store` (publish `InsertOne`), `stream.StreamStore` (`LoadToken` /

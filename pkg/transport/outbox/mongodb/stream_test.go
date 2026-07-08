@@ -95,6 +95,36 @@ func TestWatchResumesFromToken(t *testing.T) {
 	}
 }
 
+func TestPBRTNonEmptyImmediatelyAfterWatch(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	st.SetMaxAwaitTime(300 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// A fresh open (token == "") must surface a resumable baseline token from
+	// the initial aggregate's postBatchResumeToken BEFORE any Next/TryNext
+	// call — this is what the stream relay's fresh-group baseline persist
+	// (relay/stream/run.go) depends on to avoid silently skipping a first
+	// event that fails to send under stop-the-lane.
+	s, err := st.Watch(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close(context.Background()) }()
+
+	tok, ct := s.PBRT()
+	if tok == "" {
+		t.Fatal("PBRT returned empty immediately after Watch (before any Next); the fresh-group baseline persist relies on this being non-empty")
+	}
+	if ct.IsZero() {
+		t.Fatal("PBRT returned a zero clusterTime immediately after Watch")
+	}
+}
+
 func TestPBRTAdvancesOnIdle(t *testing.T) {
 	if testDB == nil {
 		t.Skip("no MongoDB")
