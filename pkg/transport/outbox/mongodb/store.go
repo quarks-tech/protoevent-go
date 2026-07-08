@@ -36,10 +36,13 @@ type outboxDoc struct {
 	CreateTime time.Time `bson:"create_time"`
 }
 
-// offsetDoc is one consumer group's resume-token store.
+// offsetDoc is one consumer group's resume-token store. ResumeToken is stored
+// as BSON binary (not an embedded document): the token is an opaque byte
+// blob to this store, and only production resume tokens happen to also be
+// valid BSON documents — storing as bson.Raw would reject arbitrary bytes.
 type offsetDoc struct {
 	Name        string    `bson:"_id"`
-	ResumeToken bson.Raw  `bson:"resume_token"`
+	ResumeToken []byte    `bson:"resume_token"`
 	ClusterTime time.Time `bson:"cluster_time"`
 	UpdateTime  time.Time `bson:"update_time"`
 }
@@ -90,7 +93,7 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) er
 }
 
 // LoadToken returns the consumer group's resume token ("" if none) as a string
-// and the anchor clusterTime. The stored bson.Raw bytes are carried verbatim.
+// and the anchor clusterTime. The stored bytes are carried verbatim.
 func (s *Store) LoadToken(ctx context.Context, name string) (string, time.Time, error) {
 	var doc offsetDoc
 	err := s.db.Collection(offsetsCollection).FindOne(ctx, bson.M{"_id": name}).Decode(&doc)
@@ -104,12 +107,12 @@ func (s *Store) LoadToken(ctx context.Context, name string) (string, time.Time, 
 }
 
 // SaveToken upserts the consumer group's resume token + clusterTime. token is
-// the opaque resume token as a string; it is stored as bson.Raw bytes.
+// the opaque resume token as a string; it is stored as BSON binary bytes.
 func (s *Store) SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) error {
 	_, err := s.db.Collection(offsetsCollection).UpdateOne(ctx,
 		bson.M{"_id": name},
 		bson.M{"$set": bson.M{
-			"resume_token": bson.Raw(token),
+			"resume_token": []byte(token),
 			"cluster_time": clusterTime.UTC(),
 			"update_time":  time.Now().UTC(),
 		}},
