@@ -104,7 +104,7 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 	var lastTok string
 	var lastCT time.Time
 
-	for i := 0; i < r.options.TokenBatchSize; i++ {
+	for range r.options.TokenBatchSize {
 		e, ok, err := r.stream.Next(ctx)
 		if err != nil {
 			return err

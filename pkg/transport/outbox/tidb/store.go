@@ -31,10 +31,19 @@ type Store struct {
 	db *sql.DB // non-nil only when built via NewStoreDB; needed by SequenceMessages
 }
 
+// NewStore builds a store over r, typically a transaction-scoped *sql.Tx for
+// atomic publish, or a *sql.DB for read-only relay use (ListMessages, Offset,
+// CommitOffset). The sequencer, leader-lock, and retention-sweep paths require
+// pool-backed capabilities not available through this constructor; use
+// NewStoreDB for those.
 func NewStore(r Runner) *Store { return &Store{r: r} }
 
-// NewStoreDB builds a store over a *sql.DB, enabling the sequencer, leader, and
-// retention paths (which manage their own transactions / run on the pool).
+// NewStoreDB builds a store over a *sql.DB. Unlike NewStore, the returned
+// Store's pool-backed capabilities are enabled: the sequencer
+// (SequenceMessages), leader election (TryAcquireLeaderLock /
+// ReleaseLeaderLock), and the retention sweep (SweepMessages) all manage their
+// own transactions against the pool, so they require a *sql.DB rather than a
+// transaction-scoped Runner.
 func NewStoreDB(db *sql.DB) *Store { return &Store{r: db, db: db} }
 
 var (
@@ -49,6 +58,10 @@ var (
 // transaction's PD start TSO (@@tidb_current_ts); id is auto-assigned in insert
 // order (= emit order); seq stays NULL until the sequencer runs. Call this on a
 // transaction-scoped Runner so the row commits atomically with business writes.
+//
+// Requires Message.ID to be a UUID string: event_id is a BINARY(16) column, and
+// m.ID is parsed as a UUID before the insert. A custom outbox.IDGenerator
+// (via outbox.WithIDGenerator) MUST emit UUIDs to be usable with this store.
 func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) error {
 	id, err := uuid.Parse(m.ID)
 	if err != nil {
@@ -62,7 +75,7 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 	_, err = s.r.ExecContext(ctx, `
 INSERT INTO outbox (seq, tx_start_ts, event_id, metadata, data, create_time, occurred_at)
 VALUES (NULL, @@tidb_current_ts, ?, ?, ?, ?, ?)`,
-		id[:], meta, m.Data, m.CreateTime.UTC(), md.Time.UTC(),
+		id[:], meta, m.Data, m.CreateTime, md.Time.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("outbox: insert: %w", err)
@@ -91,8 +104,8 @@ LIMIT ?`, afterSeq, limit)
 			meta    []byte
 			data    []byte
 		)
-		var createTime = new(sqlTime)
-		if err := rows.Scan(&seq, &eventID, &meta, &data, createTime); err != nil {
+		var createTime time.Time
+		if err := rows.Scan(&seq, &eventID, &meta, &data, &createTime); err != nil {
 			return nil, fmt.Errorf("outbox: scan: %w", err)
 		}
 		id, err := uuid.FromBytes(eventID)
@@ -108,7 +121,7 @@ LIMIT ?`, afterSeq, limit)
 			Seq:        seq,
 			Metadata:   &md,
 			Data:       data,
-			CreateTime: createTime.t,
+			CreateTime: createTime,
 		})
 	}
 	return out, rows.Err()
@@ -269,19 +282,4 @@ LIMIT ?`, before.UTC(), limit)
 		return 0, fmt.Errorf("outbox: sweep rows affected: %w", err)
 	}
 	return int(n), nil
-}
-
-// sqlTime scans a DATETIME(6). The DSN must set parseTime=true (see tidbtest).
-type sqlTime struct{ t time.Time }
-
-func (s *sqlTime) Scan(v any) error {
-	switch x := v.(type) {
-	case time.Time:
-		s.t = x
-	case nil:
-		s.t = time.Time{}
-	default:
-		return fmt.Errorf("outbox: cannot scan %T into time", v)
-	}
-	return nil
 }

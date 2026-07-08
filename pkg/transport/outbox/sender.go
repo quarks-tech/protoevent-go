@@ -12,6 +12,10 @@ import (
 // IDGenerator produces the outbox row ID for a message. It receives the event
 // metadata so a generator may derive the ID from it — in particular,
 // ReuseMetadataID returns the event's own ID.
+//
+// Note: the TiDB store requires UUID IDs (event_id is a BINARY(16) column); the
+// MongoDB store accepts any string. A custom IDGenerator used with the TiDB
+// backend must emit UUID strings.
 type IDGenerator func(md *event.Metadata) (string, error)
 
 // GenerateV4 is a non-default IDGenerator. It ignores the metadata and mints a
@@ -67,6 +71,9 @@ type SenderOption func(opts *senderOptions)
 // WithIDGenerator sets the generator used to produce the outbox row ID.
 // Defaults to ReuseMetadataID. Use GenerateV4 to key rows on a freshly minted
 // UUID independent of the event's Metadata.ID.
+//
+// Note: the TiDB store requires UUID IDs; the MongoDB store accepts any
+// string. A custom IDGenerator used with the TiDB backend must emit UUIDs.
 func WithIDGenerator(gen IDGenerator) SenderOption {
 	return func(opts *senderOptions) {
 		opts.idGenerator = gen
@@ -108,7 +115,7 @@ func (s *Sender) Send(ctx context.Context, metadata *event.Metadata, data []byte
 		ID:         id,
 		Metadata:   metadata,
 		Data:       data,
-		CreateTime: time.Now(),
+		CreateTime: time.Now().UTC(),
 	}
 
 	return s.store.CreateOutboxMessage(ctx, msg)

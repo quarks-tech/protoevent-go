@@ -47,7 +47,7 @@ func TestStreamRelayEndToEnd(t *testing.T) {
 	}
 
 	var ids []string
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		ids = append(ids, publish(t, "s"))
 	}
 

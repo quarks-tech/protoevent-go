@@ -148,7 +148,7 @@ func (s *Store) SaveToken(ctx context.Context, name string, token string, cluste
 
 // TryAcquireLeaderLock acquires or renews the lock via a conditional upsert.
 func (s *Store) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
-	now := time.Now()
+	now := time.Now().UTC()
 	filter := bson.M{
 		"_id": name,
 		"$or": bson.A{

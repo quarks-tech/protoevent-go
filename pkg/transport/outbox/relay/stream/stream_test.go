@@ -141,7 +141,7 @@ func TestRunOnceDeliversAndPersistsLastToken(t *testing.T) {
 		return nil
 	})
 	r, _ := stream.NewRelay("c", st, sender)
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
@@ -156,7 +156,7 @@ func TestRunOncePersistsPBRTOnEmptyWindow(t *testing.T) {
 	st := &fakeStreamStore{stream: &fakeStream{events: nil, pbrt: "pbrt", pbrtCT: time.Now()}}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	r, _ := stream.NewRelay("c", st, sender)
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if st.savedTok != "pbrt" {
@@ -175,7 +175,7 @@ func TestRunOnceStopTheLane(t *testing.T) {
 		return nil
 	})
 	r, _ := stream.NewRelay("c", st, sender)
-	_ = r.RunOnce(context.Background())
+	_ = r.RunOnce(t.Context())
 	// Delivered a; stopped at b; c not attempted; token persisted up to a.
 	if len(got) != 1 || got[0] != "a" {
 		t.Fatalf("delivered %v, want [a] (stop-the-lane)", got)
@@ -189,7 +189,7 @@ func TestRunOnceInvalidateIsFatal(t *testing.T) {
 	st := &fakeStreamStore{stream: &fakeStream{events: []*stream.Event{ev(1, "x", true)}}}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	r, _ := stream.NewRelay("c", st, sender)
-	err := r.RunOnce(context.Background())
+	err := r.RunOnce(t.Context())
 	if !errors.Is(err, stream.ErrStreamInvalidated) {
 		t.Fatalf("err = %v, want ErrStreamInvalidated", err)
 	}
@@ -200,7 +200,7 @@ func TestRunOnceNonLeaderIdles(t *testing.T) {
 	sent := 0
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
 	r, _ := stream.NewRelay("c", st, sender, stream.WithLeaderLockName("lock"))
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if sent != 0 {
@@ -222,7 +222,7 @@ func TestRunOnceStopClosesStreamForRedelivery(t *testing.T) {
 	r, _ := stream.NewRelay("c", st, sender)
 	// RunOnce returns errLaneStopped, which is unexported and unreferenceable
 	// here; assert the observable effects instead.
-	_ = r.RunOnce(context.Background())
+	_ = r.RunOnce(t.Context())
 
 	if len(got) != 1 || got[0] != "a" {
 		t.Fatalf("delivered %v, want [a] (stop before b)", got)
@@ -250,7 +250,7 @@ func TestRunOncePicksUpWhereItLeftOff(t *testing.T) {
 	r, _ := stream.NewRelay("c", st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 
@@ -301,7 +301,7 @@ func (s ctxCancelingLeaderStore) TryAcquireLeaderLock(ctx context.Context, _, _ 
 // error surfacing mid-RunOnce (a planned shutdown) is not reported to the
 // Observer/Logger as a pass-level error.
 func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	st := ctxCancelingLeaderStore{fakeStreamStore: &fakeStreamStore{stream: &fakeStream{}}, cancel: cancel}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &recordingObserver{}
@@ -342,7 +342,7 @@ func TestRunOnceFreshGroupPersistsBaselineBeforeDrain(t *testing.T) {
 		return errors.New("boom") // first event fails; no ErrorHandler -> stop-the-lane
 	})
 	r, _ := stream.NewRelay("c", st, sender)
-	_ = r.RunOnce(context.Background())
+	_ = r.RunOnce(t.Context())
 
 	if len(st.watchTokens) != 1 || st.watchTokens[0] != "" {
 		t.Fatalf("watch tokens = %v, want [\"\"] (fresh group opens at \"now\")", st.watchTokens)

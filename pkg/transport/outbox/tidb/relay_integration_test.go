@@ -59,7 +59,7 @@ func TestRelayEndToEndOrderAndDelivery(t *testing.T) {
 	}
 
 	wantIDs := make([]string, 0, 50)
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		wantIDs = append(wantIDs, publish(t, "s"))
 	}
 
@@ -95,7 +95,7 @@ func TestRelayStartFromBeginningReplays(t *testing.T) {
 	truncate(t)
 
 	wantIDs := make([]string, 0, 5)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wantIDs = append(wantIDs, publish(t, "s"))
 	}
 

@@ -114,7 +114,7 @@ func TestSequenceAssignsDenseContiguousSeq(t *testing.T) {
 		t.Skip("no TiDB")
 	}
 	truncate(t)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		publish(t, "s")
 	}
 	st := tidb.NewStoreDB(testDB)
@@ -154,13 +154,13 @@ func TestConcurrentSequencersNoDuplicateNoGap(t *testing.T) {
 		t.Skip("no TiDB")
 	}
 	truncate(t)
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		publish(t, "s")
 	}
 	st := tidb.NewStoreDB(testDB)
 
 	var wg sync.WaitGroup
-	for g := 0; g < 4; g++ {
+	for range 4 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -259,7 +259,7 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 	md.Subject = "fidelity"
 	md.DataContentType = "application/proto"
 	md.Time = time.Now().UTC()
-	md.Extensions = map[string]interface{}{"partitionkey": "k1"}
+	md.Extensions = map[string]any{"partitionkey": "k1"}
 	schema, err := url.Parse("https://schemas.example.com/books/created/v1")
 	if err != nil {
 		t.Fatal(err)

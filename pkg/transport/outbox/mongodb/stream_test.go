@@ -154,7 +154,7 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 	md.Subject = "fidelity"
 	md.DataContentType = "application/proto"
 	md.Time = time.Now().UTC()
-	md.Extensions = map[string]interface{}{"partitionkey": "k1"}
+	md.Extensions = map[string]any{"partitionkey": "k1"}
 	schema, err := url.Parse("https://schemas.example.com/books/created/v1")
 	if err != nil {
 		t.Fatal(err)

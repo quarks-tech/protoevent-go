@@ -133,10 +133,7 @@ func (s *fakeStore) SequenceMessages(_ context.Context, limit int) (int, error) 
 	if s.seqErr != nil {
 		return 0, s.seqErr
 	}
-	n := limit
-	if n > len(s.pending) {
-		n = len(s.pending)
-	}
+	n := min(limit, len(s.pending))
 	for i := 0; i < n; i++ {
 		m := s.pending[i]
 		m.Seq = s.nextSeq
@@ -186,12 +183,12 @@ func (s *fakeStore) CommitOffset(_ context.Context, name string, seq int64) erro
 func (s *fakeStore) InitOffsetLatest(_ context.Context, name string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	max := int64(0)
+	maxSeq := int64(0)
 	if n := len(s.log); n > 0 {
-		max = s.log[n-1].Seq
+		maxSeq = s.log[n-1].Seq
 	}
-	if max > s.offsets[name] { // GREATEST
-		s.offsets[name] = max
+	if maxSeq > s.offsets[name] { // GREATEST
+		s.offsets[name] = maxSeq
 	}
 	return s.offsets[name], nil
 }
@@ -237,7 +234,7 @@ func TestRunOnceSequencesThenDrainsSameTick(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if len(got) != 3 {
@@ -250,7 +247,7 @@ func TestRunOnceSequencesThenDrainsSameTick(t *testing.T) {
 
 func TestDrainLoopsUntilShortPage(t *testing.T) {
 	st := newFakeStore()
-	for i := 0; i < 250; i++ {
+	for range 250 {
 		st.append(msg(0))
 	}
 	var count int
@@ -260,7 +257,7 @@ func TestDrainLoopsUntilShortPage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if count != 250 {
@@ -270,7 +267,7 @@ func TestDrainLoopsUntilShortPage(t *testing.T) {
 
 func TestStopTheLaneOnSendError(t *testing.T) {
 	st := newFakeStore()
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		st.append(msg(0))
 	}
 	var got []int64
@@ -286,7 +283,7 @@ func TestStopTheLaneOnSendError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
-	_ = r.RunOnce(context.Background())
+	_ = r.RunOnce(t.Context())
 
 	// Sent 1,2; stopped at 3. Offset must not advance past 2.
 	if off := st.offsets["c"]; off != 2 {
@@ -308,7 +305,7 @@ func TestNonLeaderDoesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if sent != 0 {
@@ -318,7 +315,7 @@ func TestNonLeaderDoesNothing(t *testing.T) {
 
 func TestParkAndContinueAdvancesPastFailure(t *testing.T) {
 	st := newFakeStore()
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		st.append(msg(0))
 	}
 	var got []int64
@@ -336,7 +333,7 @@ func TestParkAndContinueAdvancesPastFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	// 3 parked; 1,2,4,5 delivered; offset advances to 5.
@@ -385,7 +382,7 @@ func (s ctxCancelingLeaderStore) TryAcquireLeaderLock(ctx context.Context, _, _ 
 // error surfacing mid-RunOnce (a planned shutdown) is not reported to the
 // Observer/Logger as a pass-level error.
 func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	st := ctxCancelingLeaderStore{fakeStore: newFakeStore(), cancel: cancel}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &recordingObserver{}
@@ -411,7 +408,7 @@ func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
 // RunOnce are delivered.
 func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 	st := newFakeStore()
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		st.append(msg(0))
 	}
 	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
@@ -428,7 +425,7 @@ func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if len(got) != 0 {
@@ -440,7 +437,7 @@ func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 
 	st.append(msg(0))
 	st.append(msg(0))
-	if err := r.RunOnce(context.Background()); err != nil {
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if len(got) != 2 || got[0] != 4 || got[1] != 5 {
