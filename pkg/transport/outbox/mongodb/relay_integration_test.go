@@ -28,8 +28,7 @@ func TestStreamRelayEndToEnd(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
-	st.SetMaxAwaitTime(300 * time.Millisecond)
+	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
 
 	sender := &recordingSender{}
 	r, err := stream.NewRelay("e2e", st, sender,

@@ -24,10 +24,6 @@ const changeStreamHistoryLostCode = 286
 // code on some server versions).
 const nonResumableChangeStreamErrorLabel = "NonResumableChangeStreamError"
 
-// SetMaxAwaitTime sets the change stream's server await time per getMore. The
-// relay wiring sets this from its drain window. Default 1s if unset.
-func (s *Store) SetMaxAwaitTime(d time.Duration) { s.maxAwait = d }
-
 // changeEvent is the decoded change-stream document (insert or invalidate).
 type changeEvent struct {
 	ID            bson.Raw       `bson:"_id"`           // resume token for THIS event

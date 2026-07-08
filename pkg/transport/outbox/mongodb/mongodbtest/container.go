@@ -45,10 +45,11 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 	// directConnection: the single-node RS advertises a container-internal
 	// address; a direct connection to the mapped port still supports txns and
 	// change streams (the server IS a replica-set member).
-	dsn := uri + "&directConnection=true"
+	sep := "&"
 	if !strings.Contains(uri, "?") {
-		dsn = uri + "?directConnection=true"
+		sep = "?"
 	}
+	dsn := uri + sep + "directConnection=true"
 	client, err := mongo.Connect(options.Client().ApplyURI(dsn)) // v2: no ctx arg
 	if err != nil {
 		_ = c.Terminate(ctx)

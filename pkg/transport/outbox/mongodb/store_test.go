@@ -24,6 +24,12 @@ func TestNewStoreConstructs(t *testing.T) {
 	}
 }
 
+func TestNewStoreWithMaxAwaitTime(t *testing.T) {
+	if mongodbstore.NewStore(nil, mongodbstore.WithMaxAwaitTime(300*time.Millisecond)) == nil {
+		t.Fatal("NewStore returned nil")
+	}
+}
+
 func TestStoreSatisfiesStreamStore(t *testing.T) {
 	// Compile-time proof lives in watch.go (var _ stream.StreamStore = ...).
 	// This test just ensures the package builds with Watch present.
@@ -119,6 +125,8 @@ func TestEnsureIndexesCreatesTTL(t *testing.T) {
 	if err := cur.All(context.Background(), &idx); err != nil {
 		t.Fatal(err)
 	}
+	// Same meaning as the unexported mongodb.retentionSeconds (7 days); this is
+	// an external test package so it can't reference the constant directly.
 	const wantTTLSeconds = int32(7 * 24 * 60 * 60)
 	found := false
 	for _, ix := range idx {

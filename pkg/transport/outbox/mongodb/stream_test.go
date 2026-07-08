@@ -17,8 +17,7 @@ func TestWatchDeliversInsertsInOrder(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
-	st.SetMaxAwaitTime(300 * time.Millisecond)
+	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -55,8 +54,7 @@ func TestWatchResumesFromToken(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
-	st.SetMaxAwaitTime(300 * time.Millisecond)
+	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -104,8 +102,7 @@ func TestPBRTNonEmptyImmediatelyAfterWatch(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
-	st.SetMaxAwaitTime(300 * time.Millisecond)
+	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -139,8 +136,7 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
-	st.SetMaxAwaitTime(300 * time.Millisecond)
+	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -212,8 +208,7 @@ func TestPBRTAdvancesOnIdle(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
-	st.SetMaxAwaitTime(300 * time.Millisecond)
+	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 

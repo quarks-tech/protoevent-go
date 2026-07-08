@@ -199,11 +199,10 @@ the driver's `bson.Raw`). It errors if `DrainWindow >= LeaseTTL/2`, since the
 leader lease must be renewable within a single drain window.
 
 ```go
-st := mongodb.NewStore(db)
+st := mongodb.NewStore(db, mongodb.WithMaxAwaitTime(time.Second))
 if err := st.EnsureIndexes(ctx); err != nil {
     log.Fatal(err)
 }
-st.SetMaxAwaitTime(time.Second)
 
 r, err := stream.NewRelay("broker-publish", st, rabbitSender,
     stream.WithDrainWindow(time.Second),
@@ -220,8 +219,9 @@ if err := r.Run(ctx); err != nil {
 ```
 
 `EnsureIndexes` creates the 7-day TTL index on `outbox.create_time` (idempotent
-— safe to call on every startup); `SetMaxAwaitTime` sets the change stream's
-`maxAwaitTimeMS`, which should match `WithDrainWindow`. `stream.WithObserver`
+— safe to call on every startup); `mongodb.WithMaxAwaitTime` (passed to
+`NewStore`) sets the change stream's `maxAwaitTimeMS`, which should match
+`WithDrainWindow`. `stream.WithObserver`
 wires the same `relay.Observer` shape used by `sequence.WithObserver` (e.g.
 Prometheus) for lag and throughput; `stream.WithLogger` wires a `relay.Logger`
 for stream-level errors; `stream.WithErrorHandler` switches send-failure

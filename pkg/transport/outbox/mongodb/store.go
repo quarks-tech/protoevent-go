@@ -25,6 +25,10 @@ const (
 
 	// retentionDays is the outbox TTL; MUST exceed the oplog window (design §7).
 	retentionDays = 7
+
+	// retentionSeconds is retentionDays expressed in seconds, as the TTL index
+	// option requires.
+	retentionSeconds = retentionDays * 24 * 60 * 60
 )
 
 // outboxDoc is one insert-only event envelope. Metadata is JSON bytes so the
@@ -59,7 +63,25 @@ type Store struct {
 	maxAwait time.Duration
 }
 
-func NewStore(db *mongo.Database) *Store { return &Store{db: db} }
+// Option configures a Store at construction time.
+type Option func(*Store)
+
+// WithMaxAwaitTime sets the change stream's server-side max await per window;
+// SHOULD match the stream relay's WithDrainWindow. Default 1s.
+func WithMaxAwaitTime(d time.Duration) Option {
+	return func(s *Store) { s.maxAwait = d }
+}
+
+// NewStore creates a Store realizing the outbox publish + relay-read contracts
+// over db. Use WithMaxAwaitTime to tune the change stream's server-side await
+// window; it defaults to 1s.
+func NewStore(db *mongo.Database, opts ...Option) *Store {
+	s := &Store{db: db}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
 
 var (
 	_ outbox.Store      = (*Store)(nil)
@@ -70,7 +92,7 @@ var (
 func (s *Store) EnsureIndexes(ctx context.Context) error {
 	_, err := s.db.Collection(outboxCollection).Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "create_time", Value: 1}},
-		Options: options.Index().SetExpireAfterSeconds(int32(retentionDays * 24 * 60 * 60)),
+		Options: options.Index().SetExpireAfterSeconds(int32(retentionSeconds)),
 	})
 	if err != nil {
 		return fmt.Errorf("outbox: ensure ttl index: %w", err)
