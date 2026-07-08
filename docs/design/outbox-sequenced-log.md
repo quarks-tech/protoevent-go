@@ -82,12 +82,15 @@ CREATE TABLE outbox (
     seq          BIGINT       NULL,                     -- logical offset; NULL until sequenced post-commit
     tx_start_ts  BIGINT       NOT NULL,                 -- @@tidb_current_ts of publishing tx (PD start TSO)
     event_id     BINARY(16)   NOT NULL,
-    `type`       VARCHAR(255) NOT NULL,
-    source       VARCHAR(255) NOT NULL,
-    subject      VARCHAR(255) NOT NULL,
-    content_type VARCHAR(64)  NOT NULL,
-    data         BLOB         NOT NULL,
-    occurred_at  DATETIME(6)  NOT NULL,
+    metadata     JSON         NOT NULL,                 -- FULL CloudEvents metadata as JSON — round-trips
+                                                        -- SpecVersion/Extensions/DataSchema (same envelope
+                                                        -- contract as the MongoDB store; scalar columns were
+                                                        -- dropped 2026-07-08: they silently lost Extensions
+                                                        -- and DataSchema, and capped subject at 255)
+    data         MEDIUMBLOB   NOT NULL,                 -- 16MB ceiling (BLOB's 64KB would abort the BUSINESS
+                                                        -- tx on an oversized event; parity with Mongo's 16MB)
+    create_time  DATETIME(6)  NOT NULL,                 -- INSERT time (Sender-stamped) — retention + lag anchor
+    occurred_at  DATETIME(6)  NOT NULL,                 -- event time (Metadata.Time; publishers may backdate)
     PRIMARY KEY (id) /*T![clustered_index] CLUSTERED */,
     UNIQUE KEY uk_outbox_event (event_id),
     -- one index serves both loops (id, the clustered PK, is implicitly appended by TiDB, so it
@@ -154,9 +157,9 @@ BEGIN;
 UPDATE accounts SET ... WHERE id = ?;                       -- business write
 
 SET @ts = @@tidb_current_ts;                                 -- this tx's start TSO
-INSERT INTO outbox (seq, tx_start_ts, event_id, `type`, source, subject, content_type, data, occurred_at)
-VALUES (NULL, @ts, ?, ?, ?, ?, ?, ?, ?);                     -- id auto-assigned in insert order = emit order
-COMMIT;
+INSERT INTO outbox (seq, tx_start_ts, event_id, metadata, data, create_time, occurred_at)
+VALUES (NULL, @ts, ?, ?, ?, ?, ?);                           -- id auto-assigned in insert order = emit order
+COMMIT;                                                      -- metadata = json.Marshal(full CloudEvents md)
 ```
 
 No hot row is touched: publishers contend neither with each other nor with the relay.
@@ -191,12 +194,22 @@ COMMIT;   -- assignment + counter atomic → seq dense & gapless; crash = clean 
 ```sql
 SELECT last_seq FROM outbox_offsets WHERE name = ?;                        -- → @last (0 if absent)
 
-SELECT seq, event_id, `type`, source, subject, content_type, data, occurred_at
+-- NEW CONSUMER GROUP (no offset row → @last = 0): the default is "latest" —
+-- parity with the stream runtime's start-at-now. The runtime calls
+-- InitOffsetLatest(name), which atomically seeds the offset row at the current
+-- max assigned seq (GREATEST-guarded, never rewinds):
+--   INSERT INTO outbox_offsets (name, last_seq, update_time)
+--   SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM outbox
+--   ON DUPLICATE KEY UPDATE last_seq = GREATEST(last_seq, VALUES(last_seq)), ...
+-- WithStartFromBeginning() skips this and replays the retained log from seq 1.
+
+SELECT seq, event_id, metadata, data, create_time
 FROM outbox
 WHERE seq > @last                                                          -- NULL seq excluded by > automatically
 ORDER BY seq
 LIMIT 1000;
 -- seq is dense → cursor is EXACT: nothing can ever appear at ≤ @last later.
+-- metadata JSON is unmarshaled back into the full CloudEvents envelope.
 
 -- after the sender/handler succeeds for the page:
 INSERT INTO outbox_offsets (name, last_seq, update_time)
@@ -215,12 +228,15 @@ at-least-once; consumers dedup on `event_id`.
 DELETE FROM outbox
 WHERE seq IS NOT NULL
   AND seq <= (SELECT MIN(last_seq) FROM outbox_offsets)                    -- every consumer passed it
-  AND occurred_at < NOW(6) - INTERVAL 7 DAY                                -- replay window
+  AND create_time < NOW(6) - INTERVAL 7 DAY                                -- replay window (INSERT time)
 LIMIT 5000;
 ```
 
 Replaces the completed-table sweep: deletes only rows every consumer has passed, after a
-retention window that permits replay.
+retention window that permits replay. The window is keyed on **`create_time` (insert time), not
+`occurred_at` (event time)** — a publisher backdating `Metadata.Time` via `WithEventTime` must not
+get its row swept early. This also matches the MongoDB store's TTL, which expires on insert-time
+`create_time`.
 
 ## 6. Ordering guarantee
 
@@ -332,6 +348,12 @@ type SequencerStore interface {
   group's latency and failure domain self-contained — §10). `WithoutSequencer()` opts a relay out
   for a dedicated-sequencer deployment.
 - New `WithRetention(window time.Duration)` enables the sweep (§5.4) on the leader.
+- **New consumer groups start at "latest" by default** (offset seeded at the current max seq via
+  `Store.InitOffsetLatest` — §5.3), matching the stream runtime's start-at-now so the same
+  `NewRelay("group", …)` call has the same meaning on both backends. `WithStartFromBeginning()`
+  opts a NEW group into replaying the retained log; it has no effect once an offset is committed.
+- Leader election is the shared `relay.LeaderElector` (acquire/renew/graceful-release), used
+  identically by both runtimes.
 - New `WithObserver(Observer)` — dependency-free lag callbacks (§10); mirrors the existing
   `Logger` seam.
 

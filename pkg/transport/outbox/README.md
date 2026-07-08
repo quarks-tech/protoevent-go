@@ -108,6 +108,12 @@ the retention window and already consumed by every registered offset. Run multip
 failover; run relays with different names against the same store for independent
 consumer groups with independent offsets.
 
+**A new consumer group starts at "latest"** — its offset is seeded at the current
+max seq, so it sees future events only (the same default as the MongoDB stream
+runtime's start-at-now). Pass `sequence.WithStartFromBeginning()` to make a new
+group replay the retained log instead; the option has no effect once the group
+has committed an offset.
+
 `sequence.WithObserver` wires an `Observer` (embeds `relay.Observer` plus
 `ObserveSequenced`) to your metrics system — e.g. Prometheus — for lag and
 throughput; `sequence.WithLogger` wires a `relay.Logger` for pass-level errors.
