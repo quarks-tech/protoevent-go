@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
@@ -74,7 +76,8 @@ type fakeStream struct {
 	pbrt       string
 	pbrtCT     time.Time
 	closeCount int
-	nextErr    error // when set, Next always returns this error instead of draining events
+	nextErr    error         // when set, Next always returns this error instead of draining events
+	blockDur   time.Duration // when set, an empty-window Next sleeps this long first, mirroring the real driver's maxAwaitTime block instead of returning instantly (which would busy-spin a bubbled Run)
 }
 
 func (s *fakeStream) Next(context.Context) (*stream.Event, bool, error) {
@@ -85,6 +88,9 @@ func (s *fakeStream) Next(context.Context) (*stream.Event, bool, error) {
 		e := s.events[s.i]
 		s.i++
 		return e, true, nil
+	}
+	if s.blockDur > 0 {
+		time.Sleep(s.blockDur)
 	}
 	return nil, false, nil // window empty
 }
@@ -127,8 +133,19 @@ func (s *fakeStreamStore) Watch(_ context.Context, token string) (stream.Stream,
 	s.mu.Lock()
 	s.watchCount++
 	s.watchTokens = append(s.watchTokens, token)
+	if s.stream != nil {
+		s.stream.i = 0 // each Watch opens a fresh cursor: simulate resuming/redelivering from the resume point
+	}
 	s.mu.Unlock()
 	return s.stream, nil
+}
+
+// watchCountSnapshot reads watchCount under mu, safe to call concurrently
+// with the relay's own goroutine (e.g. from a synctest observer point).
+func (s *fakeStreamStore) watchCountSnapshot() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.watchCount
 }
 func (s *fakeStreamStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, _ time.Duration) (bool, error) {
 	if s.leader == "" || s.leader == holderID {
@@ -433,4 +450,76 @@ func TestRunOnceFreshGroupPersistsBaselineBeforeDrain(t *testing.T) {
 	if tok != "baseline" {
 		t.Fatalf("LoadToken after RunOnce = %q, want %q (baseline persisted, not fresh now)", tok, "baseline")
 	}
+}
+
+// TestStopBackoffThenReopens exercises Run's fake-clock backoff lifecycle: a
+// stop-the-lane send failure closes the stream and backs off exactly one
+// DrainWindow (fake time) before reopening and redelivering the failed
+// event. Uses testing/synctest's fake clock so DrainWindow elapses instantly
+// and deterministically; the fake stream's empty-window Next blocks for
+// DrainWindow (mirroring the real change stream's maxAwaitTime) so the Run
+// goroutine is durably blocked between watches instead of busy-spinning the
+// bubble.
+func TestStopBackoffThenReopens(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const window = time.Second
+		fs := &fakeStream{
+			events:   []*stream.Event{ev(1, "b", false)},
+			blockDur: window,
+		}
+		st := &fakeStreamStore{stream: fs}
+
+		var attempts, delivered atomic.Int64
+		sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+			if attempts.Add(1) == 1 {
+				return errors.New("boom") // first delivery attempt fails: stop-the-lane
+			}
+			delivered.Add(1)
+			return nil
+		})
+
+		r, err := stream.NewRelay("c", st, sender, stream.WithDrainWindow(window))
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			_ = r.Run(ctx)
+			close(done)
+		}()
+
+		// Immediately after the failure: Run must have closed the stream and
+		// be backing off, not already reopened.
+		synctest.Wait()
+		if got := st.watchCountSnapshot(); got != 1 {
+			t.Fatalf("watchCount = %d immediately after the failure, want 1 (must back off before reopening)", got)
+		}
+
+		// One DrainWindow later: Run reopens and redelivers the failed event.
+		time.Sleep(window)
+		synctest.Wait()
+		if got := st.watchCountSnapshot(); got != 2 {
+			t.Fatalf("watchCount = %d after one DrainWindow, want 2 (must reopen after exactly one backoff)", got)
+		}
+		if delivered.Load() != 1 {
+			t.Fatalf("delivered = %d, want 1 (the failed event must be redelivered on reopen)", delivered.Load())
+		}
+
+		// Cancel to exit; pump the fake clock until Run drains its pending
+		// (fake-time-blocked) window wait and returns, so the bubble doesn't
+		// exit with Run still alive.
+		cancel()
+		for range 10 {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			time.Sleep(window)
+			synctest.Wait()
+		}
+		t.Fatal("Run did not exit after cancel")
+	})
 }

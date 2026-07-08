@@ -5,7 +5,9 @@ import (
 	"errors"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
@@ -220,6 +222,13 @@ func (s *fakeStore) ReleaseLeaderLock(_ context.Context, _, holderID string) err
 		s.leader = ""
 	}
 	return nil
+}
+
+// leaderHolder returns the current lock holder ("" if free), guarded by mu.
+func (s *fakeStore) leaderHolder() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leader
 }
 
 func msg(seq int64) *outbox.Message {
@@ -502,4 +511,45 @@ func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 	if len(got) != 2 || got[0] != 4 || got[1] != 5 {
 		t.Fatalf("delivered = %v, want [4 5] (only events sequenced after the group started)", got)
 	}
+}
+
+// TestRunTicksThenReleasesOnCancel exercises Run's fake-clock lifecycle end to
+// end: the ticker drives repeated drains of a pending message, and canceling
+// releases the leader lock so a planned shutdown fails over quickly. Uses
+// testing/synctest's fake clock so the 1s PollInterval elapses instantly and
+// deterministically.
+func TestRunTicksThenReleasesOnCancel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		st.append(msg(0))
+
+		var delivered atomic.Int64
+		sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+			delivered.Add(1)
+			return nil
+		})
+
+		r, err := sequence.NewRelay("c", st, sender,
+			sequence.WithPollInterval(time.Second), sequence.WithStartFromBeginning())
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() { _ = r.Run(ctx) }()
+
+		time.Sleep(1500 * time.Millisecond)
+		synctest.Wait()
+
+		if delivered.Load() < 1 {
+			t.Fatalf("delivered = %d, want >= 1 (ticker must have driven at least one drain)", delivered.Load())
+		}
+
+		cancel()
+		synctest.Wait()
+
+		if holder := st.leaderHolder(); holder != "" {
+			t.Fatalf("leader lock holder = %q, want \"\" (Run must release on cancel)", holder)
+		}
+	})
 }
