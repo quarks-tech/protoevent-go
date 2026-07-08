@@ -3,6 +3,7 @@ package sequence_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/sequence"
 )
 
@@ -126,6 +128,16 @@ type fakeStore struct {
 	leader  string // holderID currently holding the lock ("" = free)
 	seqErr  error
 	listErr error
+
+	offsetErr     error
+	initOffsetErr error
+	commitErr     error
+
+	seqCalls int // number of SequenceMessages invocations, for loop-count assertions
+
+	sweepErr        error
+	sweepCalls      int
+	lastSweepBefore time.Time
 }
 
 func newFakeStore() *fakeStore {
@@ -142,6 +154,7 @@ func (s *fakeStore) append(m *outbox.Message) {
 func (s *fakeStore) SequenceMessages(_ context.Context, limit int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.seqCalls++
 	if s.seqErr != nil {
 		return 0, s.seqErr
 	}
@@ -178,12 +191,18 @@ func (s *fakeStore) ListMessages(_ context.Context, afterSeq int64, limit int) (
 func (s *fakeStore) Offset(_ context.Context, name string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.offsetErr != nil {
+		return 0, s.offsetErr
+	}
 	return s.offsets[name], nil
 }
 
 func (s *fakeStore) CommitOffset(_ context.Context, name string, seq int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.commitErr != nil {
+		return s.commitErr
+	}
 	if seq > s.offsets[name] { // GREATEST
 		s.offsets[name] = seq
 	}
@@ -195,6 +214,9 @@ func (s *fakeStore) CommitOffset(_ context.Context, name string, seq int64) erro
 func (s *fakeStore) InitOffsetLatest(_ context.Context, name string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.initOffsetErr != nil {
+		return 0, s.initOffsetErr
+	}
 	maxSeq := int64(0)
 	if n := len(s.log); n > 0 {
 		maxSeq = s.log[n-1].Seq
@@ -203,6 +225,33 @@ func (s *fakeStore) InitOffsetLatest(_ context.Context, name string) (int64, err
 		s.offsets[name] = maxSeq
 	}
 	return s.offsets[name], nil
+}
+
+// SweepMessages implements sequence.RetentionStore: it records invocation
+// count and the `before` cutoff for retention-cadence assertions.
+func (s *fakeStore) SweepMessages(_ context.Context, before time.Time, _ int) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sweepCalls++
+	s.lastSweepBefore = before
+	if s.sweepErr != nil {
+		return 0, s.sweepErr
+	}
+	return 0, nil
+}
+
+// snapshotSweep reads the sweep counters under mu.
+func (s *fakeStore) snapshotSweep() (calls int, before time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sweepCalls, s.lastSweepBefore
+}
+
+// snapshotSeqCalls reads the SequenceMessages invocation count under mu.
+func (s *fakeStore) snapshotSeqCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seqCalls
 }
 
 func (s *fakeStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, _ time.Duration) (bool, error) {
@@ -552,4 +601,351 @@ func TestRunTicksThenReleasesOnCancel(t *testing.T) {
 			t.Fatalf("leader lock holder = %q, want \"\" (Run must release on cancel)", holder)
 		}
 	})
+}
+
+// --- fakeLogger --------------------------------------------------------------
+
+// fakeLogger is a relay.Logger fake recording every Errorf call.
+type fakeLogger struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (l *fakeLogger) Errorf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.msgs = append(l.msgs, fmt.Sprintf(format, args...))
+}
+
+func (l *fakeLogger) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]string, len(l.msgs))
+	copy(out, l.msgs)
+	return out
+}
+
+// --- noRetentionStore ---------------------------------------------------------
+
+// noRetentionStore wraps a *fakeStore but deliberately does NOT expose
+// SweepMessages (no embedding, so no method promotion), proving maybeSweep
+// treats a store lacking sequence.RetentionStore as retention-disabled.
+type noRetentionStore struct{ inner *fakeStore }
+
+func (s noRetentionStore) ListMessages(ctx context.Context, afterSeq int64, limit int) ([]*outbox.Message, error) {
+	return s.inner.ListMessages(ctx, afterSeq, limit)
+}
+
+func (s noRetentionStore) Offset(ctx context.Context, name string) (int64, error) {
+	return s.inner.Offset(ctx, name)
+}
+
+func (s noRetentionStore) CommitOffset(ctx context.Context, name string, seq int64) error {
+	return s.inner.CommitOffset(ctx, name, seq)
+}
+
+func (s noRetentionStore) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
+	return s.inner.InitOffsetLatest(ctx, name)
+}
+
+func (s noRetentionStore) SequenceMessages(ctx context.Context, limit int) (int, error) {
+	return s.inner.SequenceMessages(ctx, limit)
+}
+
+func (s noRetentionStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
+	return s.inner.TryAcquireLeaderLock(ctx, name, holderID, ttl)
+}
+
+func (s noRetentionStore) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
+	return s.inner.ReleaseLeaderLock(ctx, name, holderID)
+}
+
+// --- maybeSweep ---------------------------------------------------------------
+
+// TestMaybeSweepRunsOnCadence proves the retention sweep fires exactly every
+// RetentionSweepEvery-th RunOnce, with a `before` cutoff approximately
+// now-minus-window.
+func TestMaybeSweepRunsOnCadence(t *testing.T) {
+	st := newFakeStore()
+	window := 24 * time.Hour
+	r, err := sequence.NewRelay("c", st, nil, sequence.WithRetention(window, 3, 100))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	for i := 1; i <= 6; i++ {
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce[%d]: %v", i, err)
+		}
+		calls, before := st.snapshotSweep()
+		wantCalls := i / 3
+		if calls != wantCalls {
+			t.Fatalf("after RunOnce %d: sweepCalls = %d, want %d (every 3rd tick)", i, calls, wantCalls)
+		}
+		if wantCalls > 0 {
+			wantBefore := time.Now().Add(-window)
+			if diff := wantBefore.Sub(before); diff < -time.Minute || diff > time.Minute {
+				t.Fatalf("sweep `before` = %v, want ~%v (within a minute)", before, wantBefore)
+			}
+		}
+	}
+}
+
+// TestMaybeSweepNoopWithoutRetentionStore proves a store lacking
+// sequence.RetentionStore never gets a SweepMessages call and RunOnce does
+// not panic, even with RetentionWindow configured via a capable neighbor.
+func TestMaybeSweepNoopWithoutRetentionStore(t *testing.T) {
+	inner := newFakeStore()
+	st := noRetentionStore{inner: inner}
+	r, err := sequence.NewRelay("c", st, nil, sequence.WithRetention(time.Hour, 1, 100))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	for i := range 3 {
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce[%d]: %v", i, err)
+		}
+	}
+	if calls, _ := inner.snapshotSweep(); calls != 0 {
+		t.Fatalf("sweepCalls = %d, want 0 (store lacks RetentionStore)", calls)
+	}
+}
+
+// TestMaybeSweepErrorPropagates proves RunOnce surfaces a sweep error.
+func TestMaybeSweepErrorPropagates(t *testing.T) {
+	sentinel := errors.New("sweep boom")
+	st := newFakeStore()
+	st.sweepErr = sentinel
+	r, err := sequence.NewRelay("c", st, nil, sequence.WithRetention(time.Hour, 1, 100))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// --- sequence() looping and error propagation ---------------------------------
+
+// TestSequenceLoopsWhileFull proves sequence() keeps calling SequenceMessages
+// while a pass returns a full page, so a burst larger than SequenceBatchSize
+// is fully sequenced within one RunOnce/tick.
+func TestSequenceLoopsWhileFull(t *testing.T) {
+	st := newFakeStore()
+	for range 25 {
+		st.append(msg(0))
+	}
+	r, err := sequence.NewRelay("c", st, nil,
+		sequence.WithSequenceBatchSize(10), sequence.WithBatchSize(1000))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if calls := st.snapshotSeqCalls(); calls <= 1 {
+		t.Fatalf("SequenceMessages called %d times, want > 1 (25 pending / batch 10 must loop)", calls)
+	}
+	if len(st.log) != 25 {
+		t.Fatalf("sequenced %d, want 25 (all pending drained across loop iterations)", len(st.log))
+	}
+}
+
+// TestSequenceStopsOnCtxCancellationMidLoop proves the loop-tail ctx.Err()
+// check aborts a still-full-batch sequencer loop instead of spinning forever.
+// The fake store ignores ctx in SequenceMessages, so an already-canceled ctx
+// is only observed via the explicit ctx.Err() check between iterations.
+func TestSequenceStopsOnCtxCancellationMidLoop(t *testing.T) {
+	st := newFakeStore()
+	for range 4 {
+		st.append(msg(0))
+	}
+	r, err := sequence.NewRelay("c", st, nil, sequence.WithSequenceBatchSize(2))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	runErr := r.RunOnce(ctx)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("RunOnce err = %v, want context.Canceled", runErr)
+	}
+	if calls := st.snapshotSeqCalls(); calls != 1 {
+		t.Fatalf("SequenceMessages called %d times, want 1 (must stop after the first full page once ctx is canceled)", calls)
+	}
+}
+
+// TestSequenceSequencerErrorPropagates proves RunOnce surfaces a
+// SequenceMessages error directly.
+func TestSequenceSequencerErrorPropagates(t *testing.T) {
+	sentinel := errors.New("sequencer boom")
+	st := newFakeStore()
+	st.seqErr = sentinel
+	r, err := sequence.NewRelay("c", st, nil)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestWithoutSequencerSkipsSequencing proves WithoutSequencer makes
+// sequence() a true no-op (r.sequencer == nil) even though the underlying
+// store implements SequencerStore.
+func TestWithoutSequencerSkipsSequencing(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg(0))
+	r, err := sequence.NewRelay("c", st, nil, sequence.WithoutSequencer(), sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if calls := st.snapshotSeqCalls(); calls != 0 {
+		t.Fatalf("SequenceMessages called %d times, want 0 (WithoutSequencer)", calls)
+	}
+}
+
+// --- drain() error propagation -------------------------------------------------
+
+// TestRunOnceOffsetErrorPropagates proves a Store.Offset error surfaces
+// through drain() and RunOnce.
+func TestRunOnceOffsetErrorPropagates(t *testing.T) {
+	sentinel := errors.New("offset boom")
+	st := newFakeStore()
+	st.offsetErr = sentinel
+	r, err := sequence.NewRelay("c", st, nil)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestRunOnceInitOffsetLatestErrorPropagates proves an InitOffsetLatest error
+// (hit for a brand-new consumer group at offset 0) surfaces through drain()
+// and RunOnce.
+func TestRunOnceInitOffsetLatestErrorPropagates(t *testing.T) {
+	sentinel := errors.New("init offset boom")
+	st := newFakeStore()
+	st.initOffsetErr = sentinel
+	r, err := sequence.NewRelay("c", st, nil)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestRunOnceListMessagesErrorPropagates proves a Store.ListMessages error
+// surfaces through drain() and, in turn, through RunOnce's own
+// `if err := r.drain(ctx); err != nil` branch.
+func TestRunOnceListMessagesErrorPropagates(t *testing.T) {
+	sentinel := errors.New("list boom")
+	st := newFakeStore()
+	st.listErr = sentinel
+	r, err := sequence.NewRelay("c", st, nil)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestRunOnceCommitOffsetErrorPropagates proves a Store.CommitOffset error
+// surfaces through drain() and RunOnce after a successful send.
+func TestRunOnceCommitOffsetErrorPropagates(t *testing.T) {
+	sentinel := errors.New("commit boom")
+	st := newFakeStore()
+	st.append(msg(0))
+	st.commitErr = sentinel
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestDrainStopsOnCtxCancellationAfterFullPage proves drain's loop-tail
+// ctx.Err() check aborts a still-full-page drain loop instead of looping
+// forever, once ctx is canceled.
+func TestDrainStopsOnCtxCancellationAfterFullPage(t *testing.T) {
+	st := newFakeStore()
+	for range 4 {
+		st.append(msg(0))
+	}
+	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
+		t.Fatalf("seed sequence: %v", err)
+	}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithBatchSize(2), sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	runErr := r.RunOnce(ctx)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("RunOnce err = %v, want context.Canceled", runErr)
+	}
+	// Exactly the first full page (2) must have been committed before the
+	// loop-tail ctx check aborted the second iteration.
+	if off := st.offsets["c"]; off != 2 {
+		t.Fatalf("offset = %d, want 2 (first full page committed before ctx-cancel abort)", off)
+	}
+}
+
+// --- WithLogger ----------------------------------------------------------------
+
+func TestWithLoggerNilIsNoop(t *testing.T) {
+	o := sequence.DefaultOptions()
+	real := &fakeLogger{}
+	sequence.WithLogger(real)(&o)
+	sequence.WithLogger(nil)(&o)
+	if o.Logger != relay.Logger(real) {
+		t.Fatal("WithLogger(nil) replaced a previously set logger")
+	}
+}
+
+func TestWithLoggerReceivesTransientError(t *testing.T) {
+	st := newFakeStore()
+	for range 5 {
+		st.append(msg(0))
+	}
+	logger := &fakeLogger{}
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if mdSeq(md) == 3 {
+			return errors.New("boom")
+		}
+		return nil
+	})
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithLogger(logger), sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if msgs := logger.snapshot(); len(msgs) == 0 {
+		t.Fatal("custom Logger.Errorf was never called on send failure")
+	}
 }

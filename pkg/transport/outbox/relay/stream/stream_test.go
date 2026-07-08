@@ -3,6 +3,7 @@ package stream_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -112,11 +113,18 @@ type fakeStreamStore struct {
 	watchCount  int
 	watchTokens []string // token passed to each Watch call, in order
 	leader      string
+
+	loadErr  error
+	watchErr error
+	saveErr  error
 }
 
 func (s *fakeStreamStore) LoadToken(context.Context, string) (string, time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return "", time.Time{}, s.loadErr
+	}
 	return s.loadTok, s.loadCT, nil
 }
 
@@ -125,18 +133,24 @@ func (s *fakeStreamStore) LoadToken(context.Context, string) (string, time.Time,
 func (s *fakeStreamStore) SaveToken(_ context.Context, _ string, tok string, ct time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.saveErr != nil {
+		return s.saveErr
+	}
 	s.savedTok, s.savedCT, s.saveCount = tok, ct, s.saveCount+1
 	s.loadTok, s.loadCT = tok, ct
 	return nil
 }
 func (s *fakeStreamStore) Watch(_ context.Context, token string) (stream.Stream, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.watchErr != nil {
+		return nil, s.watchErr
+	}
 	s.watchCount++
 	s.watchTokens = append(s.watchTokens, token)
 	if s.stream != nil {
 		s.stream.i = 0 // each Watch opens a fresh cursor: simulate resuming/redelivering from the resume point
 	}
-	s.mu.Unlock()
 	return s.stream, nil
 }
 
@@ -522,4 +536,183 @@ func TestStopBackoffThenReopens(t *testing.T) {
 		}
 		t.Fatal("Run did not exit after cancel")
 	})
+}
+
+// fakeLogger is a relay.Logger fake recording every Errorf call.
+type fakeLogger struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (l *fakeLogger) Errorf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.msgs = append(l.msgs, fmt.Sprintf(format, args...))
+}
+
+func (l *fakeLogger) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]string, len(l.msgs))
+	copy(out, l.msgs)
+	return out
+}
+
+func TestNewRelayRejectsZeroLeaseTTL(t *testing.T) {
+	// DrainWindow stays at its positive default (1s), so this isolates the
+	// LeaseTTL <= 0 branch specifically.
+	_, err := stream.NewRelay("c", nil, nil, stream.WithLeaseTTL(0))
+	if err == nil {
+		t.Fatal("expected error for zero LeaseTTL, got nil")
+	}
+}
+
+func TestWithLoggerNilIsNoop(t *testing.T) {
+	o := stream.DefaultOptions()
+	real := &fakeLogger{}
+	stream.WithLogger(real)(&o)
+	stream.WithLogger(nil)(&o)
+	if o.Logger != real {
+		t.Fatal("WithLogger(nil) replaced a previously set logger")
+	}
+}
+
+// TestRunReturnsInvalidateAsFatal proves Run's switch treats
+// ErrStreamInvalidated as fatal and returns it, instead of looping forever.
+func TestRunReturnsInvalidateAsFatal(t *testing.T) {
+	st := &fakeStreamStore{stream: &fakeStream{events: []*stream.Event{ev(1, "x", true)}}}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r, err := stream.NewRelay("c", st, sender)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.Run(t.Context())
+	if !errors.Is(runErr, stream.ErrStreamInvalidated) {
+		t.Fatalf("Run err = %v, want ErrStreamInvalidated", runErr)
+	}
+}
+
+// TestRunOnceLoadTokenErrorPropagates proves a StreamStore.LoadToken error
+// surfaces directly from RunOnce.
+func TestRunOnceLoadTokenErrorPropagates(t *testing.T) {
+	sentinel := errors.New("load boom")
+	st := &fakeStreamStore{stream: &fakeStream{}, loadErr: sentinel}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r, err := stream.NewRelay("c", st, sender)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestRunOnceWatchErrorPropagates proves a StreamStore.Watch error surfaces
+// directly from RunOnce.
+func TestRunOnceWatchErrorPropagates(t *testing.T) {
+	sentinel := errors.New("watch boom")
+	st := &fakeStreamStore{stream: &fakeStream{}, watchErr: sentinel}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r, err := stream.NewRelay("c", st, sender)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestRunOnceBaselineSaveTokenErrorPropagates proves a fresh consumer group
+// (LoadToken == "") that fails to persist the pre-drain PBRT baseline
+// surfaces that SaveToken error directly from RunOnce, before ever draining.
+func TestRunOnceBaselineSaveTokenErrorPropagates(t *testing.T) {
+	sentinel := errors.New("save boom")
+	fs := &fakeStream{events: []*stream.Event{ev(1, "a", false)}, pbrt: "baseline", pbrtCT: time.Now()}
+	st := &fakeStreamStore{stream: fs, saveErr: sentinel} // loadTok == "": fresh group
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r, err := stream.NewRelay("c", st, sender)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestDrainWindowSaveTokenErrorOnDeliveryPropagates proves a SaveToken error
+// on the main processed>0 persist path surfaces from drainWindow/RunOnce. The
+// store's loadTok is pre-set to a non-empty value so the pre-drain baseline
+// persist (a different SaveToken call site) is skipped.
+func TestDrainWindowSaveTokenErrorOnDeliveryPropagates(t *testing.T) {
+	sentinel := errors.New("save boom")
+	fs := &fakeStream{events: []*stream.Event{ev(1, "a", false)}}
+	st := &fakeStreamStore{stream: fs, loadTok: "existing", saveErr: sentinel}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r, err := stream.NewRelay("c", st, sender)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestDrainWindowSaveTokenErrorOnEmptyWindowPropagates proves a SaveToken
+// error on the empty-window PBRT persist path surfaces from
+// drainWindow/RunOnce. loadTok is pre-set so the pre-drain baseline persist
+// (which would otherwise also hit saveErr) is skipped.
+func TestDrainWindowSaveTokenErrorOnEmptyWindowPropagates(t *testing.T) {
+	sentinel := errors.New("save boom")
+	fs := &fakeStream{events: nil, pbrt: "pbrt", pbrtCT: time.Now()}
+	st := &fakeStreamStore{stream: fs, loadTok: "existing", saveErr: sentinel}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r, err := stream.NewRelay("c", st, sender)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
+	}
+}
+
+// TestWithLoggerReceivesTransientError proves a custom Logger set via
+// WithLogger is invoked (not just the default nopLogger) on a transient,
+// ctx-alive error in Run's default branch.
+func TestWithLoggerReceivesTransientError(t *testing.T) {
+	fs := &fakeStream{nextErr: errors.New("boom")}
+	st := &fakeStreamStore{stream: fs}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	obs := &signalingObserver{ch: make(chan struct{}, 1)}
+	logger := &fakeLogger{}
+
+	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(obs), stream.WithLogger(logger),
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(50*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	select {
+	case <-obs.ch:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("ObserveError was not called for the transient error")
+	}
+
+	cancel()
+	if runErr := <-done; !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run err = %v, want context.Canceled", runErr)
+	}
+	if msgs := logger.snapshot(); len(msgs) == 0 {
+		t.Fatal("custom Logger.Errorf was never called on the transient error")
+	}
 }
