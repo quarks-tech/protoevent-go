@@ -102,7 +102,11 @@ type outboxDoc struct {
 // outbox_offsets — one doc per consumer group (the resume-token store).
 type offsetDoc struct {
     Name        string    `bson:"_id"`           // consumer group name
-    ResumeToken bson.Raw  `bson:"resume_token"`  // opaque; never interpreted
+    ResumeToken []byte    `bson:"resume_token"`  // opaque BSON binary; stored as []byte (NOT bson.Raw:
+                                                 // bson.Raw requires valid BSON-document bytes and fails to
+                                                 // marshal an arbitrary/opaque token — []byte binary round-trips
+                                                 // any bytes, and a real resume token still reconstructs via
+                                                 // bson.Raw(string(stored)) for SetResumeAfter)
     ClusterTime time.Time `bson:"cluster_time"`  // commit clusterTime of last processed event (DR anchor)
     UpdateTime  time.Time `bson:"update_time"`
 }
