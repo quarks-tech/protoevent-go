@@ -24,34 +24,39 @@ type Runner interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// Store implements the outbox publish path and the relay read/offset/sequencer/
-// retention/leader contracts over TiDB.
+// Store is the tx-scoped publish store: it implements only
+// CreateOutboxMessage, over a Runner that is typically a transaction-scoped
+// *sql.Tx so the outbox row commits atomically with business writes.
 type Store struct {
-	r  Runner
-	db *sql.DB // non-nil only when built via NewStoreDB; needed by SequenceMessages
+	r Runner
 }
 
-// NewStore builds a store over r, typically a transaction-scoped *sql.Tx for
-// atomic publish, or a *sql.DB for read-only relay use (ListMessages, Offset,
-// CommitOffset). The sequencer, leader-lock, and retention-sweep paths require
-// pool-backed capabilities not available through this constructor; use
-// NewStoreDB for those.
+// NewStore builds a publish-side store over r, typically a transaction-scoped
+// *sql.Tx for atomic publish. r may also be a *sql.DB for a fire-and-forget
+// publish outside a business transaction. For relay use (read/offset/
+// sequencer/retention/leader), use NewRelayStore.
 func NewStore(r Runner) *Store { return &Store{r: r} }
 
-// NewStoreDB builds a store over a *sql.DB. Unlike NewStore, the returned
-// Store's pool-backed capabilities are enabled: the sequencer
-// (SequenceMessages), leader election (TryAcquireLeaderLock /
-// ReleaseLeaderLock), and the retention sweep (SweepMessages) all manage their
-// own transactions against the pool, so they require a *sql.DB rather than a
-// transaction-scoped Runner.
-func NewStoreDB(db *sql.DB) *Store { return &Store{r: db, db: db} }
+var _ outbox.Store = (*Store)(nil)
+
+// RelayStore is the pool-backed relay store: it embeds a publish-side Store
+// (built over db, so it can also publish) plus everything the relay
+// runtimes need — read/offset, the sequencer, the retention sweep, and leader
+// election. These all manage their own transactions against the pool, so they
+// require a *sql.DB rather than a transaction-scoped Runner.
+type RelayStore struct {
+	*Store
+	db *sql.DB
+}
+
+// NewRelayStore builds a relay store over db.
+func NewRelayStore(db *sql.DB) *RelayStore { return &RelayStore{Store: NewStore(db), db: db} }
 
 var (
-	_ outbox.Store            = (*Store)(nil)
-	_ sequence.Store          = (*Store)(nil)
-	_ sequence.SequencerStore = (*Store)(nil)
-	_ sequence.RetentionStore = (*Store)(nil)
-	_ relay.LeaderStore       = (*Store)(nil)
+	_ sequence.Store          = (*RelayStore)(nil)
+	_ sequence.SequencerStore = (*RelayStore)(nil)
+	_ sequence.RetentionStore = (*RelayStore)(nil)
+	_ relay.LeaderStore       = (*RelayStore)(nil)
 )
 
 // CreateOutboxMessage inserts an unsequenced row. tx_start_ts is the publishing
@@ -88,8 +93,8 @@ VALUES (NULL, @@tidb_current_ts, ?, ?, ?, ?, ?)`,
 }
 
 // ListMessages returns sequenced rows with seq > afterSeq in seq order.
-func (s *Store) ListMessages(ctx context.Context, afterSeq int64, limit int) ([]*outbox.Message, error) {
-	rows, err := s.r.QueryContext(ctx, `
+func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit int) ([]*outbox.Message, error) {
+	rows, err := rs.db.QueryContext(ctx, `
 SELECT seq, event_id, metadata, data, create_time
 FROM outbox
 WHERE seq > ?
@@ -132,9 +137,9 @@ LIMIT ?`, afterSeq, limit)
 }
 
 // Offset returns the named consumer's watermark (0 if unset).
-func (s *Store) Offset(ctx context.Context, name string) (int64, error) {
+func (rs *RelayStore) Offset(ctx context.Context, name string) (int64, error) {
 	var seq int64
-	err := s.r.QueryRowContext(ctx, `SELECT last_seq FROM outbox_offsets WHERE name = ?`, name).Scan(&seq)
+	err := rs.db.QueryRowContext(ctx, `SELECT last_seq FROM outbox_offsets WHERE name = ?`, name).Scan(&seq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -145,8 +150,8 @@ func (s *Store) Offset(ctx context.Context, name string) (int64, error) {
 }
 
 // CommitOffset advances the watermark monotonically (GREATEST).
-func (s *Store) CommitOffset(ctx context.Context, name string, seq int64) error {
-	_, err := s.r.ExecContext(ctx, `
+func (rs *RelayStore) CommitOffset(ctx context.Context, name string, seq int64) error {
+	_, err := rs.db.ExecContext(ctx, `
 INSERT INTO outbox_offsets (name, last_seq, update_time)
 VALUES (?, ?, NOW(6))
 ON DUPLICATE KEY UPDATE
@@ -162,8 +167,8 @@ ON DUPLICATE KEY UPDATE
 // offset: it atomically initializes the group's offset row to the current
 // maximum assigned seq (0 if the log is empty or unsequenced) and returns the
 // effective offset. Monotone (GREATEST) so it never rewinds an existing row.
-func (s *Store) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
-	_, err := s.r.ExecContext(ctx, `
+func (rs *RelayStore) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
+	_, err := rs.db.ExecContext(ctx, `
 INSERT INTO outbox_offsets (name, last_seq, update_time)
 SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM outbox
 ON DUPLICATE KEY UPDATE
@@ -173,7 +178,7 @@ ON DUPLICATE KEY UPDATE
 		return 0, fmt.Errorf("outbox: init offset latest: %w", err)
 	}
 	var seq int64
-	if err := s.r.QueryRowContext(ctx,
+	if err := rs.db.QueryRowContext(ctx,
 		`SELECT last_seq FROM outbox_offsets WHERE name = ?`, name,
 	).Scan(&seq); err != nil {
 		return 0, fmt.Errorf("outbox: init offset latest read back: %w", err)
@@ -184,11 +189,8 @@ ON DUPLICATE KEY UPDATE
 // SequenceMessages assigns dense seq values to committed pending rows in
 // (tx_start_ts, id) order. The counter row is locked FOR UPDATE for the whole
 // pass, so concurrent sequencers serialize and can never double-assign.
-func (s *Store) SequenceMessages(ctx context.Context, limit int) (int, error) {
-	if s.db == nil {
-		return 0, fmt.Errorf("outbox: SequenceMessages requires a *sql.DB store (use NewStoreDB)")
-	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, error) {
+	tx, err := rs.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("outbox: begin sequence tx: %w", err)
 	}
@@ -235,8 +237,8 @@ SET o.seq = ? + b.rn - 1`, limit, next)
 
 // TryAcquireLeaderLock acquires or renews the lock; the incoming holder wins if
 // the lock is free (expired) or already theirs. TTL is applied via DB clock.
-func (s *Store) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
-	if _, err := s.r.ExecContext(ctx, `
+func (rs *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
+	if _, err := rs.db.ExecContext(ctx, `
 INSERT INTO relay_lock (name, holder_id, expire_time)
 VALUES (?, ?, NOW(6) + INTERVAL ? MICROSECOND)
 ON DUPLICATE KEY UPDATE
@@ -248,7 +250,7 @@ ON DUPLICATE KEY UPDATE
 	}
 
 	var holder string
-	if err := s.r.QueryRowContext(ctx,
+	if err := rs.db.QueryRowContext(ctx,
 		`SELECT holder_id FROM relay_lock WHERE name = ?`, name,
 	).Scan(&holder); err != nil {
 		return false, fmt.Errorf("outbox: read lock holder: %w", err)
@@ -257,8 +259,8 @@ ON DUPLICATE KEY UPDATE
 }
 
 // ReleaseLeaderLock drops the lock if still held by holderID.
-func (s *Store) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
-	_, err := s.r.ExecContext(ctx,
+func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
+	_, err := rs.db.ExecContext(ctx,
 		`DELETE FROM relay_lock WHERE name = ? AND holder_id = ?`, name, holderID)
 	if err != nil {
 		return fmt.Errorf("outbox: release lock: %w", err)
@@ -277,8 +279,8 @@ func (s *Store) ReleaseLeaderLock(ctx context.Context, name, holderID string) er
 // so provides no retention protection at all — an unrun group does not hold
 // the sweep back. Consumer groups must run (or call InitOffsetLatest) within
 // the retention window to be protected from the sweep.
-func (s *Store) SweepMessages(ctx context.Context, before time.Time, limit int) (int, error) {
-	res, err := s.r.ExecContext(ctx, `
+func (rs *RelayStore) SweepMessages(ctx context.Context, before time.Time, limit int) (int, error) {
+	res, err := rs.db.ExecContext(ctx, `
 DELETE FROM outbox
 WHERE seq IS NOT NULL
   AND seq <= (SELECT MIN(last_seq) FROM outbox_offsets)

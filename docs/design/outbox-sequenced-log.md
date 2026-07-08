@@ -420,7 +420,7 @@ over. Start at N = 1 and split a stream only when single-drainer throughput is t
 
 **Implementation status.** The v2 reference TiDB store (`pkg/transport/outbox/tidb`) targets a fixed
 `outbox` table (partition count 1) — the single-table base case. Both topics and partitions need one
-small additive change: a table-name (prefix) parameter on `NewStore`/`NewStoreDB` and the publish
+small additive change: a table-name (prefix) parameter on `NewStore`/`NewRelayStore` and the publish
 routing helper, so a store instance and its relay target `outbox_<stream>_<n>`. This is purely
 additive (no schema migration, no change to the single-table deployment) and is deferred until a
 second stream or a throughput split is actually needed. No `partition_key` column is or will be

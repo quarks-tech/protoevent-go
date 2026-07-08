@@ -88,7 +88,7 @@ should sequence). `sender` is the downstream transport, any `eventbus.Sender`.
 `SequenceBatchSize`, or `LeaseTTL` is not strictly positive.
 
 ```go
-r, err := sequence.NewRelay("broker-publish", tidb.NewStoreDB(db), rabbitSender,
+r, err := sequence.NewRelay("broker-publish", tidb.NewRelayStore(db), rabbitSender,
     sequence.WithRetention(7*24*time.Hour, 256, 5000),
     sequence.WithObserver(promObserver),
 )
@@ -101,9 +101,10 @@ if err := r.Run(ctx); err != nil {
 }
 ```
 
-`tidb.NewStoreDB(db)` (as opposed to `tidb.NewStore(r)` over a transaction-scoped
-`Runner`) is required here because the sequencer, leader-lock, and retention sweep
-each manage their own transactions against the pool. `Run` polls on
+`tidb.NewRelayStore(db)` (as opposed to `tidb.NewStore(r)` over a transaction-scoped
+`Runner`, which only implements the publish-side `outbox.Store`) is required here
+because the sequencer, leader-lock, and retention sweep each manage their own
+transactions against the pool. `Run` polls on
 `sequence.WithPollInterval` (default 1s) until `ctx` is canceled, and on each tick:
 acquires/renews the leader lock (`relay.LeaderStore`, if implemented) so only one
 relay instance processes at a time, sequences newly committed rows, drains them to

@@ -43,7 +43,7 @@ func TestRelayEndToEndOrderAndDelivery(t *testing.T) {
 
 	sender := &recordingSender{}
 	// Single relay instance: it both sequences and drains.
-	r, err := sequence.NewRelay("e2e", tidb.NewStoreDB(testDB), sender,
+	r, err := sequence.NewRelay("e2e", tidb.NewRelayStore(testDB), sender,
 		sequence.WithBatchSize(10), sequence.WithSequenceBatchSize(1000))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -76,7 +76,7 @@ func TestRelayEndToEndOrderAndDelivery(t *testing.T) {
 		t.Fatalf("delivered IDs =\n%v\nwant (published order)\n%v", sender.ids, wantIDs)
 	}
 	// Offset advanced to 50.
-	off, err := tidb.NewStore(testDB).Offset(context.Background(), "e2e")
+	off, err := tidb.NewRelayStore(testDB).Offset(context.Background(), "e2e")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestRelayStartFromBeginningReplays(t *testing.T) {
 	}
 
 	sender := &recordingSender{}
-	r, err := sequence.NewRelay("replay", tidb.NewStoreDB(testDB), sender,
+	r, err := sequence.NewRelay("replay", tidb.NewRelayStore(testDB), sender,
 		sequence.WithStartFromBeginning())
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -125,7 +125,7 @@ func TestLatePublishGetsHigherSeq(t *testing.T) {
 	truncate(t)
 	publish(t, "early")
 
-	st := tidb.NewStoreDB(testDB)
+	st := tidb.NewRelayStore(testDB)
 	ctx := context.Background()
 	if _, err := st.SequenceMessages(ctx, 100); err != nil {
 		t.Fatal(err)

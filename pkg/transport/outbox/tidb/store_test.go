@@ -26,9 +26,9 @@ func TestNewStoreCompiles(t *testing.T) {
 	}
 }
 
-func TestStoreDBConstructs(t *testing.T) {
-	if tidb.NewStoreDB(nil) == nil {
-		t.Fatal("NewStoreDB returned nil")
+func TestRelayStoreConstructs(t *testing.T) {
+	if tidb.NewRelayStore(nil) == nil {
+		t.Fatal("NewRelayStore returned nil")
 	}
 }
 
@@ -117,7 +117,7 @@ func TestSequenceAssignsDenseContiguousSeq(t *testing.T) {
 	for range 5 {
 		publish(t, "s")
 	}
-	st := tidb.NewStoreDB(testDB)
+	st := tidb.NewRelayStore(testDB)
 	n, err := st.SequenceMessages(context.Background(), 100)
 	if err != nil {
 		t.Fatalf("sequence: %v", err)
@@ -157,7 +157,7 @@ func TestConcurrentSequencersNoDuplicateNoGap(t *testing.T) {
 	for range 200 {
 		publish(t, "s")
 	}
-	st := tidb.NewStoreDB(testDB)
+	st := tidb.NewRelayStore(testDB)
 
 	var wg sync.WaitGroup
 	for range 4 {
@@ -193,7 +193,7 @@ func TestCommitOffsetIsMonotone(t *testing.T) {
 		t.Skip("no TiDB")
 	}
 	truncate(t)
-	st := tidb.NewStore(testDB)
+	st := tidb.NewRelayStore(testDB)
 	ctx := context.Background()
 	if err := st.CommitOffset(ctx, "c", 10); err != nil {
 		t.Fatal(err)
@@ -215,7 +215,7 @@ func TestLeaderLockMutualExclusionAndRelease(t *testing.T) {
 		t.Skip("no TiDB")
 	}
 	truncate(t)
-	st := tidb.NewStore(testDB)
+	st := tidb.NewRelayStore(testDB)
 	ctx := context.Background()
 
 	okA, err := st.TryAcquireLeaderLock(ctx, "lock", "A", 30*time.Second)
@@ -266,7 +266,7 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 
 	publishMetadata(t, md, []byte("payload"))
 
-	st := tidb.NewStoreDB(testDB)
+	st := tidb.NewRelayStore(testDB)
 	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
 		t.Fatalf("sequence: %v", err)
 	}
