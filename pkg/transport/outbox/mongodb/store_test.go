@@ -2,6 +2,8 @@ package mongodb_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -33,7 +35,12 @@ var testDB *mongo.Database
 func TestMain(m *testing.M) {
 	inst, cleanup, err := mongodbtest.Start(context.Background())
 	if err != nil {
-		os.Exit(0) // Docker unavailable: skip the integration suite
+		if errors.Is(err, mongodbtest.ErrDockerUnavailable) {
+			fmt.Fprintf(os.Stderr, "skipping mongo integration tests: %v\n", err)
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stderr, "mongo integration setup: %v\n", err)
+		os.Exit(1) // real harness bug, not a missing Docker
 	}
 	testDB = inst.DB
 	code := m.Run()
@@ -66,7 +73,9 @@ func publish(t *testing.T, subject string) string {
 	}
 	defer sess.EndSession(context.Background())
 	_, err = sess.WithTransaction(context.Background(), func(sc context.Context) (any, error) {
-		return nil, st.CreateOutboxMessage(sc, &outbox.Message{ID: md.ID, Metadata: md, Data: []byte("x"), CreateTime: md.Time})
+		// Go through the production Sender so the default ReuseMetadataID
+		// generator (no explicit Message.ID) derives the row id from md.ID.
+		return nil, outbox.NewSender(st).Send(sc, md, []byte("x"))
 	})
 	if err != nil {
 		t.Fatalf("publish: %v", err)
@@ -102,14 +111,47 @@ func TestEnsureIndexesCreatesTTL(t *testing.T) {
 	if err := cur.All(context.Background(), &idx); err != nil {
 		t.Fatal(err)
 	}
+	const wantTTLSeconds = int32(7 * 24 * 60 * 60)
 	found := false
 	for _, ix := range idx {
-		if _, ok := ix["expireAfterSeconds"]; ok {
-			found = true
+		// Nested documents decode to bson.D (not bson.M) when the outer
+		// document is unmarshaled into a bson.M.
+		key, ok := ix["key"].(bson.D)
+		if !ok {
+			continue
+		}
+		hasCreateTime := false
+		for _, e := range key {
+			if e.Key == "create_time" {
+				hasCreateTime = true
+				break
+			}
+		}
+		if !hasCreateTime {
+			continue
+		}
+		ttl, ok := ix["expireAfterSeconds"]
+		if !ok {
+			continue
+		}
+		found = true
+		var ttlSeconds int32
+		switch v := ttl.(type) {
+		case int32:
+			ttlSeconds = v
+		case int64:
+			ttlSeconds = int32(v)
+		case float64:
+			ttlSeconds = int32(v)
+		default:
+			t.Fatalf("expireAfterSeconds has unexpected type %T: %v", ttl, ttl)
+		}
+		if ttlSeconds != wantTTLSeconds {
+			t.Fatalf("create_time TTL index expireAfterSeconds = %d, want %d", ttlSeconds, wantTTLSeconds)
 		}
 	}
 	if !found {
-		t.Fatal("no TTL index on outbox")
+		t.Fatal("no TTL index on outbox.create_time")
 	}
 }
 
@@ -128,7 +170,7 @@ func TestOffsetRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tok) != 2 || tok[0] != 0x01 {
+	if len(tok) != 2 || tok[0] != 0x01 || tok[1] != 0x02 {
 		t.Fatalf("token = %q, want \\x01\\x02", tok)
 	}
 	if !gotCT.Equal(ct) {
@@ -147,14 +189,20 @@ func TestLeaderLockMutualExclusionAndRelease(t *testing.T) {
 	if err != nil || !okA {
 		t.Fatalf("A acquire = %v, %v; want true", okA, err)
 	}
-	okB, _ := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	okB, err := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if okB {
 		t.Fatal("B acquired while A holds the lock")
 	}
 	if err := st.ReleaseLeaderLock(ctx, "lock", "A"); err != nil {
 		t.Fatal(err)
 	}
-	okB2, _ := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	okB2, err := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !okB2 {
 		t.Fatal("B failed to acquire after A released")
 	}
