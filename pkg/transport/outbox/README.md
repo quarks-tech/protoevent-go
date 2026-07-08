@@ -84,12 +84,17 @@ satisfy `sequence.Store` (read + offset); if it also implements
 `sequence.SequencerStore`, the relay runs the post-commit sequencer pass itself
 unless `sequence.WithoutSequencer()` is set (only one relay per outbox table
 should sequence). `sender` is the downstream transport, any `eventbus.Sender`.
+`NewRelay` returns an error if `PollInterval`, `BatchSize`,
+`SequenceBatchSize`, or `LeaseTTL` is not strictly positive.
 
 ```go
-r := sequence.NewRelay("broker-publish", tidb.NewStoreDB(db), rabbitSender,
+r, err := sequence.NewRelay("broker-publish", tidb.NewStoreDB(db), rabbitSender,
     sequence.WithRetention(7*24*time.Hour, 256, 5000),
     sequence.WithObserver(promObserver),
 )
+if err != nil {
+    log.Fatal(err)
+}
 
 if err := r.Run(ctx); err != nil {
     log.Fatal(err)

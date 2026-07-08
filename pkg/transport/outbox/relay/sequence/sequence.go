@@ -4,6 +4,7 @@ package sequence
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -175,19 +176,35 @@ type Relay struct {
 	offsetInitialized bool
 }
 
-// NewRelay creates a relay for the named consumer group.
+// NewRelay creates a relay for the named consumer group. It returns an error
+// if PollInterval, BatchSize, SequenceBatchSize, or LeaseTTL is not strictly
+// positive: a zero PollInterval panics inside time.NewTicker, and a zero
+// BatchSize or SequenceBatchSize would silently stall the relay instead of
+// erroring at construction time.
 //
 // name identifies the consumer (its offset row) and is the default leader-lock
 // name. store reads the log and holds offsets; sender is the downstream
 // transport (e.g. a RabbitMQ sender). If store also implements SequencerStore,
 // this relay runs the sequencer pass unless WithoutSequencer() is given.
-func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) *Relay {
+func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) (*Relay, error) {
 	options := DefaultOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
 	if options.LeaderLockName == "" {
 		options.LeaderLockName = name
+	}
+	if options.PollInterval <= 0 {
+		return nil, fmt.Errorf("sequence: PollInterval must be > 0, got %v", options.PollInterval)
+	}
+	if options.BatchSize <= 0 {
+		return nil, fmt.Errorf("sequence: BatchSize must be > 0, got %d", options.BatchSize)
+	}
+	if options.SequenceBatchSize <= 0 {
+		return nil, fmt.Errorf("sequence: SequenceBatchSize must be > 0, got %d", options.SequenceBatchSize)
+	}
+	if options.LeaseTTL <= 0 {
+		return nil, fmt.Errorf("sequence: LeaseTTL must be > 0, got %v", options.LeaseTTL)
 	}
 
 	return &Relay{
@@ -196,5 +213,5 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		sender:  sender,
 		options: options,
 		leader:  relay.NewLeaderElector(store, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
-	}
+	}, nil
 }

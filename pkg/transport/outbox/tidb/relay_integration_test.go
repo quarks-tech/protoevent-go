@@ -43,8 +43,11 @@ func TestRelayEndToEndOrderAndDelivery(t *testing.T) {
 
 	sender := &recordingSender{}
 	// Single relay instance: it both sequences and drains.
-	r := sequence.NewRelay("e2e", tidb.NewStoreDB(testDB), sender,
+	r, err := sequence.NewRelay("e2e", tidb.NewStoreDB(testDB), sender,
 		sequence.WithBatchSize(10), sequence.WithSequenceBatchSize(1000))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
 
 	// Prime the group on the empty log: this is where latest-default
 	// initializes the offset (to 0, since nothing is sequenced yet).
@@ -97,8 +100,11 @@ func TestRelayStartFromBeginningReplays(t *testing.T) {
 	}
 
 	sender := &recordingSender{}
-	r := sequence.NewRelay("replay", tidb.NewStoreDB(testDB), sender,
+	r, err := sequence.NewRelay("replay", tidb.NewStoreDB(testDB), sender,
 		sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
 
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)

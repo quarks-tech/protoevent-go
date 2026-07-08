@@ -336,8 +336,11 @@ type SequencerStore interface {
 
 ### 7.3 `relay.Relay`
 
-- `NewRelay(store Store, sender eventbus.Sender, opts ...Option)` — `WithName(string)` becomes
-  mandatory (consumer group identity; also default leader-lock name).
+- `NewRelay(store Store, sender eventbus.Sender, opts ...Option) (*Relay, error)` — `WithName(string)`
+  becomes mandatory (consumer group identity; also default leader-lock name). Returns an error if
+  `PollInterval`, `BatchSize`, `SequenceBatchSize`, or `LeaseTTL` is not strictly positive (a zero
+  `PollInterval` would otherwise panic inside `time.NewTicker`), mirroring the stream runtime's
+  validating `NewRelay`.
 - `RunOnce`: acquire leadership → sequence pass (if `SequencerStore`) → drain pass → offset
   commit — **all in one tick** (§10).
   Send failure stops the page (stop-the-lane, preserves order) instead of the current

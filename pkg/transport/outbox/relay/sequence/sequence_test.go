@@ -64,6 +64,43 @@ func TestOptionsApply(t *testing.T) {
 	}
 }
 
+func TestNewRelayRejectsZeroPollInterval(t *testing.T) {
+	// A zero PollInterval previously panicked inside time.NewTicker; it must
+	// now be rejected at construction time.
+	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithPollInterval(0))
+	if err == nil {
+		t.Fatal("expected error for zero PollInterval, got nil")
+	}
+}
+
+func TestNewRelayRejectsZeroBatchSize(t *testing.T) {
+	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithBatchSize(0))
+	if err == nil {
+		t.Fatal("expected error for zero BatchSize, got nil")
+	}
+}
+
+func TestNewRelayRejectsZeroSequenceBatchSize(t *testing.T) {
+	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithSequenceBatchSize(0))
+	if err == nil {
+		t.Fatal("expected error for zero SequenceBatchSize, got nil")
+	}
+}
+
+func TestNewRelayRejectsZeroLeaseTTL(t *testing.T) {
+	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithLeaseTTL(0))
+	if err == nil {
+		t.Fatal("expected error for zero LeaseTTL, got nil")
+	}
+}
+
+func TestNewRelayAcceptsDefaults(t *testing.T) {
+	r, err := sequence.NewRelay("c", newFakeStore(), nil)
+	if err != nil || r == nil {
+		t.Fatalf("NewRelay with defaults: r=%v err=%v", r, err)
+	}
+}
+
 // --- in-memory contract fake ------------------------------------------------
 
 // fakeStore models the SQL store's contract: a dense sequenced log, NULL-seq
@@ -196,7 +233,10 @@ func TestRunOnceSequencesThenDrainsSameTick(t *testing.T) {
 		return nil
 	})
 
-	r := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -216,7 +256,10 @@ func TestDrainLoopsUntilShortPage(t *testing.T) {
 	var count int
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { count++; return nil })
 
-	r := sequence.NewRelay("c", st, sender, sequence.WithBatchSize(100), sequence.WithStartFromBeginning())
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithBatchSize(100), sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -239,7 +282,10 @@ func TestStopTheLaneOnSendError(t *testing.T) {
 		return nil
 	})
 
-	r := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
 	_ = r.RunOnce(context.Background())
 
 	// Sent 1,2; stopped at 3. Offset must not advance past 2.
@@ -258,7 +304,10 @@ func TestNonLeaderDoesNothing(t *testing.T) {
 	sent := 0
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
 
-	r := sequence.NewRelay("c", st, sender, sequence.WithLeaderLockName("lock"))
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithLeaderLockName("lock"))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -281,9 +330,12 @@ func TestParkAndContinueAdvancesPastFailure(t *testing.T) {
 		return nil
 	})
 	var parked []int64
-	r := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(), sequence.WithErrorHandler(
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(), sequence.WithErrorHandler(
 		func(_ context.Context, m *outbox.Message, _ error) { parked = append(parked, m.Seq) },
 	))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -337,7 +389,10 @@ func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
 	st := ctxCancelingLeaderStore{fakeStore: newFakeStore(), cancel: cancel}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &recordingObserver{}
-	r := sequence.NewRelay("c", st, sender, sequence.WithObserver(obs), sequence.WithPollInterval(time.Millisecond))
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithObserver(obs), sequence.WithPollInterval(time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
 
 	runErr := r.Run(ctx)
 	if !errors.Is(runErr, context.Canceled) {
@@ -369,7 +424,10 @@ func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 		return nil
 	})
 
-	r := sequence.NewRelay("fresh", st, sender) // no WithStartFromBeginning
+	r, err := sequence.NewRelay("fresh", st, sender) // no WithStartFromBeginning
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
