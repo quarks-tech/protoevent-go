@@ -268,6 +268,59 @@ func TestRunOncePicksUpWhereItLeftOff(t *testing.T) {
 	}
 }
 
+// recordingObserver tracks whether ObserveError was ever called.
+type recordingObserver struct {
+	mu          sync.Mutex
+	errObserved bool
+}
+
+func (o *recordingObserver) ObserveDrained(string, int, time.Duration, bool) {}
+func (o *recordingObserver) ObserveError(string, error) {
+	o.mu.Lock()
+	o.errObserved = true
+	o.mu.Unlock()
+}
+
+// ctxCancelingLeaderStore cancels the ctx passed to Run (via the embedded
+// cancel func) from inside TryAcquireLeaderLock, then returns ctx.Err() once
+// it observes the cancellation. This reproduces a leader-lock call that fails
+// with context.Canceled mid-RunOnce (as opposed to Run's own top-of-loop
+// ctx.Err() check, which would short-circuit before ever calling RunOnce).
+type ctxCancelingLeaderStore struct {
+	*fakeStreamStore
+	cancel context.CancelFunc
+}
+
+func (s ctxCancelingLeaderStore) TryAcquireLeaderLock(ctx context.Context, _, _ string, _ time.Duration) (bool, error) {
+	s.cancel()
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// TestRunDoesNotReportErrorOnShutdown verifies that a context-cancellation
+// error surfacing mid-RunOnce (a planned shutdown) is not reported to the
+// Observer/Logger as a pass-level error.
+func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	st := ctxCancelingLeaderStore{fakeStreamStore: &fakeStreamStore{stream: &fakeStream{}}, cancel: cancel}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	obs := &recordingObserver{}
+	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(obs))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	runErr := r.Run(ctx)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run err = %v, want context.Canceled", runErr)
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if obs.errObserved {
+		t.Fatal("ObserveError called on planned shutdown, want none")
+	}
+}
+
 // TestRunOnceFreshGroupPersistsBaselineBeforeDrain is the regression test for
 // the at-least-once hole: a brand-new consumer group (LoadToken == "") opens
 // its stream at "now", and if the FIRST drained event fails to send under

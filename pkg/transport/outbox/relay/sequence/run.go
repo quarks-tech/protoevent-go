@@ -2,6 +2,7 @@ package sequence
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
@@ -20,10 +21,13 @@ func (r *Relay) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if err := r.RunOnce(ctx); err != nil {
-				r.options.Observer.ObserveError(r.name, err)
-				if r.options.Logger != nil {
-					r.options.Logger.Errorf("relay %q: %v", r.name, err)
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					// Planned shutdown: ctx.Done() will fire and exit the loop; don't
+					// report a spurious error metric/log for it.
+					continue
 				}
+				r.options.Observer.ObserveError(r.name, err)
+				r.options.Logger.Errorf("relay %q: %v", r.name, err)
 			}
 		}
 	}
@@ -123,7 +127,8 @@ func (r *Relay) drain(ctx context.Context) error {
 		}
 
 		full := len(msgs) == r.options.BatchSize
-		r.options.Observer.ObserveDrained(r.name, processed, time.Since(msgs[0].CreateTime), full && !stopped)
+		more := stopped || full
+		r.options.Observer.ObserveDrained(r.name, processed, time.Since(msgs[0].CreateTime), more)
 
 		if stopped || !full {
 			return nil
@@ -156,7 +161,5 @@ func (r *Relay) handleError(ctx context.Context, msg *outbox.Message, err error)
 		r.options.ErrorHandler(ctx, msg, err)
 	}
 	r.options.Observer.ObserveError(r.name, err)
-	if r.options.Logger != nil {
-		r.options.Logger.Errorf("relay %q: send message %s: %v", r.name, msg.ID, err)
-	}
+	r.options.Logger.Errorf("relay %q: send message %s: %v", r.name, msg.ID, err)
 }

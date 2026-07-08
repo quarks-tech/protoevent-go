@@ -17,6 +17,9 @@ type Observer interface {
 	// (Message.CreateTime) age of the oldest event in the page for the
 	// sequence runtime, and committed-token (clusterTime) age for the stream
 	// runtime.
+	//
+	// more reports whether work is known to remain: a full page, or a
+	// stop-the-lane failure (the failed event is still pending).
 	ObserveDrained(name string, count int, oldestAge time.Duration, more bool)
 	// ObserveError reports a pass-level error (leadership, read, forward, sweep).
 	ObserveError(name string, err error)

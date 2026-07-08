@@ -73,6 +73,7 @@ func DefaultOptions() Options {
 		LeaseTTL:       15 * time.Second,
 		TokenBatchSize: 100,
 		Observer:       nopObserver{},
+		Logger:         nopLogger{},
 	}
 }
 
@@ -81,14 +82,27 @@ type nopObserver struct{}
 func (nopObserver) ObserveDrained(string, int, time.Duration, bool) {}
 func (nopObserver) ObserveError(string, error)                      {}
 
+// nopLogger is the default relay.Logger: it discards everything.
+type nopLogger struct{}
+
+func (nopLogger) Errorf(string, ...any) {}
+
 // Option configures Options.
 type Option func(*Options)
 
-func WithDrainWindow(d time.Duration) Option  { return func(o *Options) { o.DrainWindow = d } }
-func WithLeaseTTL(d time.Duration) Option     { return func(o *Options) { o.LeaseTTL = d } }
-func WithLeaderLockName(s string) Option      { return func(o *Options) { o.LeaderLockName = s } }
-func WithTokenBatchSize(n int) Option         { return func(o *Options) { o.TokenBatchSize = n } }
-func WithLogger(l relay.Logger) Option        { return func(o *Options) { o.Logger = l } }
+func WithDrainWindow(d time.Duration) Option { return func(o *Options) { o.DrainWindow = d } }
+func WithLeaseTTL(d time.Duration) Option    { return func(o *Options) { o.LeaseTTL = d } }
+func WithLeaderLockName(s string) Option     { return func(o *Options) { o.LeaderLockName = s } }
+func WithTokenBatchSize(n int) Option        { return func(o *Options) { o.TokenBatchSize = n } }
+
+// WithLogger sets the error logger. A nil logger is ignored.
+func WithLogger(l relay.Logger) Option {
+	return func(o *Options) {
+		if l != nil {
+			o.Logger = l
+		}
+	}
+}
 
 // WithObserver sets the observability sink. A nil observer is ignored.
 func WithObserver(obs relay.Observer) Option {

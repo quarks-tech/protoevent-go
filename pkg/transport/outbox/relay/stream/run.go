@@ -42,12 +42,15 @@ func (r *Relay) Run(ctx context.Context) error {
 			r.sleep(ctx)
 		case errors.Is(err, ErrStreamInvalidated), errors.Is(err, ErrHistoryLost):
 			return err // fatal
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// Planned shutdown: the ctx.Err() check at the top of the loop will
+			// return next iteration; don't report a spurious error metric/log.
+			r.closeStream(ctx)
+			r.sleep(ctx)
 		default:
 			// transient (leadership, reopen, send/save): report, drop the stream, retry
 			r.options.Observer.ObserveError(r.name, err)
-			if r.options.Logger != nil {
-				r.options.Logger.Errorf("stream relay %q: %v", r.name, err)
-			}
+			r.options.Logger.Errorf("stream relay %q: %v", r.name, err)
 			r.closeStream(ctx)
 			r.sleep(ctx)
 		}
@@ -187,7 +190,5 @@ func (r *Relay) handleError(ctx context.Context, msg *outbox.Message, err error)
 		r.options.ErrorHandler(ctx, msg, err)
 	}
 	r.options.Observer.ObserveError(r.name, err)
-	if r.options.Logger != nil {
-		r.options.Logger.Errorf("stream relay %q: send message %s: %v", r.name, msg.ID, err)
-	}
+	r.options.Logger.Errorf("stream relay %q: send message %s: %v", r.name, msg.ID, err)
 }

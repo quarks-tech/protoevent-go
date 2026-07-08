@@ -27,6 +27,11 @@ func (nopObserver) ObserveDrained(string, int, time.Duration, bool) {}
 func (nopObserver) ObserveError(string, error)                      {}
 func (nopObserver) ObserveSequenced(string, int)                    {}
 
+// nopLogger is the default relay.Logger: it discards everything.
+type nopLogger struct{}
+
+func (nopLogger) Errorf(string, ...any) {}
+
 // Store is the sequenced-log read/offset contract, implemented over a
 // non-transactional connection (e.g. *sql.DB).
 type Store interface {
@@ -97,6 +102,7 @@ func DefaultOptions() Options {
 		PollInterval:      time.Second,
 		LeaseTTL:          15 * time.Second,
 		Observer:          nopObserver{},
+		Logger:            nopLogger{},
 	}
 }
 
@@ -109,7 +115,15 @@ func WithPollInterval(d time.Duration) Option { return func(o *Options) { o.Poll
 func WithLeaseTTL(ttl time.Duration) Option   { return func(o *Options) { o.LeaseTTL = ttl } }
 func WithLeaderLockName(name string) Option   { return func(o *Options) { o.LeaderLockName = name } }
 func WithoutSequencer() Option                { return func(o *Options) { o.DisableSequencer = true } }
-func WithLogger(l relay.Logger) Option        { return func(o *Options) { o.Logger = l } }
+
+// WithLogger sets the error logger. A nil logger is ignored.
+func WithLogger(l relay.Logger) Option {
+	return func(o *Options) {
+		if l != nil {
+			o.Logger = l
+		}
+	}
+}
 
 // WithStartFromBeginning makes a NEW consumer group (one with no committed
 // offset) replay the retained log from the start instead of the default

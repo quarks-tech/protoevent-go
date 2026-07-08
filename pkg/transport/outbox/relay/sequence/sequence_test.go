@@ -299,6 +299,57 @@ func TestParkAndContinueAdvancesPastFailure(t *testing.T) {
 	}
 }
 
+// recordingObserver tracks whether ObserveError was ever called.
+type recordingObserver struct {
+	mu          sync.Mutex
+	errObserved bool
+}
+
+func (o *recordingObserver) ObserveDrained(string, int, time.Duration, bool) {}
+func (o *recordingObserver) ObserveSequenced(string, int)                    {}
+func (o *recordingObserver) ObserveError(string, error) {
+	o.mu.Lock()
+	o.errObserved = true
+	o.mu.Unlock()
+}
+
+// ctxCancelingLeaderStore cancels the ctx passed to Run (via the embedded
+// cancel func) from inside TryAcquireLeaderLock, then returns ctx.Err() once
+// it observes the cancellation. This reproduces a leader-lock call that fails
+// with context.Canceled mid-RunOnce (as opposed to Run's own ctx.Done() select
+// case, which would exit the loop before ever calling RunOnce again).
+type ctxCancelingLeaderStore struct {
+	*fakeStore
+	cancel context.CancelFunc
+}
+
+func (s ctxCancelingLeaderStore) TryAcquireLeaderLock(ctx context.Context, _, _ string, _ time.Duration) (bool, error) {
+	s.cancel()
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// TestRunDoesNotReportErrorOnShutdown verifies that a context-cancellation
+// error surfacing mid-RunOnce (a planned shutdown) is not reported to the
+// Observer/Logger as a pass-level error.
+func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	st := ctxCancelingLeaderStore{fakeStore: newFakeStore(), cancel: cancel}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	obs := &recordingObserver{}
+	r := sequence.NewRelay("c", st, sender, sequence.WithObserver(obs), sequence.WithPollInterval(time.Millisecond))
+
+	runErr := r.Run(ctx)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run err = %v, want context.Canceled", runErr)
+	}
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if obs.errObserved {
+		t.Fatal("ObserveError called on planned shutdown, want none")
+	}
+}
+
 // TestNewGroupStartsAtLatestByDefault proves parity with the stream runtime's
 // start-at-now: a brand-new consumer group (no committed offset) must not
 // replay the retained log. Only events sequenced AFTER the group's first
