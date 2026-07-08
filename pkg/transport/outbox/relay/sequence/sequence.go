@@ -40,6 +40,13 @@ type Store interface {
 	// CommitOffset advances the named consumer's watermark. Implementations MUST
 	// be monotone (GREATEST semantics): a lower seq never rewinds the offset.
 	CommitOffset(ctx context.Context, name string, seq int64) error
+
+	// InitOffsetLatest is called once for a consumer group with no committed
+	// offset: atomically initialize its offset row to the current maximum
+	// assigned seq (0 if the log is empty or unsequenced) and return the
+	// effective offset. Implementations MUST be monotone (GREATEST) so it never
+	// rewinds an existing row.
+	InitOffsetLatest(ctx context.Context, name string) (int64, error)
 }
 
 // SequencerStore assigns dense Seq values to committed-but-unsequenced rows.
@@ -66,6 +73,12 @@ type Options struct {
 	LeaderLockName    string // defaults to the relay name
 
 	DisableSequencer bool
+
+	// StartFromBeginning makes a NEW consumer group replay the retained log
+	// from the start instead of the default "latest" (future events only —
+	// parity with the stream runtime's start-at-now). Has no effect once the
+	// group has a committed offset.
+	StartFromBeginning bool
 
 	RetentionWindow     time.Duration // 0 disables the sweep
 	RetentionSweepEvery int           // run sweep every N ticks
@@ -97,6 +110,14 @@ func WithLeaseTTL(ttl time.Duration) Option   { return func(o *Options) { o.Leas
 func WithLeaderLockName(name string) Option   { return func(o *Options) { o.LeaderLockName = name } }
 func WithoutSequencer() Option                { return func(o *Options) { o.DisableSequencer = true } }
 func WithLogger(l relay.Logger) Option        { return func(o *Options) { o.Logger = l } }
+
+// WithStartFromBeginning makes a NEW consumer group (one with no committed
+// offset) replay the retained log from the start instead of the default
+// "latest" (future events only — parity with the stream runtime's
+// start-at-now). Has no effect once the group has a committed offset.
+func WithStartFromBeginning() Option {
+	return func(o *Options) { o.StartFromBeginning = true }
+}
 
 // WithObserver sets the observability sink. A nil observer is ignored.
 func WithObserver(obs Observer) Option {
@@ -134,6 +155,11 @@ type Relay struct {
 
 	isLeader  bool // whether this instance currently holds the lock
 	tickCount int  // for retention cadence
+
+	// offsetInitialized latches once InitOffsetLatest has run for this Relay
+	// instance, so a still-empty-log group (offset genuinely 0 with nothing to
+	// commit yet) doesn't re-run InitOffsetLatest on every drain() tick.
+	offsetInitialized bool
 }
 
 // NewRelay creates a relay for the named consumer group.

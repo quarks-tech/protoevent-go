@@ -30,21 +30,35 @@ func (r *recordingSender) Send(_ context.Context, md *event.Metadata, _ []byte) 
 	return nil
 }
 
+// TestRelayEndToEndOrderAndDelivery proves the latest-default end to end: the
+// consumer group is primed (one RunOnce on the empty log, which initializes
+// its offset at "latest") BEFORE anything is published, so the subsequent 50
+// publishes are all newer than the group's start and must all be delivered,
+// in order.
 func TestRelayEndToEndOrderAndDelivery(t *testing.T) {
 	if testDB == nil {
 		t.Skip("no TiDB")
 	}
 	truncate(t)
 
-	wantIDs := make([]string, 0, 50)
-	for i := 0; i < 50; i++ {
-		wantIDs = append(wantIDs, publish(t, "s"))
-	}
-
 	sender := &recordingSender{}
 	// Single relay instance: it both sequences and drains.
 	r := sequence.NewRelay("e2e", tidb.NewStoreDB(testDB), sender,
 		sequence.WithBatchSize(10), sequence.WithSequenceBatchSize(1000))
+
+	// Prime the group on the empty log: this is where latest-default
+	// initializes the offset (to 0, since nothing is sequenced yet).
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("priming RunOnce: %v", err)
+	}
+	if len(sender.ids) != 0 {
+		t.Fatalf("priming delivered %d, want 0", len(sender.ids))
+	}
+
+	wantIDs := make([]string, 0, 50)
+	for i := 0; i < 50; i++ {
+		wantIDs = append(wantIDs, publish(t, "s"))
+	}
 
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -65,6 +79,36 @@ func TestRelayEndToEndOrderAndDelivery(t *testing.T) {
 	}
 	if off != 50 {
 		t.Fatalf("offset = %d, want 50", off)
+	}
+}
+
+// TestRelayStartFromBeginningReplays proves the explicit replay opt-in: a
+// fresh group with WithStartFromBeginning delivers events published BEFORE it
+// ever ran, unlike the latest-default proven above.
+func TestRelayStartFromBeginningReplays(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+
+	wantIDs := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		wantIDs = append(wantIDs, publish(t, "s"))
+	}
+
+	sender := &recordingSender{}
+	r := sequence.NewRelay("replay", tidb.NewStoreDB(testDB), sender,
+		sequence.WithStartFromBeginning())
+
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(sender.ids) != 5 {
+		t.Fatalf("delivered %d, want 5 (WithStartFromBeginning must replay the retained log)", len(sender.ids))
+	}
+	if !reflect.DeepEqual(sender.ids, wantIDs) {
+		t.Fatalf("delivered IDs =\n%v\nwant (published order)\n%v", sender.ids, wantIDs)
 	}
 }
 

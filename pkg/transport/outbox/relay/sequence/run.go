@@ -109,6 +109,17 @@ func (r *Relay) drain(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if offset == 0 && !r.options.StartFromBeginning && !r.offsetInitialized {
+			// offset==0 reliably means "no committed offset row": CommitOffset is
+			// only ever called with seq>=1. Initialize a brand-new group at
+			// "latest" (parity with the stream runtime's start-at-now) unless the
+			// caller opted into a full replay.
+			offset, err = r.store.InitOffsetLatest(ctx, r.name)
+			if err != nil {
+				return err
+			}
+			r.offsetInitialized = true
+		}
 		msgs, err := r.store.ListMessages(ctx, offset, r.options.BatchSize)
 		if err != nil {
 			return err

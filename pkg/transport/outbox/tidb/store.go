@@ -141,6 +141,29 @@ ON DUPLICATE KEY UPDATE
 	return nil
 }
 
+// InitOffsetLatest is called once for a consumer group with no committed
+// offset: it atomically initializes the group's offset row to the current
+// maximum assigned seq (0 if the log is empty or unsequenced) and returns the
+// effective offset. Monotone (GREATEST) so it never rewinds an existing row.
+func (s *Store) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
+	_, err := s.r.ExecContext(ctx, `
+INSERT INTO outbox_offsets (name, last_seq, update_time)
+SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM outbox
+ON DUPLICATE KEY UPDATE
+    last_seq    = GREATEST(last_seq, VALUES(last_seq)),
+    update_time = VALUES(update_time)`, name)
+	if err != nil {
+		return 0, fmt.Errorf("outbox: init offset latest: %w", err)
+	}
+	var seq int64
+	if err := s.r.QueryRowContext(ctx,
+		`SELECT last_seq FROM outbox_offsets WHERE name = ?`, name,
+	).Scan(&seq); err != nil {
+		return 0, fmt.Errorf("outbox: init offset latest read back: %w", err)
+	}
+	return seq, nil
+}
+
 // SequenceMessages assigns dense seq values to committed pending rows in
 // (tx_start_ts, id) order. The counter row is locked FOR UPDATE for the whole
 // pass, so concurrent sequencers serialize and can never double-assign.

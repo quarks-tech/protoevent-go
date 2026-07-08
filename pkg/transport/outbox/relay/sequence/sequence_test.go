@@ -144,6 +144,21 @@ func (s *fakeStore) CommitOffset(_ context.Context, name string, seq int64) erro
 	return nil
 }
 
+// InitOffsetLatest mirrors the SQL store's upsert: initialize name's offset to
+// the current max sequenced seq, GREATEST-merged with any existing value.
+func (s *fakeStore) InitOffsetLatest(_ context.Context, name string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	max := int64(0)
+	if n := len(s.log); n > 0 {
+		max = s.log[n-1].Seq
+	}
+	if max > s.offsets[name] { // GREATEST
+		s.offsets[name] = max
+	}
+	return s.offsets[name], nil
+}
+
 func (s *fakeStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, _ time.Duration) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -181,7 +196,7 @@ func TestRunOnceSequencesThenDrainsSameTick(t *testing.T) {
 		return nil
 	})
 
-	r := sequence.NewRelay("c", st, sender)
+	r := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -201,7 +216,7 @@ func TestDrainLoopsUntilShortPage(t *testing.T) {
 	var count int
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { count++; return nil })
 
-	r := sequence.NewRelay("c", st, sender, sequence.WithBatchSize(100))
+	r := sequence.NewRelay("c", st, sender, sequence.WithBatchSize(100), sequence.WithStartFromBeginning())
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -224,7 +239,7 @@ func TestStopTheLaneOnSendError(t *testing.T) {
 		return nil
 	})
 
-	r := sequence.NewRelay("c", st, sender)
+	r := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
 	_ = r.RunOnce(context.Background())
 
 	// Sent 1,2; stopped at 3. Offset must not advance past 2.
@@ -266,7 +281,7 @@ func TestParkAndContinueAdvancesPastFailure(t *testing.T) {
 		return nil
 	})
 	var parked []int64
-	r := sequence.NewRelay("c", st, sender, sequence.WithErrorHandler(
+	r := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(), sequence.WithErrorHandler(
 		func(_ context.Context, m *outbox.Message, _ error) { parked = append(parked, m.Seq) },
 	))
 	if err := r.RunOnce(context.Background()); err != nil {
@@ -281,5 +296,45 @@ func TestParkAndContinueAdvancesPastFailure(t *testing.T) {
 	}
 	if len(got) != 4 {
 		t.Fatalf("delivered = %v, want 4 messages", got)
+	}
+}
+
+// TestNewGroupStartsAtLatestByDefault proves parity with the stream runtime's
+// start-at-now: a brand-new consumer group (no committed offset) must not
+// replay the retained log. Only events sequenced AFTER the group's first
+// RunOnce are delivered.
+func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
+	st := newFakeStore()
+	for i := 0; i < 3; i++ {
+		st.append(msg(0))
+	}
+	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
+		t.Fatalf("seed sequence: %v", err)
+	}
+
+	var got []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		got = append(got, mdSeq(md))
+		return nil
+	})
+
+	r := sequence.NewRelay("fresh", st, sender) // no WithStartFromBeginning
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("delivered %v on a fresh group, want nothing (latest-default must skip the retained log)", got)
+	}
+	if off := st.offsets["fresh"]; off != 3 {
+		t.Fatalf("offset = %d, want 3 (initialized to current max seq)", off)
+	}
+
+	st.append(msg(0))
+	st.append(msg(0))
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(got) != 2 || got[0] != 4 || got[1] != 5 {
+		t.Fatalf("delivered = %v, want [4 5] (only events sequenced after the group started)", got)
 	}
 }
