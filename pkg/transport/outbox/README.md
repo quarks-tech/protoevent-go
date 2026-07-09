@@ -7,7 +7,7 @@ broker, and a crashed relay simply resumes from the last committed offset — th
 event is never silently dropped nor delivered before the transaction that produced
 it has committed.
 
-This package implements the **v2 sequenced-log** design: the outbox table is an
+This package implements a **sequenced-log** design: the outbox table is an
 append-only log, a leader-elected sequencer pass assigns a dense, gapless offset
 (`seq`) to committed rows after the fact (so a transaction that started earlier but
 committed later can never be skipped), and one or more relays drain the log in
@@ -238,11 +238,11 @@ handling from stop-the-lane (default, order-preserving — closes and reopens
 the cursor at the failed event) to park-and-continue (keeps the cursor open,
 hands the failure to the callback).
 
-### Ordering, replay, and dedup (v1)
+### Ordering, replay, and dedup
 
 - **StartNow-only, no replay.** A consumer group with no stored token starts
-  at "now" (no `resumeAfter`); there is no v1 way to replay from the
-  beginning of the outbox. This is a deliberate v1 scope cut (design §7/§11),
+  at "now" (no `resumeAfter`); there is currently no way to replay from the
+  beginning of the outbox. This is a deliberate scope cut (design §7/§11),
   not a limitation of the change stream itself.
 - **Commit-order delivery**, per the single stream: causal order is preserved
   (a transaction that committed later is never delivered ahead of one that
@@ -252,7 +252,7 @@ hands the failure to the callback).
   CloudEvents `Metadata.ID`.
 - **The resume-token cliff.** A relay that falls behind the oplog's retention
   window gets `ErrHistoryLost` (fatal — MongoDB's `ChangeStreamHistoryLost`)
-  instead of resuming. v1 handles this with lag alerting on the committed
+  instead of resuming. This is handled with lag alerting on the committed
   token's age plus a break-glass runbook (design §7), not automatic replay.
   Operators **must** size the deployment so that **oplog window > outbox TTL
   (7 days) > consumer-downtime SLO** (design §7) and alert on committed-token
