@@ -85,7 +85,9 @@ satisfy `sequence.Store` (read + offset); if it also implements
 unless `sequence.WithoutSequencer()` is set (only one relay per outbox table
 should sequence). `sender` is the downstream transport, any `eventbus.Sender`.
 `NewRelay` returns an error if `PollInterval`, `BatchSize`,
-`SequenceBatchSize`, or `LeaseTTL` is not strictly positive.
+`SequenceBatchSize`, or `LeaseTTL` is not strictly positive, and if
+`WithRetention` is given a nonzero window without a strictly positive
+`sweepEvery` and `sweepBatch`.
 
 ```go
 r, err := sequence.NewRelay("broker-publish", tidb.NewRelayStore(db), rabbitSender,
@@ -201,8 +203,9 @@ carries exactly the ID the publisher assigned.
 `stream.NewRelay` builds a relay for one named consumer group over a
 `stream.StreamStore` (`LoadToken`/`SaveToken`/`Watch`, all `string` resume
 tokens — see the design doc §8.2 for why the boundary is `string` rather than
-the driver's `bson.Raw`). It errors if `DrainWindow >= LeaseTTL/2`, since the
-leader lease must be renewable within a single drain window.
+the driver's `bson.Raw`). It errors if `DrainWindow`, `LeaseTTL`, or
+`TokenBatchSize` is not strictly positive, or if `DrainWindow >= LeaseTTL/2`,
+since the leader lease must be renewable within a single drain window.
 
 ```go
 st := mongodb.NewStore(db, mongodb.WithMaxAwaitTime(time.Second))
@@ -255,3 +258,27 @@ hands the failure to the callback).
   (7 days) > consumer-downtime SLO** (design §7) and alert on committed-token
   age well before it approaches the oplog window, so the cliff should never
   fire in practice.
+
+## Benchmarks
+
+Two tiers. Engine micro-benchmarks (`bench_test.go` in this package, plus
+`relay/sequence` and `relay/stream`) run against in-memory fakes, need no
+external services, and cover `Sender.Send`, a sequence-relay drain pass, and a
+stream-relay drain window:
+
+```bash
+go test ./... -bench=. -run='^$'
+```
+
+Store-level benchmarks (`tidb/bench_test.go`, `mongodb/bench_test.go`) are
+opt-in and containerized: they skip themselves unless Docker is available
+(via `testcontainers`, the same `TestMain` the integration tests use), and
+each store is its own Go module, so run with `GOWORK=off`:
+
+```bash
+GOWORK=off go test . -bench=. -run='^$'   # inside tidb/ or mongodb/
+```
+
+Numbers from these come from a container on the host running the benchmark,
+not a production TiDB/MongoDB deployment — treat them as relative, not
+absolute.

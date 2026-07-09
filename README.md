@@ -9,7 +9,8 @@ A Go library for building event-driven applications using Protocol Buffers with 
 - Pluggable transport mechanisms:
   - In-memory Go channels (`gochan`)
   - RabbitMQ (`pkg/transport/rabbitmq`)
-  - Transactional Outbox (`pkg/transport/outbox`)
+  - Transactional Outbox (`pkg/transport/outbox`) — sequenced-log (TiDB) and
+    change-stream (MongoDB) relay backends
 - Code generation from proto definitions
 - Interceptor chains for cross-cutting concerns
 - Pluggable event ID generation (UUID v4 by default)
@@ -251,453 +252,110 @@ receiver := parkinglot.NewReceiver(client,
 
 ### Transactional Outbox Transport
 
-The outbox transport implements the transactional outbox pattern for reliable event publishing with database transactions.
-
-#### Architecture
-
-The relay uses a **two-table approach** that eliminates cursor management and prevents race conditions:
+The outbox transport implements the transactional outbox pattern: events are
+written to a durable, append-only log in the same database transaction as the
+business change, then relayed to a downstream transport (e.g. RabbitMQ) in
+commit order, so publish-time writes never block on the broker. Two relay
+runtimes share one publish-side API. On **TiDB**, a leader-elected sequencer
+pass assigns a dense, gapless offset (`seq`) to committed rows after the
+fact, so a transaction that started earlier but committed later is never
+skipped. On **MongoDB**, a relay tails a change stream on the insert-only
+outbox collection, reusing the oplog's total commit order — no sequencer
+needed. Both give **at-least-once** delivery in commit order (equivalent to
+one Kafka partition) and support independent consumer groups, each with its
+own offset/resume token; a new group starts at "latest" (future events only)
+by default.
 
 ```
-┌─────────────────┐     send ok      ┌─────────────────┐
-│ outbox_pending  │ ───────────────► │outbox_completed │
-│  (to be sent)   │   (delete or     │   (optional)    │
-└─────────────────┘      move)       └─────────────────┘
+┌──────────────┐  insert (seq=NULL)   ┌──────────────────┐
+│  business tx │ ────────────────────►│   outbox (log)    │
+└──────────────┘                      └─────────┬────────┘
+                                                  │ sequence (TiDB) /
+                                                  │ change-stream tail (Mongo)
+                                                  ▼
+                                       ┌──────────────────┐
+                                       │ relay (per group) │──► broker (e.g. RabbitMQ)
+                                       │ offset/resume-tok │
+                                       └──────────────────┘
 ```
 
-If the message broker is unavailable, messages stay in pending and are retried on next poll.
-
-**Benefits:**
-- **No cursor management** - always read from beginning of pending table
-- **No race conditions** - messages are never skipped, even when a transaction commits late (with an earlier `create_time`)
-- **Simpler queries** - no cursor comparisons needed
-- **Smaller working set** - pending table stays small
-
-#### Implement Store Interfaces (TiDB)
+#### Publish (both backends)
 
 ```go
-package storage
-
-import (
-    "context"
-    "database/sql"
-    "encoding/json"
-    "fmt"
-    "strings"
-    "time"
-
-    "github.com/quarks-tech/protoevent-go/pkg/event"
-    "github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
-)
-
-// Store implements outbox.Store for transactional operations.
-// Embed this in your application store to use within transactions.
-type Store struct {
-    db *sql.DB
-}
-
-func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) error {
-    metadata, err := json.Marshal(msg.Metadata)
-    if err != nil {
-        return fmt.Errorf("marshal metadata: %w", err)
-    }
-
-    _, err = s.db.ExecContext(ctx, `
-        INSERT INTO outbox_pending (id, metadata, data, create_time)
-        VALUES (?, ?, ?, ?)
-    `, msg.ID, metadata, msg.Data, msg.CreateTime)
-    return err
-}
-
-// RelayStore implements relay.Store for relay operations.
-type RelayStore struct {
-    db *sql.DB
-}
-
-func NewRelayStore(db *sql.DB) *RelayStore {
-    return &RelayStore{db: db}
-}
-
-func (s *RelayStore) ListPendingMessages(ctx context.Context, limit int) ([]*outbox.Message, error) {
-    query := `SELECT id, metadata, data, create_time FROM outbox_pending ORDER BY create_time LIMIT ?`
-    rows, err := s.db.QueryContext(ctx, query, limit)
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
-
-    var messages []*outbox.Message
-    for rows.Next() {
-        var (
-            id           []byte
-            metadataJSON []byte
-            data         []byte
-            createTime   time.Time
-        )
-        if err := rows.Scan(&id, &metadataJSON, &data, &createTime); err != nil {
-            return nil, err
-        }
-
-        var metadata event.Metadata
-        if err := json.Unmarshal(metadataJSON, &metadata); err != nil {
-            return nil, fmt.Errorf("unmarshal metadata: %w", err)
-        }
-
-        messages = append(messages, &outbox.Message{
-            ID:         string(id),
-            Metadata:   &metadata,
-            Data:       data,
-            CreateTime: createTime,
-        })
-    }
-    return messages, rows.Err()
-}
-
-// CompletePendingMessages marks messages as sent.
-// Choose ONE of the implementations below based on your needs.
-
-// Option A: Delete (no audit trail, simpler)
-func (s *RelayStore) CompletePendingMessages(ctx context.Context, sentTime time.Time, ids ...string) error {
-    if len(ids) == 0 {
-        return nil
-    }
-
-    placeholders := make([]string, len(ids))
-    args := make([]any, len(ids))
-    for i, id := range ids {
-        placeholders[i] = "?"
-        args[i] = id
-    }
-
-    query := fmt.Sprintf(`DELETE FROM outbox_pending WHERE id IN (%s)`, strings.Join(placeholders, ","))
-    _, err := s.db.ExecContext(ctx, query, args...)
-    return err
-}
-
-// Option B: Move to completed table (audit trail)
-func (s *RelayStore) CompletePendingMessages(ctx context.Context, sentTime time.Time, ids ...string) error {
-    if len(ids) == 0 {
-        return nil
-    }
-
-    tx, err := s.db.BeginTx(ctx, nil)
-    if err != nil {
-        return err
-    }
-    defer tx.Rollback()
-
-    placeholders := make([]string, len(ids))
-    args := make([]any, len(ids)+1)
-    args[0] = sentTime
-    for i, id := range ids {
-        placeholders[i] = "?"
-        args[i+1] = id
-    }
-
-    // Move to completed table
-    insertQuery := fmt.Sprintf(`
-        INSERT INTO outbox_completed (id, metadata, data, create_time, sent_time)
-        SELECT id, metadata, data, create_time, ? FROM outbox_pending WHERE id IN (%s)
-    `, strings.Join(placeholders, ","))
-    if _, err := tx.ExecContext(ctx, insertQuery, args...); err != nil {
-        return err
-    }
-
-    // Delete from pending
-    deleteQuery := fmt.Sprintf(`DELETE FROM outbox_pending WHERE id IN (%s)`, strings.Join(placeholders, ","))
-    if _, err := tx.ExecContext(ctx, deleteQuery, args[1:]...); err != nil {
-        return err
-    }
-
-    return tx.Commit()
-}
-```
-
-#### Publisher with Transactional Outbox
-
-```go
-package main
-
-import (
-    "context"
-
-    "github.com/quarks-tech/protoevent-go/pkg/eventbus"
-    "github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
-
-    bookspb "example/gen/example/books/v1"
-)
-
-type TxStore interface {
-    Store
-    WithTransaction(ctx context.Context, fn func(ctx context.Context, s Store) error) error
-}
-
-type Store interface {
-    outbox.Store
-    CreateBook(ctx context.Context, book *Book) error
-}
-
-func main() {
-    // Create typed publisher factory with generated constructor.
-    // Publisher options are passed via WithPublisherOptions; outbox sender
-    // options (e.g. ID generation) via WithSenderOptions.
-    booksFactory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
-        outbox.WithPublisherOptions(
-            eventbus.WithDefaultPublishOptions(
-                eventbus.WithEventSource("books-service"),
-            ),
+factory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
+    outbox.WithPublisherOptions(
+        eventbus.WithDefaultPublishOptions(
+            eventbus.WithEventSource("books-service"),
         ),
-    )
-
-    // Use within transaction - clean one-liner for publishing
-    err := txStore.WithTransaction(ctx, func(ctx context.Context, store Store) error {
-        // Business logic
-        if err := store.CreateBook(ctx, book); err != nil {
-            return err
-        }
-
-        // Publish event (saved to outbox in same transaction)
-        return booksFactory.Create(store).PublishBookCreatedEvent(ctx,
-            &bookspb.BookCreatedEvent{
-                Id:     book.ID,
-                Title:  book.Title,
-                Author: book.Author,
-            },
-        )
-    })
-}
-```
-
-##### Outbox Row IDs
-
-Each outbox row has its own ID — the table's primary key. The relay orders
-delivery by `create_time`, not by this ID, so the ID only needs to be unique.
-By default the sender mints a fresh random **UUID v4** (`outbox.GenerateV4`),
-keeping the row ID independent of the caller-controlled `Metadata.ID`.
-
-> A random key is intentional: on TiDB a time-ordered primary key (UUID v7,
-> `AUTO_INCREMENT`) concentrates inserts on a single Region — a write hotspot.
-> Since the relay orders by `create_time`, the row ID gains nothing from being
-> time-ordered, so v4 scatters writes at no cost.
-
-To key the row on the event's own ID instead — giving the row and the event a
-single identity end to end — use `outbox.ReuseMetadataID`:
-
-```go
-booksFactory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
-    outbox.WithSenderOptions(
-        outbox.WithIDGenerator(outbox.ReuseMetadataID),
     ),
 )
-```
 
-> Because the relay orders by `create_time`, `ReuseMetadataID` does not affect
-> delivery order regardless of the event ID's format — it only requires the
-> event ID to be unique (it becomes the row's primary key).
-
-#### Message Relay
-
-```go
-package main
-
-import (
-    "context"
-    "database/sql"
-    "log"
-    "time"
-
-    "github.com/quarks-tech/amqpx"
-    "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
-    "github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
-
-    "yourapp/storage" // your storage package with RelayStore implementation
-)
-
-func main() {
-    ctx := context.Background()
-
-    // Database connection
-    db, err := sql.Open("mysql", "user:pass@tcp(localhost:4000)/mydb")
-    if err != nil {
-        log.Fatal(err)
+err := txStore.WithTransaction(ctx, func(ctx context.Context, store MyStore) error {
+    // MyStore embeds outbox.Store (CreateOutboxMessage) alongside your own
+    // business-data methods, backed by the same *sql.Tx (or Mongo session).
+    if err := saveBook(ctx, store, book); err != nil {
+        return err
     }
-    defer db.Close()
 
-    // RabbitMQ sender as downstream transport
-    amqpClient := amqpx.NewClient(&amqpx.Config{
-        Host:     "localhost",
-        Port:     5672,
-        Username: "guest",
-        Password: "guest",
+    return factory.Create(store).PublishBookCreatedEvent(ctx, &bookspb.BookCreatedEvent{
+        BookId: book.ID,
     })
-    defer amqpClient.Close()
-    sender := rabbitmq.NewSender(amqpClient)
-
-    // Create relay store
-    relayStore := storage.NewRelayStore(db)
-
-    // Create relay
-    r := relay.NewRelay(relayStore, sender,
-        relay.WithBatchSize(100),
-        relay.WithPollInterval(time.Second),
-    )
-
-    // Run relay (blocks until context cancelled)
-    if err := r.Run(ctx); err != nil {
-        log.Fatal(err)
-    }
-}
+})
 ```
 
-#### Message Relay with Leader Election
+By default the outbox row ID is `outbox.ReuseMetadataID`: the row's ID is the
+publisher's CloudEvents `Metadata.ID`, so the relayed event carries exactly
+the ID the publisher assigned. Pass
+`outbox.WithSenderOptions(outbox.WithIDGenerator(outbox.GenerateV4))` via
+`FactoryOption` to decouple the row's identity from the event's instead.
 
-For running multiple relay instances with automatic failover, enable leader election.
-Only one instance will be active at a time, ensuring strict FIFO ordering.
-All pods use identical configuration - the leader is elected automatically via database lock.
+#### Relay: TiDB (sequenced log)
 
 ```go
-// Create relay with leader election
-// relayStore must implement relay.LeaderStore interface
-r := relay.NewRelay(relayStore, sender,
-    relay.WithBatchSize(100),
-    relay.WithPollInterval(time.Second),
-    relay.WithLeaderElection("outbox-relay"), // lock name
-    relay.WithLeaseTTL(30*time.Second),       // lock expires after 30s if not renewed
+r, err := sequence.NewRelay("broker-publish", tidb.NewRelayStore(db), rabbitSender,
+    sequence.WithRetention(7*24*time.Hour, 256, 5000),
 )
+if err != nil {
+    log.Fatal(err)
+}
 
-// Run relay (blocks until context cancelled)
-// Only the leader instance will process messages
 if err := r.Run(ctx); err != nil {
     log.Fatal(err)
 }
 ```
 
-#### Implement LeaderStore (TiDB)
+#### Relay: MongoDB (change-stream tail)
 
 ```go
-func (s *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, leaseTTL time.Duration) (bool, error) {
-    holderUUID, err := uuid.Parse(holderID)
-    if err != nil {
-        return false, fmt.Errorf("parse holder ID: %w", err)
-    }
-    holderBytes := holderUUID[:]
-    expireTime := time.Now().Add(leaseTTL)
+st := mongodb.NewStore(db, mongodb.WithMaxAwaitTime(time.Second))
+if err := st.EnsureIndexes(ctx); err != nil {
+    log.Fatal(err)
+}
 
-    // Try to acquire or renew the lock
-    _, err = s.db.ExecContext(ctx, `
-        INSERT INTO relay_lock (name, holder_id, expire_time) VALUES (?, ?, ?)
-        ON DUPLICATE KEY UPDATE
-            holder_id = CASE
-                WHEN expire_time < NOW() THEN VALUES(holder_id)
-                WHEN holder_id = VALUES(holder_id) THEN holder_id
-                ELSE holder_id
-            END,
-            expire_time = CASE
-                WHEN expire_time < NOW() THEN VALUES(expire_time)
-                WHEN holder_id = VALUES(holder_id) THEN VALUES(expire_time)
-                ELSE expire_time
-            END
-    `, name, holderBytes, expireTime)
-    if err != nil {
-        return false, fmt.Errorf("upsert lock: %w", err)
-    }
+r, err := stream.NewRelay("broker-publish", st, rabbitSender,
+    stream.WithDrainWindow(time.Second),
+    stream.WithLeaseTTL(15*time.Second),
+)
+if err != nil {
+    log.Fatal(err)
+}
 
-    // Check if we hold the lock
-    var currentHolder []byte
-    err = s.db.QueryRowContext(ctx, `SELECT holder_id FROM relay_lock WHERE name = ?`, name).Scan(&currentHolder)
-    if err != nil {
-        return false, fmt.Errorf("check lock holder: %w", err)
-    }
-
-    return bytes.Equal(currentHolder, holderBytes), nil
+if err := r.Run(ctx); err != nil {
+    log.Fatal(err)
 }
 ```
 
-## SQL Schema for Outbox (TiDB)
+Both relays run leader election automatically when the store implements
+`relay.LeaderStore` (both reference stores do), so multiple instances can run
+for failover with only one processing at a time. Delivery is at-least-once,
+not exactly-once: consumers **must** dedup on the event's ID (`event_id`,
+the outbox row's ID) for effectively-once processing.
 
-The outbox uses a **two-table approach** for simplicity and reliability:
-
-```sql
--- Pending messages (messages waiting to be sent)
--- This table stays small as messages are deleted/moved after successful send
-CREATE TABLE outbox_pending
-(
-  id          BINARY(16) PRIMARY KEY,                    -- unique row id (random UUID v4 by default)
-  metadata    JSON                             NOT NULL, -- CloudEvents metadata
-  data        VARBINARY(your-max-message-size) NOT NULL, -- Serialized event payload
-  create_time DATETIME(6)                      NOT NULL
-);
-
--- Completed messages (optional, for audit trail)
--- Used if your CompletePendingMessages implementation moves messages here
-CREATE TABLE outbox_completed
-(
-  id          BINARY(16) PRIMARY KEY,
-  metadata    JSON                             NOT NULL,
-  data        VARBINARY(your-max-message-size) NOT NULL,
-  create_time DATETIME(6)                      NOT NULL,
-  sent_time   DATETIME(6)                      NOT NULL
-);
-
--- For leader election (optional, required for WithLeaderElection)
-CREATE TABLE relay_lock
-(
-  name        VARCHAR(255) PRIMARY KEY, -- lock name (e.g., "outbox-relay")
-  holder_id   BINARY(16) NOT NULL,      -- UUID of the current leader
-  expire_time DATETIME(6) NOT NULL      -- lock expires after this time
-);
-```
-
-### Typical Queries
-
-**Store (transactional - within your business transaction):**
-```sql
--- CreateOutboxMessage: insert new message into pending table
-INSERT INTO outbox_pending (id, metadata, data, create_time) VALUES (?, ?, ?, ?);
-```
-
-**RelayStore:**
-```sql
--- ListPendingMessages: get messages to process (always from beginning, no cursor!)
-SELECT id, metadata, data, create_time FROM outbox_pending ORDER BY create_time LIMIT ?;
-
--- CompletePendingMessages: implementation decides what "complete" means
--- Option A: Just delete (no audit trail)
-DELETE FROM outbox_pending WHERE id IN (?...);
-
--- Option B: Move to completed table (audit trail)
-INSERT INTO outbox_completed (id, metadata, data, create_time, sent_time)
-SELECT id, metadata, data, create_time, ? FROM outbox_pending WHERE id IN (?...);
-DELETE FROM outbox_pending WHERE id IN (?...);
-```
-
-**LeaderStore (optional):**
-```sql
--- TryAcquireLeaderLock: acquire or renew leader lock
-INSERT INTO relay_lock (name, holder_id, expire_time) VALUES (?, ?, ?)
-ON DUPLICATE KEY UPDATE
-    holder_id = CASE
-        WHEN expire_time < NOW() THEN VALUES(holder_id)
-        WHEN holder_id = VALUES(holder_id) THEN holder_id
-        ELSE holder_id
-    END,
-    expire_time = CASE
-        WHEN expire_time < NOW() THEN VALUES(expire_time)
-        WHEN holder_id = VALUES(holder_id) THEN VALUES(expire_time)
-        ELSE expire_time
-    END;
-
--- Check current lock holder
-SELECT holder_id FROM relay_lock WHERE name = ?;
-```
-
-**Operational (monitoring):**
-```sql
--- Count pending messages
-SELECT COUNT(*) FROM outbox_pending;
-
--- Oldest pending message age
-SELECT MIN(create_time) FROM outbox_pending;
-```
+See [`pkg/transport/outbox/README.md`](pkg/transport/outbox/README.md) for
+the full guide (package layout, ordering guarantees, benchmarks), and
+[`docs/design/outbox-sequenced-log.md`](docs/design/outbox-sequenced-log.md) /
+[`docs/design/outbox-mongodb-changestream.md`](docs/design/outbox-mongodb-changestream.md)
+for the design rationale and race analysis.
 
 ## License
 
