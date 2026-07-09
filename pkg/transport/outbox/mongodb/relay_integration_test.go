@@ -81,4 +81,32 @@ func TestStreamRelayEndToEnd(t *testing.T) {
 	if err != nil || tok == "" {
 		t.Fatalf("token not persisted: tok=%q err=%v", tok, err)
 	}
+
+	// Prove the resume claim for real, not just that a token was persisted: a
+	// SECOND relay instance for the SAME consumer group, over the SAME store,
+	// must deliver nothing new on RunOnce. r never called Run, so it never
+	// released its leader lock; drop it directly so r2 can acquire
+	// leadership (this is a test-only shortcut for what a graceful shutdown's
+	// Run-deferred Release would otherwise do).
+	if err := testDB.Collection("relay_lock").Drop(context.Background()); err != nil {
+		t.Fatalf("drop relay_lock: %v", err)
+	}
+
+	sender2 := &recordingSender{}
+	r2, err := stream.NewRelay("e2e", st, sender2,
+		stream.WithDrainWindow(300*time.Millisecond),
+		stream.WithLeaseTTL(15*time.Second),
+	)
+	if err != nil {
+		t.Fatalf("new relay (resume): %v", err)
+	}
+	if err := r2.RunOnce(ctx); err != nil {
+		t.Fatalf("resume run once: %v", err)
+	}
+	sender2.mu.Lock()
+	n2 := len(sender2.ids)
+	sender2.mu.Unlock()
+	if n2 != 0 {
+		t.Fatalf("resumed relay delivered %d new events, want 0 (fresh relay resuming from the saved token must not redeliver)", n2)
+	}
 }

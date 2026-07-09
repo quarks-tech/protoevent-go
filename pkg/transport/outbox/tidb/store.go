@@ -68,6 +68,9 @@ var (
 // m.ID is parsed as a UUID before the insert. A custom outbox.IDGenerator
 // (via outbox.WithIDGenerator) MUST emit UUIDs to be usable with this store.
 func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) error {
+	if m.Metadata == nil {
+		return fmt.Errorf("outbox: message metadata is nil")
+	}
 	id, err := uuid.Parse(m.ID)
 	if err != nil {
 		return fmt.Errorf("outbox: parse message ID %q: %w", m.ID, err)

@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,8 @@ type LeaderElector struct {
 	lockName string
 	holderID string
 	ttl      time.Duration
+
+	mu       sync.Mutex // guards isLeader: TryAcquire/Release may be called concurrently
 	isLeader bool
 }
 
@@ -32,14 +35,18 @@ func NewLeaderElector(ls LeaderStore, lockName, holderID string, ttl time.Durati
 // it after the call.
 func (e *LeaderElector) TryAcquire(ctx context.Context) (bool, error) {
 	if e.ls == nil {
+		e.mu.Lock()
 		e.isLeader = true
+		e.mu.Unlock()
 		return true, nil
 	}
 	held, err := e.ls.TryAcquireLeaderLock(ctx, e.lockName, e.holderID, e.ttl)
 	if err != nil {
 		return false, err
 	}
+	e.mu.Lock()
 	e.isLeader = held
+	e.mu.Unlock()
 	return held, nil
 }
 
@@ -48,11 +55,18 @@ func (e *LeaderElector) TryAcquire(ctx context.Context) (bool, error) {
 // context.Background() with an internal timeout, not the caller's ctx, since
 // this typically runs on a shutdown path where ctx may already be canceled.
 func (e *LeaderElector) Release() {
+	e.mu.Lock()
 	if e.ls == nil || !e.isLeader {
+		e.mu.Unlock()
 		return
 	}
+	e.mu.Unlock()
+
 	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
 	defer cancel()
 	_ = e.ls.ReleaseLeaderLock(ctx, e.lockName, e.holderID)
+
+	e.mu.Lock()
 	e.isLeader = false
+	e.mu.Unlock()
 }

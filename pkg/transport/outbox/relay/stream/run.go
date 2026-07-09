@@ -70,6 +70,7 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 	}
 	if !leader {
 		r.closeStream(ctx)
+		r.sleep(ctx) // avoid busy-spinning TryAcquireLeaderLock while not leader
 		return nil
 	}
 	if r.stream == nil {

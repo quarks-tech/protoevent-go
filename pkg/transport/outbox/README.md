@@ -254,10 +254,10 @@ hands the failure to the callback).
   window gets `ErrHistoryLost` (fatal — MongoDB's `ChangeStreamHistoryLost`)
   instead of resuming. This is handled with lag alerting on the committed
   token's age plus a break-glass runbook (design §7), not automatic replay.
-  Operators **must** size the deployment so that **oplog window > outbox TTL
-  (7 days) > consumer-downtime SLO** (design §7) and alert on committed-token
-  age well before it approaches the oplog window, so the cliff should never
-  fire in practice.
+  Operators **must** size the deployment so that **outbox TTL (7 days) >
+  oplog window > consumer-downtime SLO** (design §7) and alert on
+  committed-token age well before it approaches the oplog window, so the
+  cliff should never fire in practice.
 
 ## Benchmarks
 

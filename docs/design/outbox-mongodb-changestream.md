@@ -248,8 +248,10 @@ alerting — not built into `stream.Relay` v1.**
   a fresh stream at "now." Order during this catch-up is best-effort (`create_time`); steady-state
   order stays exact. This is the TiDB backstep tradeoff, quarantined to a disaster path that should
   never fire if the windows below are sized correctly.
-- **Operationally make it "never" fire:** size **oplog window > `outbox` TTL floor >
-  consumer-downtime SLO**, and alert before lag reaches the oplog window.
+- **Operationally make it "never" fire:** size **`outbox` TTL (7d) > oplog window >
+  consumer-downtime SLO** (matching §4's requirement that the TTL outlive the oplog window, so the
+  break-glass re-read still finds events after a token loss), and alert before lag reaches the oplog
+  window.
 
 **Future "backfill" feature (deferred — unifies DR + replay).** Both the break-glass DR re-read
 above and a replay-from-beginning start position (§6b) are the *same* routine: a gapless

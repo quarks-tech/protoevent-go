@@ -36,6 +36,18 @@ func TestStoreSatisfiesStreamStore(t *testing.T) {
 	_ = mongodbstore.NewStore(nil)
 }
 
+// TestCreateOutboxMessageRejectsNilMetadata proves the nil-Metadata guard
+// fires before any driver call: a nil *mongo.Database (via NewStore(nil))
+// would panic on the first Collection(...) call if the guard didn't run
+// first.
+func TestCreateOutboxMessageRejectsNilMetadata(t *testing.T) {
+	st := mongodbstore.NewStore(nil)
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id"})
+	if err == nil {
+		t.Fatal("expected error for nil Metadata, got nil")
+	}
+}
+
 var testDB *mongo.Database
 
 func TestMain(m *testing.M) {
@@ -223,5 +235,40 @@ func TestLeaderLockMutualExclusionAndRelease(t *testing.T) {
 	}
 	if !okB2 {
 		t.Fatal("B failed to acquire after A released")
+	}
+}
+
+// TestLeaderLockRenewalSameHolder proves the renewal path: the SAME holder
+// re-acquiring an already-live (not expired) lock document must succeed via
+// the update branch of TryAcquireLeaderLock, not just the initial-upsert
+// branch that TestLeaderLockMutualExclusionAndRelease exercises. Every relay
+// tick's TryAcquire call hits exactly this path once leadership is held.
+func TestLeaderLockRenewalSameHolder(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	ctx := context.Background()
+
+	okA1, err := st.TryAcquireLeaderLock(ctx, "lock", "A", 30*time.Second)
+	if err != nil || !okA1 {
+		t.Fatalf("A first acquire = %v, %v; want true", okA1, err)
+	}
+	// A renews on the still-live document (the update path every relay tick
+	// exercises), not a fresh upsert.
+	okA2, err := st.TryAcquireLeaderLock(ctx, "lock", "A", 30*time.Second)
+	if err != nil || !okA2 {
+		t.Fatalf("A renewal = %v, %v; want true", okA2, err)
+	}
+
+	// B must still be denied: A's renewal must not have released or handed
+	// off the lock.
+	okB, err := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if okB {
+		t.Fatal("B acquired while A holds a renewed lock")
 	}
 }

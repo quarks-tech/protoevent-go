@@ -56,10 +56,27 @@ func TestNewRelayRejectsZeroTokenBatchSize(t *testing.T) {
 }
 
 func TestNewRelayAcceptsValidWindow(t *testing.T) {
-	r, err := stream.NewRelay("c", nil, nil,
+	st := &fakeStreamStore{}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r, err := stream.NewRelay("c", st, sender,
 		stream.WithLeaseTTL(10*time.Second), stream.WithDrainWindow(1*time.Second))
 	if err != nil || r == nil {
 		t.Fatalf("NewRelay valid config: r=%v err=%v", r, err)
+	}
+}
+
+func TestNewRelayRejectsNilStore(t *testing.T) {
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	_, err := stream.NewRelay("c", nil, sender)
+	if err == nil {
+		t.Fatal("expected error for nil store, got nil")
+	}
+}
+
+func TestNewRelayRejectsNilSender(t *testing.T) {
+	_, err := stream.NewRelay("c", &fakeStreamStore{}, nil)
+	if err == nil {
+		t.Fatal("expected error for nil sender, got nil")
 	}
 }
 
@@ -252,7 +269,12 @@ func TestRunOnceNonLeaderIdles(t *testing.T) {
 	st := &fakeStreamStore{stream: &fakeStream{events: []*stream.Event{ev(1, "a", false)}}, leader: "other"}
 	sent := 0
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
-	r, _ := stream.NewRelay("c", st, sender, stream.WithLeaderLockName("lock"))
+	// Small DrainWindow/LeaseTTL: RunOnce's non-leader branch now backs off one
+	// DrainWindow (F3, avoids busy-spinning TryAcquireLeaderLock) before
+	// returning, so keep this test fast (DrainWindow < LeaseTTL/2 guard still
+	// satisfied: 10ms < 500ms).
+	r, _ := stream.NewRelay("c", st, sender, stream.WithLeaderLockName("lock"),
+		stream.WithDrainWindow(10*time.Millisecond), stream.WithLeaseTTL(1*time.Second))
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}

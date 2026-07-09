@@ -40,8 +40,15 @@ type Stream interface {
 	// caught-up case) — the caller then persists PBRT(). Returns (nil,false,err)
 	// on a stream error (transient → caller reopens; fatal → caller stops).
 	Next(ctx context.Context) (*Event, bool, error)
-	// PBRT returns the postBatchResumeToken after an empty window, so a caught-up
-	// consumer's persisted position keeps tracking the oplog head.
+	// PBRT returns the postBatchResumeToken. It serves two purposes: (a) on an
+	// empty window, the caller persists it so a caught-up-and-connected
+	// consumer's persisted position keeps tracking the oplog head instead of
+	// falling behind; and (b) immediately after a fresh Watch (token == ""),
+	// before any Next call, the caller persists it as the initial resume
+	// baseline — so a first-window send failure under stop-the-lane (which
+	// persists nothing itself) still has a prior position to reopen from,
+	// instead of restarting at a fresh "now" and silently skipping the failed
+	// event.
 	PBRT() (token string, clusterTime time.Time)
 	Close(ctx context.Context) error
 }
@@ -148,6 +155,13 @@ type Relay struct {
 // Operators should size TokenBatchSize x worst-case Sender.Send latency <
 // LeaseTTL to keep a window inside one lease term (see design doc §8.2).
 func NewRelay(name string, store StreamStore, sender eventbus.Sender, opts ...Option) (*Relay, error) {
+	if store == nil {
+		return nil, fmt.Errorf("stream: store must not be nil")
+	}
+	if sender == nil {
+		return nil, fmt.Errorf("stream: sender must not be nil")
+	}
+
 	options := DefaultOptions()
 	for _, opt := range opts {
 		opt(&options)

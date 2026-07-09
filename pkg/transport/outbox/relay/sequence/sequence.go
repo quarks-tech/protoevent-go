@@ -190,6 +190,13 @@ type Relay struct {
 // transport (e.g. a RabbitMQ sender). If store also implements SequencerStore,
 // this relay runs the sequencer pass unless WithoutSequencer() is given.
 func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) (*Relay, error) {
+	if store == nil {
+		return nil, fmt.Errorf("sequence: store must not be nil")
+	}
+	if sender == nil {
+		return nil, fmt.Errorf("sequence: sender must not be nil")
+	}
+
 	options := DefaultOptions()
 	for _, opt := range opts {
 		opt(&options)

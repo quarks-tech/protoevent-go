@@ -41,8 +41,15 @@ func (s *Store) Watch(ctx context.Context, token string) (stream.Stream, error) 
 		// should be unreachable via the public API.
 		await = time.Second
 	}
+	// invalidate MUST pass the filter too: a $match on "insert" alone silently
+	// drops the collection-dropped/renamed invalidate event, leaving the
+	// stream reporting empty windows forever instead of surfacing the fatal
+	// condition via the Invalidate branch in Next below (verified live: see
+	// TestWatchSurfacesInvalidateOnDrop).
 	pipeline := mongo.Pipeline{
-		bson.D{{Key: "$match", Value: bson.D{{Key: "operationType", Value: "insert"}}}},
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{"insert", "invalidate"}}}},
+		}}},
 	}
 	opts := options.ChangeStream().SetMaxAwaitTime(await)
 	if token != "" {

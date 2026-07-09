@@ -24,6 +24,10 @@ func (f senderFunc) Send(ctx context.Context, md *event.Metadata, d []byte) erro
 	return f(ctx, md, d)
 }
 
+// noopSender is a shared no-op sender for tests that exercise paths (offset,
+// sequencer, sweep errors, etc.) which never reach Sender.Send.
+var noopSender = senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+
 // mdSeq encodes/decodes a seq into metadata ID for send-order assertions. The
 // fake store sets Metadata.ID to the decimal Seq at sequence time.
 func mdSeq(md *event.Metadata) int64 {
@@ -109,9 +113,23 @@ func TestNewRelayRejectsRetentionWindowWithoutSweepCadence(t *testing.T) {
 }
 
 func TestNewRelayAcceptsDefaults(t *testing.T) {
-	r, err := sequence.NewRelay("c", newFakeStore(), nil)
+	r, err := sequence.NewRelay("c", newFakeStore(), noopSender)
 	if err != nil || r == nil {
 		t.Fatalf("NewRelay with defaults: r=%v err=%v", r, err)
+	}
+}
+
+func TestNewRelayRejectsNilStore(t *testing.T) {
+	_, err := sequence.NewRelay("c", nil, noopSender)
+	if err == nil {
+		t.Fatal("expected error for nil store, got nil")
+	}
+}
+
+func TestNewRelayRejectsNilSender(t *testing.T) {
+	_, err := sequence.NewRelay("c", newFakeStore(), nil)
+	if err == nil {
+		t.Fatal("expected error for nil sender, got nil")
 	}
 }
 
@@ -668,7 +686,7 @@ func (s noRetentionStore) ReleaseLeaderLock(ctx context.Context, name, holderID 
 func TestMaybeSweepRunsOnCadence(t *testing.T) {
 	st := newFakeStore()
 	window := 24 * time.Hour
-	r, err := sequence.NewRelay("c", st, nil, sequence.WithRetention(window, 3, 100))
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(window, 3, 100))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -697,7 +715,7 @@ func TestMaybeSweepRunsOnCadence(t *testing.T) {
 func TestMaybeSweepNoopWithoutRetentionStore(t *testing.T) {
 	inner := newFakeStore()
 	st := noRetentionStore{inner: inner}
-	r, err := sequence.NewRelay("c", st, nil, sequence.WithRetention(time.Hour, 1, 100))
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, 1, 100))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -716,7 +734,7 @@ func TestMaybeSweepErrorPropagates(t *testing.T) {
 	sentinel := errors.New("sweep boom")
 	st := newFakeStore()
 	st.sweepErr = sentinel
-	r, err := sequence.NewRelay("c", st, nil, sequence.WithRetention(time.Hour, 1, 100))
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, 1, 100))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -736,7 +754,7 @@ func TestSequenceLoopsWhileFull(t *testing.T) {
 	for range 25 {
 		st.append(msg(0))
 	}
-	r, err := sequence.NewRelay("c", st, nil,
+	r, err := sequence.NewRelay("c", st, noopSender,
 		sequence.WithSequenceBatchSize(10), sequence.WithBatchSize(1000))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -761,7 +779,7 @@ func TestSequenceStopsOnCtxCancellationMidLoop(t *testing.T) {
 	for range 4 {
 		st.append(msg(0))
 	}
-	r, err := sequence.NewRelay("c", st, nil, sequence.WithSequenceBatchSize(2))
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithSequenceBatchSize(2))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -784,7 +802,7 @@ func TestSequenceSequencerErrorPropagates(t *testing.T) {
 	sentinel := errors.New("sequencer boom")
 	st := newFakeStore()
 	st.seqErr = sentinel
-	r, err := sequence.NewRelay("c", st, nil)
+	r, err := sequence.NewRelay("c", st, noopSender)
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -800,7 +818,7 @@ func TestSequenceSequencerErrorPropagates(t *testing.T) {
 func TestWithoutSequencerSkipsSequencing(t *testing.T) {
 	st := newFakeStore()
 	st.append(msg(0))
-	r, err := sequence.NewRelay("c", st, nil, sequence.WithoutSequencer(), sequence.WithStartFromBeginning())
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithoutSequencer(), sequence.WithStartFromBeginning())
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -820,7 +838,7 @@ func TestRunOnceOffsetErrorPropagates(t *testing.T) {
 	sentinel := errors.New("offset boom")
 	st := newFakeStore()
 	st.offsetErr = sentinel
-	r, err := sequence.NewRelay("c", st, nil)
+	r, err := sequence.NewRelay("c", st, noopSender)
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -837,7 +855,7 @@ func TestRunOnceInitOffsetLatestErrorPropagates(t *testing.T) {
 	sentinel := errors.New("init offset boom")
 	st := newFakeStore()
 	st.initOffsetErr = sentinel
-	r, err := sequence.NewRelay("c", st, nil)
+	r, err := sequence.NewRelay("c", st, noopSender)
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -854,7 +872,7 @@ func TestRunOnceListMessagesErrorPropagates(t *testing.T) {
 	sentinel := errors.New("list boom")
 	st := newFakeStore()
 	st.listErr = sentinel
-	r, err := sequence.NewRelay("c", st, nil)
+	r, err := sequence.NewRelay("c", st, noopSender)
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}

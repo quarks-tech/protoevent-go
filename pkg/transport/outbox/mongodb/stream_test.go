@@ -203,6 +203,48 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 	}
 }
 
+// TestWatchSurfacesInvalidateOnDrop proves that dropping the outbox
+// collection surfaces an Invalidate event through Next, instead of silently
+// producing empty windows forever. Verified live (see the F7 report): with
+// the pipeline matching ONLY "insert", the driver's invalidate event was
+// filtered out before it ever reached the caller — TryNext just kept
+// returning false with no error, an unrecoverable-but-silent condition. The
+// fix widens the $match to insert-or-invalidate.
+func TestWatchSurfacesInvalidateOnDrop(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	strm, err := st.Watch(ctx, "")
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	defer func() { _ = strm.Close(context.Background()) }()
+
+	_ = publish(t, "before-drop")
+
+	if err := testDB.Collection("outbox").Drop(ctx); err != nil {
+		t.Fatalf("drop outbox: %v", err)
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		e, ok, err := strm.Next(ctx)
+		if err != nil {
+			t.Fatalf("next returned an error instead of an Invalidate event: %v", err)
+		}
+		if ok && e.Invalidate {
+			return // the claim: invalidate must surface
+		}
+	}
+	t.Fatal("drop of the outbox collection never surfaced an Invalidate event")
+}
+
 func TestPBRTAdvancesOnIdle(t *testing.T) {
 	if testDB == nil {
 		t.Skip("no MongoDB")

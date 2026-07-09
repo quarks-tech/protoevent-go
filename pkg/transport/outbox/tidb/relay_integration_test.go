@@ -138,16 +138,28 @@ func TestLatePublishGetsHigherSeq(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var earlySeq, lateSeq int64
-	if err := testDB.QueryRow(
-		`SELECT seq FROM outbox WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.Subject')) = 'early'`,
-	).Scan(&earlySeq); err != nil {
+	// Go through the public API (ListMessages) rather than a raw JSON_EXTRACT
+	// query, so this test doesn't couple to the metadata storage encoding.
+	msgs, err := st.ListMessages(ctx, 0, 10)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := testDB.QueryRow(
-		`SELECT seq FROM outbox WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.Subject')) = 'late'`,
-	).Scan(&lateSeq); err != nil {
-		t.Fatal(err)
+	if len(msgs) != 2 {
+		t.Fatalf("got %d messages, want 2", len(msgs))
+	}
+	var earlySeq, lateSeq int64
+	for _, m := range msgs {
+		switch m.Metadata.Subject {
+		case "early":
+			earlySeq = m.Seq
+		case "late":
+			lateSeq = m.Seq
+		default:
+			t.Fatalf("unexpected subject %q", m.Metadata.Subject)
+		}
+	}
+	if earlySeq == 0 || lateSeq == 0 {
+		t.Fatalf("did not find both subjects: early seq=%d late seq=%d", earlySeq, lateSeq)
 	}
 	if lateSeq <= earlySeq {
 		t.Fatalf("late seq %d not > early seq %d", lateSeq, earlySeq)

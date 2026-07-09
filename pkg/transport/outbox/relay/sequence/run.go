@@ -14,6 +14,20 @@ func (r *Relay) Run(ctx context.Context) error {
 	defer ticker.Stop()
 	defer r.leader.Release()
 
+	// Do one pass immediately instead of waiting a full PollInterval for the
+	// first tick, so a freshly started relay starts delivering right away.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := r.RunOnce(ctx); err != nil {
+		if ctx.Err() == nil {
+			// Only observe if this isn't a planned shutdown (see the
+			// same-shaped handling in the loop below for the rationale).
+			r.options.Observer.ObserveError(r.name, err)
+			r.options.Logger.Errorf("relay %q: %v", r.name, err)
+		}
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -86,22 +100,23 @@ func (r *Relay) sequence(ctx context.Context) error {
 // successful send. On send failure it stops the lane (default) or parks and
 // continues (WithErrorHandler). Loops while pages are full.
 func (r *Relay) drain(ctx context.Context) error {
-	for {
-		offset, err := r.store.Offset(ctx, r.name)
+	offset, err := r.store.Offset(ctx, r.name)
+	if err != nil {
+		return err
+	}
+	if offset == 0 && !r.options.StartFromBeginning && !r.offsetInitialized {
+		// offset==0 reliably means "no committed offset row": CommitOffset is
+		// only ever called with seq>=1. Initialize a brand-new group at
+		// "latest" (parity with the stream runtime's start-at-now) unless the
+		// caller opted into a full replay.
+		offset, err = r.store.InitOffsetLatest(ctx, r.name)
 		if err != nil {
 			return err
 		}
-		if offset == 0 && !r.options.StartFromBeginning && !r.offsetInitialized {
-			// offset==0 reliably means "no committed offset row": CommitOffset is
-			// only ever called with seq>=1. Initialize a brand-new group at
-			// "latest" (parity with the stream runtime's start-at-now) unless the
-			// caller opted into a full replay.
-			offset, err = r.store.InitOffsetLatest(ctx, r.name)
-			if err != nil {
-				return err
-			}
-			r.offsetInitialized = true
-		}
+		r.offsetInitialized = true
+	}
+
+	for {
 		msgs, err := r.store.ListMessages(ctx, offset, r.options.BatchSize)
 		if err != nil {
 			return err
@@ -130,6 +145,11 @@ func (r *Relay) drain(ctx context.Context) error {
 			if err := r.store.CommitOffset(ctx, r.name, maxSeq); err != nil {
 				return err
 			}
+			// A single leader owns the watermark, so the value we just
+			// committed IS the new offset: advance the local variable instead
+			// of re-querying Offset every iteration (a wasted round-trip per
+			// full page).
+			offset = maxSeq
 		}
 
 		full := len(msgs) == r.options.BatchSize

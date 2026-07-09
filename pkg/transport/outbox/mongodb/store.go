@@ -51,12 +51,6 @@ type offsetDoc struct {
 	UpdateTime  time.Time `bson:"update_time"`
 }
 
-type lockDoc struct {
-	Name       string    `bson:"_id"`
-	HolderID   string    `bson:"holder_id"`
-	ExpireTime time.Time `bson:"expire_time"`
-}
-
 // Store realizes the outbox publish + relay-read contracts over a *mongo.Database.
 type Store struct {
 	db       *mongo.Database
@@ -109,6 +103,9 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 // CreateOutboxMessage inserts an unsequenced event envelope. Call on the
 // session-bound ctx so it commits atomically with the business write.
 func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) error {
+	if msg.Metadata == nil {
+		return fmt.Errorf("outbox: message metadata is nil")
+	}
 	meta, err := json.Marshal(msg.Metadata)
 	if err != nil {
 		return fmt.Errorf("outbox: marshal metadata: %w", err)
@@ -162,7 +159,9 @@ func (s *Store) TryAcquireLeaderLock(ctx context.Context, name, holderID string,
 			bson.M{"holder_id": holderID},
 		},
 	}
-	update := bson.M{"$set": lockDoc{Name: name, HolderID: holderID, ExpireTime: now.Add(ttl)}}
+	// _id is intentionally excluded from $set: the filter already pins it, so
+	// setting it too is redundant (and would be fragile if it ever diverged).
+	update := bson.M{"$set": bson.M{"holder_id": holderID, "expire_time": now.Add(ttl)}}
 	res, err := s.db.Collection(lockCollection).UpdateOne(ctx, filter, update, options.UpdateOne().SetUpsert(true))
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {

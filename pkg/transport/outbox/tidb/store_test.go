@@ -32,6 +32,18 @@ func TestRelayStoreConstructs(t *testing.T) {
 	}
 }
 
+// TestCreateOutboxMessageRejectsNilMetadata proves the nil-Metadata guard
+// fires before any SQL is issued: a nil Runner (via NewStore(nil)) would
+// panic on md.Time.UTC() if the guard were missing, and would also panic on
+// the first ExecContext call if the guard didn't run before it.
+func TestCreateOutboxMessageRejectsNilMetadata(t *testing.T) {
+	st := tidb.NewStore(nil)
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: uuid.NewString()})
+	if err == nil {
+		t.Fatal("expected error for nil Metadata, got nil")
+	}
+}
+
 var testDB *sql.DB
 
 func TestMain(m *testing.M) {

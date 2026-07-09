@@ -13,6 +13,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/mongodb"
 )
 
@@ -34,9 +35,18 @@ type Instance struct {
 // ready Instance + cleanup. Returns an error (tests should t.Skip on it) when
 // Docker is unavailable.
 func Start(ctx context.Context) (*Instance, func(), error) {
+	// Probe the Docker daemon explicitly BEFORE starting a container, so only
+	// a genuinely-unavailable daemon maps to ErrDockerUnavailable; any error
+	// from the container start below (with a healthy daemon) — e.g. an
+	// image-pull failure or a replica-set init bug — is a real harness bug
+	// and must fail loudly, not be silently skipped.
+	if err := probeDocker(ctx); err != nil {
+		return nil, nil, fmt.Errorf("probe docker daemon: %w", errors.Join(ErrDockerUnavailable, err))
+	}
+
 	c, err := mongodb.Run(ctx, "mongo:8", mongodb.WithReplicaSet("rs0"))
 	if err != nil {
-		return nil, nil, fmt.Errorf("start mongodb: %w", errors.Join(ErrDockerUnavailable, err))
+		return nil, nil, fmt.Errorf("start mongodb: %w", err)
 	}
 	uri, err := c.ConnectionString(ctx)
 	if err != nil {
@@ -75,4 +85,18 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 		terminate: func() { _ = client.Disconnect(context.Background()); _ = c.Terminate(context.Background()) },
 	}
 	return inst, inst.terminate, nil
+}
+
+// probeDocker reports whether the Docker daemon is reachable, via the
+// testcontainers Docker provider's own health check (client Info call). The
+// provider is closed by Health itself.
+func probeDocker(ctx context.Context) error {
+	provider, err := testcontainers.NewDockerProvider()
+	if err != nil {
+		return fmt.Errorf("create docker provider: %w", err)
+	}
+	if err := provider.Health(ctx); err != nil {
+		return fmt.Errorf("docker daemon health check: %w", err)
+	}
+	return nil
 }
