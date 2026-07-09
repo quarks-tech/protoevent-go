@@ -78,3 +78,46 @@ func BenchmarkListMessages(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkPublishParallel measures CreateOutboxMessage inside a transaction
+// under concurrent load (b.RunParallel): each goroutine opens its own
+// transaction on the pool, publishes one message, and commits, mirroring
+// BenchmarkPublish's per-op shape. The design claims the publish path stays
+// contention-free (no hot row: no shared counter, no FOR UPDATE) — so this
+// parallel ns/op should scale with concurrency, not collapse toward (or
+// exceed) BenchmarkPublish's serial ns/op.
+func BenchmarkPublishParallel(b *testing.B) {
+	if testDB == nil {
+		b.Skip("no TiDB")
+	}
+	b.ReportAllocs()
+	truncate(b)
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			publish(b, "bench-parallel")
+		}
+	})
+}
+
+// BenchmarkCommitOffset measures RelayStore.CommitOffset, the GREATEST
+// upsert every relay drain page pays to advance a consumer's watermark. seq
+// increments each iteration so every call takes the UPDATE (advancing)
+// branch, matching steady-state drain behavior.
+func BenchmarkCommitOffset(b *testing.B) {
+	if testDB == nil {
+		b.Skip("no TiDB")
+	}
+	b.ReportAllocs()
+	truncate(b)
+	ctx := context.Background()
+	st := tidb.NewRelayStore(testDB)
+
+	var seq int64
+	for b.Loop() {
+		seq++
+		if err := st.CommitOffset(ctx, "bench", seq); err != nil {
+			b.Fatalf("commit offset: %v", err)
+		}
+	}
+}

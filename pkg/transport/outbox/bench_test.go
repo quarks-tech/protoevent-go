@@ -7,7 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/types/known/emptypb"
+
 	"github.com/quarks-tech/protoevent-go/pkg/event"
+	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 )
 
@@ -73,4 +76,40 @@ func BenchmarkMetadataJSONRoundTrip(b *testing.B) {
 			b.Fatalf("unmarshal: %v", err)
 		}
 	}
+}
+
+// BenchmarkPublisherFactoryPublish measures the real production publish path:
+// PublisherFactory.Create (Sender + eventbus.Publisher construction) plus
+// Publish (interceptor chain, metadata completion, proto marshal, Send) over
+// a no-op Store. The delta vs BenchmarkSenderSend is the eventbus overhead on
+// top of the raw outbox write. Two sub-benchmarks isolate Create's own cost:
+// "create-per-publish" mirrors the WithTransaction pattern (a fresh publisher
+// per business transaction, factory.Create(store) called inside the loop);
+// "publisher-reused" builds the publisher once outside the loop.
+func BenchmarkPublisherFactoryPublish(b *testing.B) {
+	identity := func(p eventbus.Publisher) eventbus.Publisher { return p }
+
+	b.Run("create-per-publish", func(b *testing.B) {
+		b.ReportAllocs()
+		store := &captureStore{}
+		factory := outbox.NewPublisherFactory(identity)
+		for b.Loop() {
+			publisher := factory.Create(store)
+			if err := publisher.Publish(context.Background(), "bench.event", &emptypb.Empty{}); err != nil {
+				b.Fatalf("publish: %v", err)
+			}
+		}
+	})
+
+	b.Run("publisher-reused", func(b *testing.B) {
+		b.ReportAllocs()
+		store := &captureStore{}
+		factory := outbox.NewPublisherFactory(identity)
+		publisher := factory.Create(store)
+		for b.Loop() {
+			if err := publisher.Publish(context.Background(), "bench.event", &emptypb.Empty{}); err != nil {
+				b.Fatalf("publish: %v", err)
+			}
+		}
+	})
 }

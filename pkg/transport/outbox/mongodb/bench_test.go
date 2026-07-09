@@ -18,9 +18,13 @@ package mongodb_test
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
+
+	mongodbstore "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/mongodb"
 )
 
 // BenchmarkPublish measures a session+transaction insert per op — the cost a
@@ -65,6 +69,55 @@ func BenchmarkWatchDrainRead(b *testing.B) {
 		}
 		if len(docs) != 100 {
 			b.Fatalf("read %d docs, want 100", len(docs))
+		}
+	}
+}
+
+// BenchmarkSaveToken measures Store.SaveToken with a realistic ~100-byte
+// resume token, the write every drain window's leader pays to persist its
+// change-stream position.
+func BenchmarkSaveToken(b *testing.B) {
+	if testDB == nil {
+		b.Skip("no MongoDB")
+	}
+	b.ReportAllocs()
+	reset(b)
+	ctx := context.Background()
+	st := mongodbstore.NewStore(testDB)
+
+	token := strings.Repeat("a", 100) // ~100 bytes: realistic resume-token size
+	ct := time.Now().UTC()
+
+	for b.Loop() {
+		if err := st.SaveToken(ctx, "bench", token, ct); err != nil {
+			b.Fatalf("save token: %v", err)
+		}
+	}
+}
+
+// BenchmarkTryAcquireLeaderLock measures the renewal path — the same holder
+// re-acquiring an already-held lock — the steady-state per-tick cost a live
+// leader pays, as opposed to the one-off acquire-from-free case.
+func BenchmarkTryAcquireLeaderLock(b *testing.B) {
+	if testDB == nil {
+		b.Skip("no MongoDB")
+	}
+	b.ReportAllocs()
+	reset(b)
+	ctx := context.Background()
+	st := mongodbstore.NewStore(testDB)
+
+	if _, err := st.TryAcquireLeaderLock(ctx, "bench", "holder", 30*time.Second); err != nil {
+		b.Fatalf("initial acquire: %v", err)
+	}
+
+	for b.Loop() {
+		ok, err := st.TryAcquireLeaderLock(ctx, "bench", "holder", 30*time.Second)
+		if err != nil {
+			b.Fatalf("acquire: %v", err)
+		}
+		if !ok {
+			b.Fatal("renewal failed, want true (same holder)")
 		}
 	}
 }
