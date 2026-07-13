@@ -55,6 +55,30 @@ func TestCreateOutboxMessageRejectsEmptyID(t *testing.T) {
 	}
 }
 
+// TestCreateOutboxMessageRejectsTransactionlessCtx proves the tx guard: a
+// valid message published on a ctx with no running transaction is rejected
+// (an outbox row committing independently of the business write would be a
+// phantom event), before any driver call — same nil-*mongo.Database trick.
+func TestCreateOutboxMessageRejectsTransactionlessCtx(t *testing.T) {
+	st := mongodbstore.NewStore(nil)
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id", Metadata: event.NewMetadata("t")})
+	if err == nil || !strings.Contains(err.Error(), "transaction") {
+		t.Fatalf("expected transactionless-ctx rejection, got %v", err)
+	}
+}
+
+// TestEnsureIndexesRejectsSubSecondRetention proves the TTL range guard:
+// expireAfterSeconds is whole int32 seconds, and a sub-second retention would
+// truncate to 0 — expiring every row immediately. Fails before any driver
+// call (nil *mongo.Database).
+func TestEnsureIndexesRejectsSubSecondRetention(t *testing.T) {
+	st := mongodbstore.NewStore(nil, mongodbstore.WithRetention(500*time.Millisecond))
+	err := st.EnsureIndexes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "retention") {
+		t.Fatalf("expected retention range rejection, got %v", err)
+	}
+}
+
 var testDB *mongo.Database
 
 func TestMain(m *testing.M) {

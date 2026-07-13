@@ -202,10 +202,10 @@ sequencer is needed. The lifecycle and resume-token cliff analysis are covered
 in the sections below.
 
 `pkg/transport/outbox/mongodb` is the reference `stream.Store` + publish
-implementation over `*mongo.Database` (its own Go module, since it pulls in
-`go.mongodb.org/mongo-driver/v2` — run `GOWORK=off go build ./...` /
-`GOWORK=off go test ./...` inside it, since it is intentionally excluded from
-this repo's `go.work`).
+implementation over `*mongo.Database` (its own Go module, so the
+`go.mongodb.org/mongo-driver/v2` dependency stays out of the engine; it is
+part of this repo's `go.work`, so plain `go build ./...` / `go test ./...`
+inside it just work).
 
 ### Publishing
 
@@ -334,11 +334,10 @@ go test ./... -bench=. -run='^$'
 
 Store-level benchmarks (`tidb/bench_test.go`, `mongodb/bench_test.go`) are
 opt-in and containerized: they skip themselves unless Docker is available
-(via `testcontainers`, the same `TestMain` the integration tests use), and
-each store is its own Go module, so run with `GOWORK=off`:
+(via `testcontainers`, the same `TestMain` the integration tests use):
 
 ```bash
-GOWORK=off go test . -bench=. -run='^$'   # inside tidb/ or mongodb/
+go test . -bench=. -run='^$'   # inside tidb/ or mongodb/
 ```
 
 Numbers from these come from a container on the host running the benchmark,

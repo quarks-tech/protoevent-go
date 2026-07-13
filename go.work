@@ -3,5 +3,7 @@ go 1.26.4
 use (
 	.
 	./pkg/transport/outbox
+	./pkg/transport/outbox/mongodb
+	./pkg/transport/outbox/tidb
 	./pkg/transport/rabbitmq
 )

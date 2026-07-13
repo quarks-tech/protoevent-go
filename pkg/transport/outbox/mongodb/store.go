@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -99,10 +100,19 @@ var (
 // expireAfterSeconds the server rejects the create (IndexOptionsConflict) and
 // the error is surfaced with a collMod hint rather than masked — silently
 // keeping the old TTL would defeat the point of changing WithRetention.
+//
+// The retention is validated here rather than in WithRetention so the failure
+// is loud: expireAfterSeconds is an int32 of whole seconds, and a sub-second
+// retention would truncate to 0 — a TTL that expires every outbox row as soon
+// as create_time passes, silently losing events the relay hasn't drained.
 func (s *Store) EnsureIndexes(ctx context.Context) error {
+	secs := int64(s.retention / time.Second)
+	if secs < 1 || secs > math.MaxInt32 {
+		return fmt.Errorf("outbox: ensure ttl index: retention %v outside the TTL range [1s, ~68y]", s.retention)
+	}
 	_, err := s.db.Collection(outboxCollection).Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "create_time", Value: 1}},
-		Options: options.Index().SetExpireAfterSeconds(int32(s.retention / time.Second)),
+		Options: options.Index().SetExpireAfterSeconds(int32(secs)),
 	})
 	if err != nil {
 		var se mongo.ServerError
@@ -116,8 +126,11 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 	return nil
 }
 
-// CreateOutboxMessage inserts an unsequenced event envelope. Call on the
-// session-bound ctx so it commits atomically with the business write.
+// CreateOutboxMessage inserts an unsequenced event envelope. ctx MUST carry a
+// session with a running transaction (mongo.Session.WithTransaction binds it):
+// an outbox row that commits independently of the business write is a phantom
+// event, so a transactionless ctx is rejected loudly — the same fail-loud
+// stance the TiDB store takes for autocommit publishes.
 //
 // msg.ID must be non-empty (it is the row's _id; an empty _id would make the
 // SECOND publish fail with a far-from-cause duplicate-key error). Unlike the
@@ -129,6 +142,10 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) er
 	}
 	if msg.Metadata == nil {
 		return fmt.Errorf("outbox: message metadata is nil")
+	}
+	if sess := mongo.SessionFromContext(ctx); sess == nil || !sess.TransactionRunning() {
+		return fmt.Errorf("outbox: create message: ctx has no running transaction; " +
+			"publish must share the business write's session (see the README's publishing example)")
 	}
 	meta, err := json.Marshal(msg.Metadata)
 	if err != nil {
