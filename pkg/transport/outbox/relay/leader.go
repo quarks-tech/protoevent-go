@@ -14,13 +14,20 @@ const releaseTimeout = 5 * time.Second
 // LeaderElector wraps a store's optional LeaderStore capability with
 // acquire/renew and graceful-release. A store that does not implement
 // LeaderStore is treated as always-leader (single-instance deployments).
+//
+// TryAcquire and Release keep store I/O outside the internal lock, so they
+// must not be invoked concurrently with each other: a Release racing a
+// TryAcquire can delete the lock row the concurrent TryAcquire just won,
+// leaving a caller that believes it is leader without a lock. The relay
+// runtimes call both from the single Run goroutine; other callers must
+// provide the same serialization.
 type LeaderElector struct {
 	ls       LeaderStore
 	lockName string
 	holderID string
 	ttl      time.Duration
 
-	mu       sync.Mutex // guards isLeader: TryAcquire/Release may be called concurrently
+	mu       sync.Mutex // guards isLeader (crash-safe visibility for the deferred Release path)
 	isLeader bool
 }
 

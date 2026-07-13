@@ -35,9 +35,8 @@ const (
 var ErrDockerUnavailable = errors.New("docker unavailable")
 
 type Instance struct {
-	DB        *sql.DB
-	DSN       string
-	terminate func()
+	DB  *sql.DB
+	DSN string
 }
 
 // Start boots TiDB, creates the db, applies migrations, and returns a ready
@@ -134,7 +133,7 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 		return nil, nil, fmt.Errorf("apply migrations: %w", err)
 	}
 
-	inst := &Instance{DB: db, DSN: dsn, terminate: cleanup}
+	inst := &Instance{DB: db, DSN: dsn}
 	terminate := cleanup
 	cleanup = nil // disarm the deferred unwind: ownership passes to the caller
 	return inst, terminate, nil

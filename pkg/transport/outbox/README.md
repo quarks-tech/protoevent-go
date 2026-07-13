@@ -21,11 +21,11 @@ and race analysis:
 
 ```
 pkg/transport/outbox/            publish side (transport-agnostic): Message, Store, Sender, PublisherFactory
-pkg/transport/outbox/relay/      primitives shared by every relay runtime: Observer, Logger, LeaderStore
+pkg/transport/outbox/relay/      primitives shared by every relay runtime: Observer, ErrorHandler, LeaderStore
 pkg/transport/outbox/relay/sequence/   TiDB sequenced-log runtime: Store/SequencerStore/RetentionStore, Options, Relay
-pkg/transport/outbox/relay/stream/     MongoDB change-stream runtime: StreamStore/Stream/Event, Options, Relay
+pkg/transport/outbox/relay/stream/     MongoDB change-stream runtime: Store/Stream/Event, Options, Relay
 pkg/transport/outbox/tidb/       reference TiDB store implementation + schema migrations
-pkg/transport/outbox/mongodb/    reference MongoDB store implementation (publish + StreamStore + LeaderStore)
+pkg/transport/outbox/mongodb/    reference MongoDB store implementation (publish + stream.Store + LeaderStore)
 ```
 
 `outbox` and `relay` have no database dependency; `tidb` and `mongodb` are the
@@ -68,6 +68,15 @@ err := txStore.WithTransaction(ctx, func(ctx context.Context, store MyStore) err
 through the normal `eventbus` interceptor chain and lands as a row in the outbox
 table instead of going straight to the wire.
 
+With the TiDB store the transaction is mandatory, not just good practice: the
+row's `tx_start_ts` reads `@@tidb_current_ts`, which only exists on a
+transactional connection — on an autocommit `*sql.DB` it reads 0, and
+`CreateOutboxMessage` fails loudly rather than write a row that would sort
+before every transactional row in a sequencer batch. (DSN tip: with
+`go-sql-driver/mysql`, set `interpolateParams=true`, or every parameterized
+query — including the publish INSERT inside your business transaction — pays a
+prepare/exec/close cycle of three wire round trips.)
+
 By default the outbox row ID is `outbox.ReuseMetadataID`: the row's ID is the
 publisher's CloudEvents `Metadata.ID`, so the event the relay eventually emits
 carries exactly the ID the publisher assigned, end to end. Because CloudEvents
@@ -75,19 +84,28 @@ IDs are UUIDs, this also scatters inserts across TiDB regions — hotspot
 avoidance and identity preservation come for free together. Pass
 `outbox.WithSenderOptions(outbox.WithIDGenerator(outbox.GenerateV4))` via
 `FactoryOption` if you need the row's identity decoupled from the event's
-`Metadata.ID` instead.
+`Metadata.ID` instead — the relayed event still carries the published
+`Metadata.ID`, which travels in the persisted metadata document under either
+generator. One fidelity caveat: stores persist metadata as JSON, so numeric
+extension values round-trip as `float64` (encode exact numeric types as
+strings).
 
 ## Relaying
 
 `sequence.NewRelay` builds a relay for one named consumer group. `store` must
 satisfy `sequence.Store` (read + offset); if it also implements
 `sequence.SequencerStore`, the relay runs the post-commit sequencer pass itself
-unless `sequence.WithoutSequencer()` is set (only one relay per outbox table
-should sequence). `sender` is the downstream transport, any `eventbus.Sender`.
-`NewRelay` returns an error if `PollInterval`, `BatchSize`,
-`SequenceBatchSize`, or `LeaseTTL` is not strictly positive, and if
-`WithRetention` is given a nonzero window without a strictly positive
-`sweepEvery` and `sweepBatch`.
+unless `sequence.WithoutSequencer()` is set. When several consumer groups share
+one store, run the sequencer in exactly one relay and configure the others with
+`WithoutSequencer()` — extra passes are harmless for correctness (they
+serialize on the counter row) but waste serialized DB work every tick. `sender`
+is the downstream transport, any `eventbus.Sender`. `NewRelay` returns an error
+if `name` is empty (it keys the offset row and the default leader lock); if
+`PollInterval`, `BatchSize`, `SequenceBatchSize`, or `LeaseTTL` is not strictly
+positive; if `PollInterval` is not strictly less than `LeaseTTL/2` (the lease
+must be renewable at least twice per TTL); and if `WithRetention` is given a
+nonzero window without a strictly positive `sweepEvery` and `sweepBatch`. A
+`Relay` is not safe for concurrent use: call `Run` from a single goroutine.
 
 ```go
 r, err := sequence.NewRelay("broker-publish", tidb.NewRelayStore(db), rabbitSender,
@@ -111,20 +129,35 @@ transactions against the pool. `Run` polls on
 acquires/renews the leader lock (`relay.LeaderStore`, if implemented) so only one
 relay instance processes at a time, sequences newly committed rows, drains them to
 `sender` in `seq` order, and — on the configured cadence — sweeps rows older than
-the retention window and already consumed by every registered offset. Run multiple
-`*Relay` instances (different processes) with the same name for automatic
-failover; run relays with different names against the same store for independent
-consumer groups with independent offsets.
+the retention window and already consumed by every registered offset. Both the
+sequencer and drain loops also renew the lease between full pages, so a pass over
+a long backlog cannot outlive `LeaseTTL` — stale-leader overlap is bounded to a
+single page. Run multiple `*Relay` instances (different processes) with the same
+name for automatic failover; run relays with different names against the same
+store for independent consumer groups with independent offsets. When a consumer
+group is retired, decommission it with `DeleteOffset`: its stale offset row
+otherwise keeps pinning `MIN(last_seq)` and halts the retention sweep forever.
 
 **A new consumer group starts at "latest"** — its offset is seeded at the current
 max seq, so it sees future events only (the same default as the MongoDB stream
-runtime's start-at-now). Pass `sequence.WithStartFromBeginning()` to make a new
-group replay the retained log instead; the option has no effect once the group
-has committed an offset.
+runtime's start-at-now). Seeding is insert-if-absent (`InitOffsetLatest`): an
+existing offset row — even one at 0 — is a committed position and is never
+modified. Pass `sequence.WithStartFromBeginning()` to make a new group replay
+the retained log instead; the option has no effect once the group has committed
+an offset.
 
 `sequence.WithObserver` wires an `Observer` (embeds `relay.Observer` plus
 `ObserveSequenced`) to your metrics system — e.g. Prometheus — for lag and
-throughput; `sequence.WithLogger` wires a `relay.Logger` for pass-level errors.
+throughput; `ObserveDrained`'s count is successfully sent messages only (parked
+messages surface via `ObserveError`). `sequence.WithLogger` wires a
+`*log/slog.Logger` for pass-level errors. `sequence.WithErrorHandler` switches
+failure handling from stop-the-lane (default, order-preserving) to
+park-and-continue: the `relay.ErrorHandler` is called for a message that failed
+to send — or for a poison row whose persisted metadata fails to decode
+(`sequence.DecodeError`) — and the relay advances past it; without a handler
+the lane stops at the failed row. Shutdown cancellation is never routed to the
+handler: a canceled run context stops the lane instead of parking healthy
+messages.
 
 ## Ordering guarantee
 
@@ -138,22 +171,23 @@ delivered in either relative order.
 
 The relay guarantees at-least-once, not exactly-once: a redelivery can happen
 after a drainer crashes between sending a page and committing its offset.
-Consumers **must** dedup on the event's ID (the outbox row's `event_id`, which
-under the default `ReuseMetadataID` generator equals the published CloudEvents
-`Metadata.ID`) to get effectively-once processing.
+Consumers **must** dedup on the event's CloudEvents `Metadata.ID` — the relayed
+event always carries the ID the publisher assigned, under any `IDGenerator`;
+`event_id` is the outbox row's key, and the default `ReuseMetadataID` makes the
+two coincide — to get effectively-once processing.
 
 ## MongoDB (change-stream relay)
 
 `pkg/transport/outbox/relay/stream` is the second relay runtime, a sibling of
 `relay/sequence` that reuses the same shared `relay` primitives (`Observer`,
-`Logger`, `LeaderStore`). Instead of a leader-elected sequencer pass over a
+`ErrorHandler`, `LeaderStore`). Instead of a leader-elected sequencer pass over a
 polled table, it tails a MongoDB **change stream** on the insert-only `outbox`
 collection: MongoDB's oplog already gives a total, gapless commit order, so no
 sequencer is needed. See
 [`docs/design/outbox-mongodb-changestream.md`](../../../docs/design/outbox-mongodb-changestream.md)
 for the full design — schema, lifecycle, and the resume-token cliff analysis.
 
-`pkg/transport/outbox/mongodb` is the reference `StreamStore` + publish
+`pkg/transport/outbox/mongodb` is the reference `stream.Store` + publish
 implementation over `*mongo.Database` (its own Go module, since it pulls in
 `go.mongodb.org/mongo-driver/v2` — run `GOWORK=off go build ./...` /
 `GOWORK=off go test ./...` inside it, since it is intentionally excluded from
@@ -201,14 +235,16 @@ carries exactly the ID the publisher assigned.
 ### Relaying
 
 `stream.NewRelay` builds a relay for one named consumer group over a
-`stream.StreamStore` (`LoadToken`/`SaveToken`/`Watch`, all `string` resume
+`stream.Store` (`LoadToken`/`SaveToken`/`Watch`, all `string` resume
 tokens — see the design doc §8.2 for why the boundary is `string` rather than
-the driver's `bson.Raw`). It errors if `DrainWindow`, `LeaseTTL`, or
-`TokenBatchSize` is not strictly positive, or if `DrainWindow >= LeaseTTL/2`,
-since the leader lease must be renewable within a single drain window.
+the driver's `bson.Raw`). It errors if `name` is empty, if `DrainWindow`,
+`LeaseTTL`, or `TokenBatchSize` is not strictly positive, or if
+`DrainWindow >= LeaseTTL/2`, since the leader lease must be renewable within a
+single drain window. As with the sequence runtime, a `Relay` is not safe for
+concurrent use: call `Run` from a single goroutine.
 
 ```go
-st := mongodb.NewStore(db, mongodb.WithMaxAwaitTime(time.Second))
+st := mongodb.NewStore(db)
 if err := st.EnsureIndexes(ctx); err != nil {
     log.Fatal(err)
 }
@@ -227,16 +263,27 @@ if err := r.Run(ctx); err != nil {
 }
 ```
 
-`EnsureIndexes` creates the 7-day TTL index on `outbox.create_time` (idempotent
-— safe to call on every startup); `mongodb.WithMaxAwaitTime` (passed to
-`NewStore`) sets the change stream's `maxAwaitTimeMS`, which should match
-`WithDrainWindow`. `stream.WithObserver`
+`EnsureIndexes` creates the TTL index on `outbox.create_time` (default 7 days,
+tunable via `mongodb.WithRetention(d)`; idempotent for an unchanged retention —
+safe to call on every startup). Changing retention on an existing collection
+requires a `collMod` on the index, not a restart with a new option value;
+`EnsureIndexes` surfaces that server error with a hint. There is no separate
+`maxAwaitTime` knob: the relay passes `WithDrainWindow` to `Store.Watch` as
+`maxAwait`, which becomes the change stream's `maxAwaitTimeMS` — one latency
+knob, nothing to keep in sync. `stream.WithObserver`
 wires the same `relay.Observer` shape used by `sequence.WithObserver` (e.g.
-Prometheus) for lag and throughput; `stream.WithLogger` wires a `relay.Logger`
+Prometheus) for lag and throughput (`ObserveDrained` counts successfully sent
+messages only; parked messages surface via `ObserveError`);
+`stream.WithLogger` wires a `*log/slog.Logger`
 for stream-level errors; `stream.WithErrorHandler` switches send-failure
 handling from stop-the-lane (default, order-preserving — closes and reopens
 the cursor at the failed event) to park-and-continue (keeps the cursor open,
-hands the failure to the callback).
+hands the failure to the callback). The same policy covers poison events whose
+payload fails to decode (`stream.DecodeError`, which carries the event's resume
+position): with a handler the relay parks the event and resumes past it;
+without one the lane stops at it. Shutdown cancellation is never routed to the
+handler — a canceled run context stops the lane instead of parking healthy
+messages.
 
 ### Ordering, replay, and dedup
 
@@ -247,15 +294,16 @@ hands the failure to the callback).
 - **Commit-order delivery**, per the single stream: causal order is preserved
   (a transaction that committed later is never delivered ahead of one that
   committed earlier), equivalent to one Kafka partition. As with the TiDB
-  runtime, delivery is **at-least-once** — consumers **must** dedup on
-  `event_id`, which under the default `ReuseMetadataID` equals the published
-  CloudEvents `Metadata.ID`.
+  runtime, delivery is **at-least-once** — consumers **must** dedup on the
+  event's CloudEvents `Metadata.ID` (always the ID the publisher assigned;
+  under the default `ReuseMetadataID` it also keys the outbox row).
 - **The resume-token cliff.** A relay that falls behind the oplog's retention
   window gets `ErrHistoryLost` (fatal — MongoDB's `ChangeStreamHistoryLost`)
   instead of resuming. This is handled with lag alerting on the committed
   token's age plus a break-glass runbook (design §7), not automatic replay.
-  Operators **must** size the deployment so that **outbox TTL (7 days) >
-  oplog window > consumer-downtime SLO** (design §7) and alert on
+  Operators **must** size the deployment so that **outbox TTL (default 7
+  days, `mongodb.WithRetention`) > oplog window > consumer-downtime SLO**
+  (design §7) and alert on
   committed-token age well before it approaches the oplog window, so the
   cliff should never fire in practice.
 

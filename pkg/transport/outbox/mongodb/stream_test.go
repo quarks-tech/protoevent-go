@@ -2,28 +2,35 @@ package mongodb_test
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	mongodbstore "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/mongodb"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/stream"
 )
+
+// testMaxAwait is the change stream maxAwaitTime the tests pass to Watch — in
+// production the relay passes its DrainWindow here (the single latency knob).
+const testMaxAwait = 300 * time.Millisecond
 
 func TestWatchDeliversInsertsInOrder(t *testing.T) {
 	if testDB == nil {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
+	st := mongodbstore.NewStore(testDB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	// Open the stream at "now" BEFORE publishing, so we catch the inserts.
-	strm, err := st.Watch(ctx, "")
+	strm, err := st.Watch(ctx, "", testMaxAwait)
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}
@@ -54,11 +61,11 @@ func TestWatchResumesFromToken(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
+	st := mongodbstore.NewStore(testDB)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	s1, err := st.Watch(ctx, "")
+	s1, err := st.Watch(ctx, "", testMaxAwait)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +90,7 @@ func TestWatchResumesFromToken(t *testing.T) {
 	_ = s1.Close(context.Background())
 
 	// resume from the token: must NOT re-deliver "first".
-	s2, err := st.Watch(ctx, tok)
+	s2, err := st.Watch(ctx, tok, testMaxAwait)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +109,7 @@ func TestPBRTNonEmptyImmediatelyAfterWatch(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
+	st := mongodbstore.NewStore(testDB)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -111,7 +118,7 @@ func TestPBRTNonEmptyImmediatelyAfterWatch(t *testing.T) {
 	// call — this is what the stream relay's fresh-group baseline persist
 	// (relay/stream/run.go) depends on to avoid silently skipping a first
 	// event that fails to send under stop-the-lane.
-	s, err := st.Watch(ctx, "")
+	s, err := st.Watch(ctx, "", testMaxAwait)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,12 +143,12 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
+	st := mongodbstore.NewStore(testDB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	strm, err := st.Watch(ctx, "")
+	strm, err := st.Watch(ctx, "", testMaxAwait)
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}
@@ -204,23 +211,23 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 }
 
 // TestWatchSurfacesInvalidateOnDrop proves that dropping the outbox
-// collection surfaces an Invalidate event through Next, instead of silently
-// producing empty windows forever. Verified live (see the F7 report): with
-// the pipeline matching ONLY "insert", the driver's invalidate event was
-// filtered out before it ever reached the caller — TryNext just kept
-// returning false with no error, an unrecoverable-but-silent condition. The
-// fix widens the $match to insert-or-invalidate.
+// collection surfaces stream.ErrStreamInvalidated through Next, instead of
+// silently producing empty windows forever. Verified live (see the F7
+// report): with the pipeline matching ONLY "insert", the driver's invalidate
+// event was filtered out before it ever reached the caller — TryNext just
+// kept returning false with no error, an unrecoverable-but-silent condition.
+// The fix widens the $match to insert-or-invalidate.
 func TestWatchSurfacesInvalidateOnDrop(t *testing.T) {
 	if testDB == nil {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
+	st := mongodbstore.NewStore(testDB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	strm, err := st.Watch(ctx, "")
+	strm, err := st.Watch(ctx, "", testMaxAwait)
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}
@@ -234,15 +241,97 @@ func TestWatchSurfacesInvalidateOnDrop(t *testing.T) {
 
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		e, ok, err := strm.Next(ctx)
-		if err != nil {
-			t.Fatalf("next returned an error instead of an Invalidate event: %v", err)
+		_, _, err := strm.Next(ctx)
+		if errors.Is(err, stream.ErrStreamInvalidated) {
+			return // the claim: invalidate must surface as the sentinel
 		}
-		if ok && e.Invalidate {
-			return // the claim: invalidate must surface
+		if err != nil {
+			t.Fatalf("next returned an unexpected error instead of ErrStreamInvalidated: %v", err)
 		}
 	}
-	t.Fatal("drop of the outbox collection never surfaced an Invalidate event")
+	t.Fatal("drop of the outbox collection never surfaced ErrStreamInvalidated")
+}
+
+// TestWatchPoisonEventReturnsDecodeError proves an undecodable outbox row
+// surfaces as *stream.DecodeError carrying the event's resume position —
+// NOT a bare error, which would wedge the lane forever (reopen from the last
+// saved token → same poison event → same error). With the position in hand,
+// the relay's ErrorHandler can park the event and a subsequent Watch from
+// DecodeError.ResumeToken resumes PAST it.
+func TestWatchPoisonEventReturnsDecodeError(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	strm, err := st.Watch(ctx, "", testMaxAwait)
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	defer func() { _ = strm.Close(context.Background()) }()
+
+	// A raw driver insert bypasses CreateOutboxMessage's marshaling: metadata
+	// is stored as bytes that are NOT valid CloudEvents JSON, so decodeMessage
+	// must fail on this event.
+	if _, err := testDB.Collection("outbox").InsertOne(ctx, bson.M{
+		"_id":         "poison",
+		"metadata":    []byte("{corrupt"),
+		"data":        []byte("x"),
+		"create_time": time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("insert poison doc: %v", err)
+	}
+	good := publish(t, "after-poison")
+
+	var de *stream.DecodeError
+	for de == nil {
+		e, ok, err := strm.Next(ctx)
+		if err != nil {
+			if !errors.As(err, &de) {
+				t.Fatalf("next returned %T (%v), want *stream.DecodeError", err, err)
+			}
+			continue
+		}
+		if ok {
+			t.Fatalf("delivered event %s before surfacing the poison decode error", e.Message.ID)
+		}
+	}
+	if de.ID != "poison" {
+		t.Fatalf("DecodeError.ID = %q, want poison", de.ID)
+	}
+	if de.ResumeToken == "" {
+		t.Fatal("DecodeError.ResumeToken is empty; the relay could not resume past the poison event")
+	}
+	if de.ClusterTime.IsZero() {
+		t.Fatal("DecodeError.ClusterTime is zero")
+	}
+
+	// Resume from the poison event's token: it must be skipped, and the next
+	// delivery must be the good event published after it.
+	s2, err := st.Watch(ctx, de.ResumeToken, testMaxAwait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s2.Close(context.Background()) }()
+	for {
+		e, ok, err := s2.Next(ctx)
+		if err != nil {
+			t.Fatalf("resumed next: %v", err)
+		}
+		if !ok {
+			continue
+		}
+		if e.Message.ID == "poison" {
+			t.Fatal("resume from DecodeError.ResumeToken re-delivered the poison event")
+		}
+		if e.Message.ID == good {
+			return // poison skipped, stream moved on
+		}
+	}
 }
 
 func TestPBRTAdvancesOnIdle(t *testing.T) {
@@ -250,11 +339,11 @@ func TestPBRTAdvancesOnIdle(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB, mongodbstore.WithMaxAwaitTime(300*time.Millisecond))
+	st := mongodbstore.NewStore(testDB)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	s, err := st.Watch(ctx, "")
+	s, err := st.Watch(ctx, "", testMaxAwait)
 	if err != nil {
 		t.Fatal(err)
 	}

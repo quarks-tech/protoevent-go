@@ -95,7 +95,13 @@ func BenchmarkPublishParallel(b *testing.B) {
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			publish(b, "bench-parallel")
+			// Not publish(b, ...): its Fatalf (FailNow) must run on the
+			// benchmark's own goroutine, and RunParallel bodies are not it —
+			// report with Error and bail out of this body instead.
+			if err := publishMetadataErr(newTestMetadata("bench-parallel"), []byte("x")); err != nil {
+				b.Errorf("publish: %v", err)
+				return
+			}
 		}
 	})
 }

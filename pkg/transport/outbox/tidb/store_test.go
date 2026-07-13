@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/sequence"
 	tidb "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb/tidbtest"
 )
@@ -41,6 +43,20 @@ func TestCreateOutboxMessageRejectsNilMetadata(t *testing.T) {
 	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: uuid.NewString()})
 	if err == nil {
 		t.Fatal("expected error for nil Metadata, got nil")
+	}
+}
+
+// TestCreateOutboxMessageRejectsZeroTime proves the zero-Time guard fires
+// before any SQL is issued (the nil Runner would panic on ExecContext if it
+// didn't): a zero Metadata.Time would be sent as 0001-01-01, below the
+// DATETIME(6) minimum, and surface only as an opaque driver error.
+func TestCreateOutboxMessageRejectsZeroTime(t *testing.T) {
+	st := tidb.NewStore(nil)
+	md := event.NewMetadata("books.created") // Time left at its zero value
+	md.ID = uuid.NewString()
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: md.ID, Metadata: md})
+	if err == nil || !strings.Contains(err.Error(), "time is zero") {
+		t.Fatalf("err = %v, want descriptive zero-time error", err)
 	}
 }
 
@@ -76,15 +92,20 @@ func truncate(t testing.TB) {
 	}
 }
 
-func publish(t testing.TB, subject string) string {
-	t.Helper()
+// newTestMetadata builds a fully populated publishable metadata envelope.
+func newTestMetadata(subject string) *event.Metadata {
 	md := event.NewMetadata("books.created")
 	md.ID = uuid.NewString()
 	md.Source = "books-service"
 	md.Subject = subject
 	md.DataContentType = "application/proto"
 	md.Time = time.Now().UTC()
-	return publishMetadata(t, md, []byte("x"))
+	return md
+}
+
+func publish(t testing.TB, subject string) string {
+	t.Helper()
+	return publishMetadata(t, newTestMetadata(subject), []byte("x"))
 }
 
 // publishMetadata publishes a caller-prepared *event.Metadata through the
@@ -92,19 +113,26 @@ func publish(t testing.TB, subject string) string {
 // transaction-scoped Runner. Returns the outbox row/event ID.
 func publishMetadata(t testing.TB, md *event.Metadata, data []byte) string {
 	t.Helper()
+	if err := publishMetadataErr(md, data); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	return md.ID
+}
+
+// publishMetadataErr is the error-returning core of publishMetadata. It is
+// safe to call from b.RunParallel goroutines, where testing.TB's Fatal/FailNow
+// must not be used (FailNow must run on the test's own goroutine).
+func publishMetadataErr(md *event.Metadata, data []byte) error {
 	tx, err := testDB.Begin()
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 	st := tidb.NewStore(tx)
 	if err := outbox.NewSender(st).Send(context.Background(), md, data); err != nil {
 		_ = tx.Rollback()
-		t.Fatalf("publish: %v", err)
+		return err
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-	return md.ID
+	return tx.Commit()
 }
 
 func TestPublishInsertsUnsequencedRow(t *testing.T) {
@@ -316,5 +344,187 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 	}
 	if got.DataSchema.String() != schema.String() {
 		t.Fatalf("DataSchema = %q, want %q", got.DataSchema.String(), schema.String())
+	}
+}
+
+// TestCreateOutboxMessageRejectsAutocommit proves an autocommit publish fails
+// loudly with a descriptive error instead of writing a row: on an autocommit
+// connection @@tidb_current_ts is 0 (verified against live TiDB), and a
+// tx_start_ts of 0 would silently sort the row before every transactional row
+// in a sequencer batch.
+func TestCreateOutboxMessageRejectsAutocommit(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+
+	md := newTestMetadata("autocommit")
+	st := tidb.NewStore(testDB) // pool, not a transaction: autocommit
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{
+		ID:         md.ID,
+		Metadata:   md,
+		Data:       []byte("x"),
+		CreateTime: time.Now().UTC(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "must run inside a transaction") {
+		t.Fatalf("err = %v, want must-run-inside-a-transaction error", err)
+	}
+
+	var count int
+	if err := testDB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("outbox rows = %d, want 0 (autocommit publish must not write)", count)
+	}
+
+	// A transactional publish on the same store code path is unaffected.
+	publish(t, "transactional")
+}
+
+// TestListMessagesPoisonRowReturnsPrefixAndDecodeError pins the poison-row
+// contract: on a metadata decode failure, ListMessages returns the
+// successfully decoded prefix of the page plus a *sequence.DecodeError
+// identifying the row, so the relay can park it (or stop the lane) instead of
+// blocking on the whole page.
+func TestListMessagesPoisonRowReturnsPrefixAndDecodeError(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+
+	firstID := publish(t, "ok-1")
+	poisonID := publish(t, "poison")
+	publish(t, "ok-2")
+
+	st := tidb.NewRelayStore(testDB)
+	ctx := context.Background()
+	if _, err := st.SequenceMessages(ctx, 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+
+	// Corrupt the middle row: '[]' passes the JSON column's validity check but
+	// cannot decode into event.Metadata.
+	if _, err := testDB.Exec("UPDATE outbox SET metadata = '[]' WHERE seq = 2"); err != nil {
+		t.Fatalf("corrupt row: %v", err)
+	}
+
+	msgs, err := st.ListMessages(ctx, 0, 10)
+	var de *sequence.DecodeError
+	if !errors.As(err, &de) {
+		t.Fatalf("err = %v, want *sequence.DecodeError", err)
+	}
+	if de.ID != poisonID || de.Seq != 2 {
+		t.Fatalf("DecodeError = {ID: %s, Seq: %d}, want {ID: %s, Seq: 2}", de.ID, de.Seq, poisonID)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("prefix length = %d, want 1 (rows before the poison row)", len(msgs))
+	}
+	if msgs[0].Metadata.ID != firstID {
+		t.Fatalf("prefix[0].Metadata.ID = %s, want %s", msgs[0].Metadata.ID, firstID)
+	}
+}
+
+// TestDeleteOffsetUnpinsSweep proves DeleteOffset is the decommissioning step
+// for a retired consumer group: its stale offset row pins MIN(last_seq) and
+// halts the retention sweep until the row is removed.
+func TestDeleteOffsetUnpinsSweep(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+
+	for range 3 {
+		publish(t, "s")
+	}
+	st := tidb.NewRelayStore(testDB)
+	ctx := context.Background()
+	if _, err := st.SequenceMessages(ctx, 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+	if err := st.CommitOffset(ctx, "live", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CommitOffset(ctx, "retired", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// The retired group pins MIN(last_seq) at 1: only seq 1 is sweepable.
+	sweepBefore := time.Now().UTC().Add(time.Hour)
+	n, err := st.SweepMessages(ctx, sweepBefore, 100)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("swept %d, want 1 (retired offset row must pin the sweep)", n)
+	}
+
+	if err := st.DeleteOffset(ctx, "retired"); err != nil {
+		t.Fatalf("delete offset: %v", err)
+	}
+	off, err := st.Offset(ctx, "retired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != 0 {
+		t.Fatalf("offset after delete = %d, want 0 (row gone)", off)
+	}
+
+	// With the retired row gone, the sweep advances to the live watermark.
+	n, err = st.SweepMessages(ctx, sweepBefore, 100)
+	if err != nil {
+		t.Fatalf("sweep after delete: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("swept %d after DeleteOffset, want 2 (sweep unpinned)", n)
+	}
+
+	// Deleting a missing row is a no-op, not an error.
+	if err := st.DeleteOffset(ctx, "retired"); err != nil {
+		t.Fatalf("delete missing offset: %v", err)
+	}
+}
+
+// TestGenerateV4RelayedMetadataIDFidelity pins the public outbox.GenerateV4
+// contract (see outbox/sender.go): the row key is a freshly minted UUID, but
+// the relayed event still carries exactly the Metadata.ID the caller
+// published — the ID travels inside the persisted metadata JSON.
+func TestGenerateV4RelayedMetadataIDFidelity(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+
+	md := newTestMetadata("v4")
+	ctx := context.Background()
+	tx, err := testDB.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := outbox.NewSender(tidb.NewStore(tx), outbox.WithIDGenerator(outbox.GenerateV4))
+	if err := sender.Send(ctx, md, []byte("x")); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("publish: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	st := tidb.NewRelayStore(testDB)
+	if _, err := st.SequenceMessages(ctx, 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+	msgs, err := st.ListMessages(ctx, 0, 10)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("got %d messages, want 1", len(msgs))
+	}
+	if msgs[0].Metadata.ID != md.ID {
+		t.Fatalf("Metadata.ID = %s, want the published ID %s (identity must survive GenerateV4)", msgs[0].Metadata.ID, md.ID)
+	}
+	if msgs[0].ID == md.ID {
+		t.Fatalf("Message.ID = %s equals the published Metadata.ID; GenerateV4 must mint an independent row key", msgs[0].ID)
 	}
 }

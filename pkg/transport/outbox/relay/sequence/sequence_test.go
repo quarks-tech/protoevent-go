@@ -3,7 +3,8 @@ package sequence_test
 import (
 	"context"
 	"errors"
-	"fmt"
+	"log/slog"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/sequence"
 )
 
@@ -64,8 +64,8 @@ func TestOptionsApply(t *testing.T) {
 	if o.BatchSize != 50 || o.SequenceBatchSize != 500 {
 		t.Fatalf("batch sizes not applied: %+v", o)
 	}
-	if !o.DisableSequencer {
-		t.Fatal("WithoutSequencer did not set DisableSequencer")
+	if !o.SequencerDisabled {
+		t.Fatal("WithoutSequencer did not set SequencerDisabled")
 	}
 	if o.RetentionWindow != 7*24*time.Hour || o.RetentionSweepEvery != 256 || o.RetentionSweepBatch != 5000 {
 		t.Fatalf("retention not applied: %+v", o)
@@ -151,6 +151,11 @@ type fakeStore struct {
 	initOffsetErr error
 	commitErr     error
 
+	// poisonSeq, when non-zero, marks that row as undecodable: ListMessages
+	// returns the decoded prefix before it plus a *sequence.DecodeError, per
+	// the Store contract.
+	poisonSeq int64
+
 	seqCalls int // number of SequenceMessages invocations, for loop-count assertions
 
 	sweepErr        error
@@ -194,13 +199,18 @@ func (s *fakeStore) ListMessages(_ context.Context, afterSeq int64, limit int) (
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
+	// The log is Seq-ascending, so binary-search the page start instead of
+	// scanning from index 0: with a linear scan the benchmarks would measure
+	// the fake's O(N^2/B) walk, not the relay.
+	start := sort.Search(len(s.log), func(i int) bool { return s.log[i].Seq > afterSeq })
 	var out []*outbox.Message
-	for _, m := range s.log {
-		if m.Seq > afterSeq {
-			out = append(out, m)
-			if len(out) == limit {
-				break
-			}
+	for _, m := range s.log[start:] {
+		if s.poisonSeq != 0 && m.Seq == s.poisonSeq {
+			return out, &sequence.DecodeError{ID: m.ID, Seq: m.Seq, Err: errors.New("bad metadata")}
+		}
+		out = append(out, m)
+		if len(out) == limit {
+			break
 		}
 	}
 	return out, nil
@@ -227,22 +237,25 @@ func (s *fakeStore) CommitOffset(_ context.Context, name string, seq int64) erro
 	return nil
 }
 
-// InitOffsetLatest mirrors the SQL store's upsert: initialize name's offset to
-// the current max sequenced seq, GREATEST-merged with any existing value.
+// InitOffsetLatest mirrors the SQL store's insert-if-absent: create name's
+// offset row at the current max sequenced seq ONLY if no row exists, and
+// return the effective committed offset. An existing row — even at 0 — is a
+// committed position and is never modified.
 func (s *fakeStore) InitOffsetLatest(_ context.Context, name string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.initOffsetErr != nil {
 		return 0, s.initOffsetErr
 	}
+	if off, ok := s.offsets[name]; ok {
+		return off, nil
+	}
 	maxSeq := int64(0)
 	if n := len(s.log); n > 0 {
 		maxSeq = s.log[n-1].Seq
 	}
-	if maxSeq > s.offsets[name] { // GREATEST
-		s.offsets[name] = maxSeq
-	}
-	return s.offsets[name], nil
+	s.offsets[name] = maxSeq
+	return maxSeq, nil
 }
 
 // SweepMessages implements sequence.RetentionStore: it records invocation
@@ -621,25 +634,32 @@ func TestRunTicksThenReleasesOnCancel(t *testing.T) {
 	})
 }
 
-// --- fakeLogger --------------------------------------------------------------
+// --- recordingHandler ---------------------------------------------------------
 
-// fakeLogger is a relay.Logger fake recording every Errorf call.
-type fakeLogger struct {
+// recordingHandler is a slog.Handler recording every record's message, so
+// tests can assert the relay's *slog.Logger was (or wasn't) invoked.
+type recordingHandler struct {
 	mu   sync.Mutex
 	msgs []string
 }
 
-func (l *fakeLogger) Errorf(format string, args ...any) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.msgs = append(l.msgs, fmt.Sprintf(format, args...))
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingHandler) Handle(_ context.Context, rec slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.msgs = append(h.msgs, rec.Message)
+	return nil
 }
 
-func (l *fakeLogger) snapshot() []string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	out := make([]string, len(l.msgs))
-	copy(out, l.msgs)
+func (h *recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *recordingHandler) snapshot() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]string, len(h.msgs))
+	copy(out, h.msgs)
 	return out
 }
 
@@ -900,10 +920,10 @@ func TestRunOnceCommitOffsetErrorPropagates(t *testing.T) {
 	}
 }
 
-// TestDrainStopsOnCtxCancellationAfterFullPage proves drain's loop-tail
-// ctx.Err() check aborts a still-full-page drain loop instead of looping
-// forever, once ctx is canceled.
-func TestDrainStopsOnCtxCancellationAfterFullPage(t *testing.T) {
+// TestDrainStopsImmediatelyOnPreCanceledCtx proves drain's per-message ctx
+// check stops the lane before any send when ctx is already canceled: an
+// already-dead run context must not walk even the first page.
+func TestDrainStopsImmediatelyOnPreCanceledCtx(t *testing.T) {
 	st := newFakeStore()
 	for range 4 {
 		st.append(msg(0))
@@ -911,7 +931,8 @@ func TestDrainStopsOnCtxCancellationAfterFullPage(t *testing.T) {
 	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
 		t.Fatalf("seed sequence: %v", err)
 	}
-	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	var sent int
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
 	r, err := sequence.NewRelay("c", st, sender,
 		sequence.WithBatchSize(2), sequence.WithStartFromBeginning())
 	if err != nil {
@@ -925,10 +946,11 @@ func TestDrainStopsOnCtxCancellationAfterFullPage(t *testing.T) {
 	if !errors.Is(runErr, context.Canceled) {
 		t.Fatalf("RunOnce err = %v, want context.Canceled", runErr)
 	}
-	// Exactly the first full page (2) must have been committed before the
-	// loop-tail ctx check aborted the second iteration.
-	if off := st.offsets["c"]; off != 2 {
-		t.Fatalf("offset = %d, want 2 (first full page committed before ctx-cancel abort)", off)
+	if sent != 0 {
+		t.Fatalf("sent %d messages on a pre-canceled ctx, want 0", sent)
+	}
+	if off := st.offsets["c"]; off != 0 {
+		t.Fatalf("offset = %d, want 0 (nothing sent, nothing committed)", off)
 	}
 }
 
@@ -936,10 +958,10 @@ func TestDrainStopsOnCtxCancellationAfterFullPage(t *testing.T) {
 
 func TestWithLoggerNilIsNoop(t *testing.T) {
 	o := sequence.DefaultOptions()
-	real := &fakeLogger{}
+	real := slog.New(&recordingHandler{})
 	sequence.WithLogger(real)(&o)
 	sequence.WithLogger(nil)(&o)
-	if o.Logger != relay.Logger(real) {
+	if o.Logger != real {
 		t.Fatal("WithLogger(nil) replaced a previously set logger")
 	}
 }
@@ -949,21 +971,313 @@ func TestWithLoggerReceivesTransientError(t *testing.T) {
 	for range 5 {
 		st.append(msg(0))
 	}
-	logger := &fakeLogger{}
+	h := &recordingHandler{}
 	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
 		if mdSeq(md) == 3 {
 			return errors.New("boom")
 		}
 		return nil
 	})
-	r, err := sequence.NewRelay("c", st, sender, sequence.WithLogger(logger), sequence.WithStartFromBeginning())
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithLogger(slog.New(h)), sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	_ = r.RunOnce(t.Context())
+	if msgs := h.snapshot(); len(msgs) == 0 {
+		t.Fatal("custom logger was never called on send failure")
+	}
+}
+
+// --- new-validation, lease-renewal, shutdown, and poison-row coverage ----------
+
+func TestNewRelayRejectsEmptyName(t *testing.T) {
+	// name is the offset-row key and the default leader-lock name; two
+	// empty-named relays would silently share both.
+	_, err := sequence.NewRelay("", newFakeStore(), noopSender)
+	if err == nil {
+		t.Fatal("expected error for empty name, got nil")
+	}
+}
+
+func TestNewRelayRejectsPollIntervalNotBelowHalfLeaseTTL(t *testing.T) {
+	// The lease is renewed once per tick, so PollInterval must be < LeaseTTL/2
+	// or the lease expires between renewals and leadership flaps every tick.
+	_, err := sequence.NewRelay("c", newFakeStore(), noopSender,
+		sequence.WithPollInterval(time.Second), sequence.WithLeaseTTL(2*time.Second))
+	if err == nil {
+		t.Fatal("expected error for PollInterval >= LeaseTTL/2, got nil")
+	}
+}
+
+// TestNewRelayRedefaultsNilObserverAndLogger proves a raw Option that nils
+// Observer/Logger (bypassing the With* nil guards) does not leave the runtime
+// with a latent nil-deref: NewRelay re-defaults both after applying options.
+func TestNewRelayRedefaultsNilObserverAndLogger(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg(0))
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+		return errors.New("boom") // exercises the Observer+Logger error path
+	})
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
+		func(o *sequence.Options) { o.Observer = nil; o.Logger = nil })
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil { // must not panic
+		t.Fatalf("RunOnce: %v", err)
+	}
+}
+
+// revokingLeaderStore wraps fakeStore's leader lock but only lets the first
+// `allowed` TryAcquireLeaderLock calls succeed; later renewals report the lock
+// as lost, simulating leadership revoked mid-pass.
+type revokingLeaderStore struct {
+	*fakeStore
+	allowed atomic.Int32 // remaining acquires that may succeed
+}
+
+func (s *revokingLeaderStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
+	if s.allowed.Add(-1) < 0 {
+		return false, nil
+	}
+	return s.fakeStore.TryAcquireLeaderLock(ctx, name, holderID, ttl)
+}
+
+// TestDrainStopsWhenLeadershipLostBetweenPages proves the between-pages lease
+// renewal: when the renewal after the first full page reports leadership lost,
+// the relay ends the pass cleanly (nil error) with only that page committed,
+// bounding stale-leader overlap to a single page.
+func TestDrainStopsWhenLeadershipLostBetweenPages(t *testing.T) {
+	st := &revokingLeaderStore{fakeStore: newFakeStore()}
+	st.allowed.Store(1) // RunOnce's opening acquire succeeds; the renewal fails
+	for range 6 {
+		st.append(msg(0))
+	}
+	var sent int
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
+
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithBatchSize(2), sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if runErr := r.RunOnce(t.Context()); runErr != nil {
+		t.Fatalf("RunOnce = %v, want nil (losing leadership is not an error)", runErr)
+	}
+	if sent != 2 {
+		t.Fatalf("sent = %d, want 2 (must stop after the first page once leadership is lost)", sent)
+	}
+	if off := st.offsets["c"]; off != 2 {
+		t.Fatalf("offset = %d, want 2 (first page committed before the pass ended)", off)
+	}
+}
+
+// TestCancelDuringSendDoesNotPark proves drain's send-failure branch treats a
+// failure with a canceled run ctx as shutdown, not a message fault: no
+// ErrorHandler invocation, no offset advance past the last success.
+func TestCancelDuringSendDoesNotPark(t *testing.T) {
+	st := newFakeStore()
+	for range 5 {
+		st.append(msg(0))
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	var sent []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if mdSeq(md) == 3 {
+			cancel()
+			return ctx.Err() // send aborted by the shutdown
+		}
+		sent = append(sent, mdSeq(md))
+		return nil
+	})
+	var parked []int64
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
+		sequence.WithErrorHandler(func(_ context.Context, m *outbox.Message, _ error) {
+			parked = append(parked, m.Seq)
+		}))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	runErr := r.RunOnce(ctx)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("RunOnce err = %v, want context.Canceled", runErr)
+	}
+	if len(parked) != 0 {
+		t.Fatalf("parked = %v, want none (shutdown must not park healthy messages)", parked)
+	}
+	if off := st.offsets["c"]; off != 2 {
+		t.Fatalf("offset = %d, want 2 (not advanced past the last success)", off)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("sent = %v, want [1 2]", sent)
+	}
+}
+
+// TestCancelBetweenSendsStopsLane proves drain's per-message ctx check: a ctx
+// canceled after a successful send stops the lane before the next message is
+// even attempted (no fail-fast walk of the rest of the page).
+func TestCancelBetweenSendsStopsLane(t *testing.T) {
+	st := newFakeStore()
+	for range 5 {
+		st.append(msg(0))
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	var sent []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		sent = append(sent, mdSeq(md))
+		if mdSeq(md) == 2 {
+			cancel() // shutdown lands after this send succeeds
+		}
+		return nil
+	})
+	var parked []int64
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
+		sequence.WithErrorHandler(func(_ context.Context, m *outbox.Message, _ error) {
+			parked = append(parked, m.Seq)
+		}))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	runErr := r.RunOnce(ctx)
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("RunOnce err = %v, want context.Canceled", runErr)
+	}
+	if len(sent) != 2 {
+		t.Fatalf("sent = %v, want [1 2] (no message attempted after cancellation)", sent)
+	}
+	if len(parked) != 0 {
+		t.Fatalf("parked = %v, want none", parked)
+	}
+	if off := st.offsets["c"]; off != 2 {
+		t.Fatalf("offset = %d, want 2 (committed through the last success)", off)
+	}
+}
+
+// TestPoisonRowParkedWithErrorHandler proves DecodeError routing with an
+// ErrorHandler: the decoded prefix is delivered, the poison row is parked
+// exactly once, the offset advances past it, and rows after it are delivered.
+func TestPoisonRowParkedWithErrorHandler(t *testing.T) {
+	st := newFakeStore()
+	for range 5 {
+		st.append(msg(0))
+	}
+	st.poisonSeq = 3
+
+	var got []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		got = append(got, mdSeq(md))
+		return nil
+	})
+	var parked []*outbox.Message
+	var parkedErrs []error
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
+		sequence.WithErrorHandler(func(_ context.Context, m *outbox.Message, err error) {
+			parked = append(parked, m)
+			parkedErrs = append(parkedErrs, err)
+		}))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	if msgs := logger.snapshot(); len(msgs) == 0 {
-		t.Fatal("custom Logger.Errorf was never called on send failure")
+
+	if len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 4 || got[3] != 5 {
+		t.Fatalf("delivered = %v, want [1 2 4 5]", got)
+	}
+	if len(parked) != 1 || parked[0].Seq != 3 {
+		t.Fatalf("parked = %+v, want exactly the seq-3 poison row once", parked)
+	}
+	var de *sequence.DecodeError
+	if !errors.As(parkedErrs[0], &de) || de.Seq != 3 {
+		t.Fatalf("parked err = %v, want *sequence.DecodeError with Seq 3", parkedErrs[0])
+	}
+	if off := st.offsets["c"]; off != 5 {
+		t.Fatalf("offset = %d, want 5 (advanced past the parked poison row)", off)
+	}
+}
+
+// TestPoisonRowStopsLaneWithoutErrorHandler proves the default stop-the-lane
+// behavior for a decode failure: the decoded prefix is delivered and
+// committed, then the pass surfaces the *DecodeError and stops at the row.
+func TestPoisonRowStopsLaneWithoutErrorHandler(t *testing.T) {
+	st := newFakeStore()
+	for range 5 {
+		st.append(msg(0))
+	}
+	st.poisonSeq = 3
+
+	var got []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		got = append(got, mdSeq(md))
+		return nil
+	})
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	runErr := r.RunOnce(t.Context())
+	var de *sequence.DecodeError
+	if !errors.As(runErr, &de) || de.Seq != 3 {
+		t.Fatalf("RunOnce err = %v, want *sequence.DecodeError with Seq 3", runErr)
+	}
+	if len(got) != 2 {
+		t.Fatalf("delivered = %v, want [1 2] (prefix only)", got)
+	}
+	if off := st.offsets["c"]; off != 2 {
+		t.Fatalf("offset = %d, want 2 (lane stops at the poison row)", off)
+	}
+}
+
+// drainCountObserver records every ObserveDrained count.
+type drainCountObserver struct {
+	mu     sync.Mutex
+	counts []int
+}
+
+func (o *drainCountObserver) ObserveDrained(_ string, count int, _ time.Duration, _ bool) {
+	o.mu.Lock()
+	o.counts = append(o.counts, count)
+	o.mu.Unlock()
+}
+func (o *drainCountObserver) ObserveSequenced(string, int) {}
+func (o *drainCountObserver) ObserveError(string, error)   {}
+
+// TestObserveDrainedExcludesParkedMessages pins the relay.Observer contract:
+// ObserveDrained's count is successful sends only — a parked message is
+// surfaced via ObserveError and not counted.
+func TestObserveDrainedExcludesParkedMessages(t *testing.T) {
+	st := newFakeStore()
+	for range 5 {
+		st.append(msg(0))
+	}
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if mdSeq(md) == 3 {
+			return errors.New("boom")
+		}
+		return nil
+	})
+	obs := &drainCountObserver{}
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
+		sequence.WithObserver(obs),
+		sequence.WithErrorHandler(func(context.Context, *outbox.Message, error) {}))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	total := 0
+	for _, c := range obs.counts {
+		total += c
+	}
+	if total != 4 {
+		t.Fatalf("ObserveDrained total = %d, want 4 (parked message must not be counted)", total)
 	}
 }

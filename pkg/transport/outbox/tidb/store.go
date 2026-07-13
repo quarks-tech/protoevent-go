@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
@@ -31,10 +33,18 @@ type Store struct {
 	r Runner
 }
 
-// NewStore builds a publish-side store over r, typically a transaction-scoped
-// *sql.Tx for atomic publish. r may also be a *sql.DB for a fire-and-forget
-// publish outside a business transaction. For relay use (read/offset/
-// sequencer/retention/leader), use NewRelayStore.
+// NewStore builds a publish-side store over r, which MUST be a
+// transaction-scoped *sql.Tx: the row's tx_start_ts is the publishing
+// transaction's PD start TSO (@@tidb_current_ts), which only exists on a
+// transactional connection — on an autocommit *sql.DB it reads 0, and
+// CreateOutboxMessage fails loudly rather than write a row that would sort
+// before every transactional row in a sequencer batch. For relay use
+// (read/offset/sequencer/retention/leader), use NewRelayStore.
+//
+// DSN note: with go-sql-driver/mysql, set interpolateParams=true — without it
+// every parameterized query pays a prepare/exec/close cycle (3 wire round
+// trips), including the publish INSERT inside the caller's business
+// transaction.
 func NewStore(r Runner) *Store { return &Store{r: r} }
 
 var _ outbox.Store = (*Store)(nil)
@@ -61,8 +71,11 @@ var (
 
 // CreateOutboxMessage inserts an unsequenced row. tx_start_ts is the publishing
 // transaction's PD start TSO (@@tidb_current_ts); id is auto-assigned in insert
-// order (= emit order); seq stays NULL until the sequencer runs. Call this on a
-// transaction-scoped Runner so the row commits atomically with business writes.
+// order (= emit order); seq stays NULL until the sequencer runs. This MUST run
+// inside a transaction (a transaction-scoped Runner): the row then commits
+// atomically with business writes, and tx_start_ts is only available on
+// transactional connections — an autocommit publish fails with a descriptive
+// error.
 //
 // Requires Message.ID to be a UUID string: event_id is a BINARY(16) column, and
 // m.ID is parsed as a UUID before the insert. A custom outbox.IDGenerator
@@ -76,6 +89,11 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 		return fmt.Errorf("outbox: parse message ID %q: %w", m.ID, err)
 	}
 	md := m.Metadata
+	if md.Time.IsZero() {
+		// A zero time would be sent as 0001-01-01, below DATETIME(6)'s minimum,
+		// and surface as an opaque driver error; reject it up front instead.
+		return fmt.Errorf("outbox: message metadata time is zero; set Metadata.Time before publishing")
+	}
 	meta, err := json.Marshal(md)
 	if err != nil {
 		return fmt.Errorf("outbox: marshal metadata: %w", err)
@@ -84,18 +102,29 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 	// operators and future event-time features; the engine itself reads event
 	// time from the metadata JSON, and retention (SweepMessages) is
 	// create_time-anchored, not occurred_at-anchored.
+	//
+	// NULLIF(@@tidb_current_ts, 0): on an autocommit connection the variable
+	// reads 0, and a 0 tx_start_ts would silently sort the row before every
+	// transactional row in a sequencer batch. NULLIF turns that 0 into NULL so
+	// the NOT NULL column rejects the row loudly instead.
 	_, err = s.r.ExecContext(ctx, `
 INSERT INTO outbox (seq, tx_start_ts, event_id, metadata, data, create_time, occurred_at)
-VALUES (NULL, @@tidb_current_ts, ?, ?, ?, ?, ?)`,
+VALUES (NULL, NULLIF(@@tidb_current_ts, 0), ?, ?, ?, ?, ?)`,
 		id[:], meta, m.Data, m.CreateTime, md.Time.UTC(),
 	)
 	if err != nil {
+		if strings.Contains(err.Error(), "tx_start_ts") {
+			return fmt.Errorf("outbox: CreateOutboxMessage must run inside a transaction (tx_start_ts is only available on transactional connections): %w", err)
+		}
 		return fmt.Errorf("outbox: insert: %w", err)
 	}
 	return nil
 }
 
-// ListMessages returns sequenced rows with seq > afterSeq in seq order.
+// ListMessages returns sequenced rows with seq > afterSeq in seq order. If a
+// row's persisted metadata fails to decode, it stops at that row and returns
+// the successfully decoded prefix together with a *sequence.DecodeError
+// identifying the poison row (per the sequence.Store contract).
 func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit int) ([]*outbox.Message, error) {
 	rows, err := rs.db.QueryContext(ctx, `
 SELECT seq, event_id, metadata, data, create_time
@@ -108,7 +137,7 @@ LIMIT ?`, afterSeq, limit)
 	}
 	defer func() { _ = rows.Close() }()
 
-	var out []*outbox.Message
+	out := make([]*outbox.Message, 0, limit)
 	for rows.Next() {
 		var (
 			seq     int64
@@ -126,7 +155,10 @@ LIMIT ?`, afterSeq, limit)
 		}
 		var md event.Metadata
 		if err := json.Unmarshal(meta, &md); err != nil {
-			return nil, fmt.Errorf("outbox: unmarshal metadata: %w", err)
+			// Poison row: hand the decoded prefix back with a typed error so
+			// the relay can deliver up to the poison row and then park it (or
+			// stop the lane) instead of blocking on the whole page.
+			return out, &sequence.DecodeError{ID: id.String(), Seq: seq, Err: err}
 		}
 		out = append(out, &outbox.Message{
 			ID:         id.String(),
@@ -166,18 +198,28 @@ ON DUPLICATE KEY UPDATE
 	return nil
 }
 
-// InitOffsetLatest is called once for a consumer group with no committed
-// offset: it atomically initializes the group's offset row to the current
-// maximum assigned seq (0 if the log is empty or unsequenced) and returns the
-// effective offset. Monotone (GREATEST) so it never rewinds an existing row.
+// InitOffsetLatest creates the named consumer group's offset row at the
+// current maximum assigned seq (0 if the log is empty or unsequenced) ONLY if
+// no row exists yet, and returns the effective committed offset.
+// Insert-if-absent: an existing row — even one at 0 — is a committed position
+// and is never modified. Forward-jumping an existing row (the old GREATEST
+// upsert) silently lost events: a group primed on an empty log commits a row
+// at 0, and a re-init after a relay restart jumped it 0 → MAX(seq), skipping
+// everything pending.
+//
+// The row-exists case is detected via the duplicate-key error rather than
+// INSERT IGNORE: IGNORE downgrades every ignorable error to a warning — a
+// too-long name would be silently truncated into a different group's row —
+// while tolerating exactly ER_DUP_ENTRY keeps all other failures loud. The
+// duplicate is expected, not an anomaly: it fires on each relay restart while
+// the group still sits at offset 0, and in the split-brain race where two
+// leaders init concurrently; the read-back below returns the surviving row
+// either way.
 func (rs *RelayStore) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
 	_, err := rs.db.ExecContext(ctx, `
 INSERT INTO outbox_offsets (name, last_seq, update_time)
-SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM outbox
-ON DUPLICATE KEY UPDATE
-    last_seq    = GREATEST(last_seq, VALUES(last_seq)),
-    update_time = VALUES(update_time)`, name)
-	if err != nil {
+SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM outbox`, name)
+	if err != nil && !isDuplicateKey(err) {
 		return 0, fmt.Errorf("outbox: init offset latest: %w", err)
 	}
 	var seq int64
@@ -189,10 +231,44 @@ ON DUPLICATE KEY UPDATE
 	return seq, nil
 }
 
+// isDuplicateKey reports whether err is MySQL/TiDB ER_DUP_ENTRY (1062).
+func isDuplicateKey(err error) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1062
+}
+
+// DeleteOffset removes the named consumer group's offset row. It is the
+// decommissioning step for a retired consumer group: a retired group's stale
+// offset row keeps pinning MIN(last_seq) (see SweepMessages) and halts
+// retention permanently until the row is deleted. Deleting a missing row is a
+// no-op.
+func (rs *RelayStore) DeleteOffset(ctx context.Context, name string) error {
+	if _, err := rs.db.ExecContext(ctx,
+		`DELETE FROM outbox_offsets WHERE name = ?`, name,
+	); err != nil {
+		return fmt.Errorf("outbox: delete offset: %w", err)
+	}
+	return nil
+}
+
 // SequenceMessages assigns dense seq values to committed pending rows in
 // (tx_start_ts, id) order. The counter row is locked FOR UPDATE for the whole
 // pass, so concurrent sequencers serialize and can never double-assign.
 func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, error) {
+	// Idle fast path: probe for pending work on the pool before opening the
+	// sequencing transaction. An idle tick otherwise pays BEGIN + FOR UPDATE +
+	// UPDATE + COMMIT (~4 round trips) and a pessimistic lock on the counter
+	// row every PollInterval per relay. Racing a freshly committed row merely
+	// defers it one tick — the same cadence the poll already imposes.
+	var one int
+	err := rs.db.QueryRowContext(ctx, `SELECT 1 FROM outbox WHERE seq IS NULL LIMIT 1`).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("outbox: probe pending: %w", err)
+	}
+
 	tx, err := rs.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("outbox: begin sequence tx: %w", err)
@@ -206,14 +282,23 @@ func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, err
 		return 0, fmt.Errorf("outbox: lock sequencer: %w", err)
 	}
 
+	// The page LIMIT sits in the innermost derived table, BELOW the window:
+	// TiDB does not push Limit below Sort/Window, so a single-block
+	// `ROW_NUMBER() OVER (...) ... LIMIT ?` ships the ENTIRE pending backlog
+	// to the root executor and fully sorts it on every pass — O(backlog) per
+	// pass, O(N²/batch) to recover from a long outage. With the inner LIMIT
+	// the TopN is pushed into TiKV and only the page reaches the root, where
+	// the window numbers just those rows.
 	res, err := tx.ExecContext(ctx, `
 UPDATE outbox o
 JOIN (
     SELECT id, ROW_NUMBER() OVER (ORDER BY tx_start_ts, id) AS rn
-    FROM outbox
-    WHERE seq IS NULL
-    ORDER BY tx_start_ts, id
-    LIMIT ?
+    FROM (
+        SELECT id, tx_start_ts FROM outbox
+        WHERE seq IS NULL
+        ORDER BY tx_start_ts, id
+        LIMIT ?
+    ) page
 ) b ON b.id = o.id
 SET o.seq = ? + b.rn - 1`, limit, next)
 	if err != nil {
@@ -282,6 +367,10 @@ func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID stri
 // so provides no retention protection at all — an unrun group does not hold
 // the sweep back. Consumer groups must run (or call InitOffsetLatest) within
 // the retention window to be protected from the sweep.
+//
+// Conversely, a RETIRED group's offset row stops advancing but keeps pinning
+// MIN(last_seq) at its last committed position, halting the sweep permanently.
+// Decommission a retired consumer group with DeleteOffset to unpin retention.
 func (rs *RelayStore) SweepMessages(ctx context.Context, before time.Time, limit int) (int, error) {
 	res, err := rs.db.ExecContext(ctx, `
 DELETE FROM outbox

@@ -327,7 +327,7 @@ if err := r.Run(ctx); err != nil {
 #### Relay: MongoDB (change-stream tail)
 
 ```go
-st := mongodb.NewStore(db, mongodb.WithMaxAwaitTime(time.Second))
+st := mongodb.NewStore(db)
 if err := st.EnsureIndexes(ctx); err != nil {
     log.Fatal(err)
 }
@@ -348,8 +348,10 @@ if err := r.Run(ctx); err != nil {
 Both relays run leader election automatically when the store implements
 `relay.LeaderStore` (both reference stores do), so multiple instances can run
 for failover with only one processing at a time. Delivery is at-least-once,
-not exactly-once: consumers **must** dedup on the event's ID (`event_id`,
-the outbox row's ID) for effectively-once processing.
+not exactly-once: consumers **must** dedup on the event's CloudEvents
+`Metadata.ID` (always the ID the publisher assigned; under the default
+`ReuseMetadataID` it also keys the outbox row) for effectively-once
+processing.
 
 See [`pkg/transport/outbox/README.md`](pkg/transport/outbox/README.md) for
 the full guide (package layout, ordering guarantees, benchmarks), and

@@ -2,6 +2,7 @@ package outbox
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,12 +23,12 @@ type IDGenerator func(md *event.Metadata) (string, error)
 // fresh random UUID v4 as the outbox row's unique primary key, independent of
 // the caller-controlled Metadata.ID.
 //
-// Because the row ID is independent of Metadata.ID, the relay does NOT
-// reconstruct the emitted CloudEvents id from Metadata.ID as it does under
-// ReuseMetadataID — the id the publisher assigned is not persisted, so the
-// relayed event's id will differ from the one the caller published. Use this
-// only when the outbox row's identity does not need to match the event's
-// identity.
+// This only decouples the row key from the event's identity: the full
+// event.Metadata (including the publisher-assigned ID) is persisted in the
+// row's metadata document and relayed verbatim, so the relayed event still
+// carries exactly the id the caller published. Use GenerateV4 when the store's
+// row key must not depend on caller-controlled input; consumer-side
+// Metadata.ID dedup keeps working either way.
 func GenerateV4(_ *event.Metadata) (string, error) {
 	id, err := uuid.NewRandom()
 	if err != nil {
@@ -37,20 +38,22 @@ func GenerateV4(_ *event.Metadata) (string, error) {
 	return id.String(), nil
 }
 
-// ReuseMetadataID is the default IDGenerator. It uses the event's Metadata.ID
-// as the outbox row ID, giving the row and the event a single identity end to
-// end: the relay persists this ID as the store's event_id column and
-// reconstructs the emitted CloudEvents Metadata.ID from it, so the relayed
-// event carries exactly the id the publisher assigned.
+// ReuseMetadataID is the default IDGenerator. It copies the event's
+// Metadata.ID into the outbox row ID, giving the row and the event a single
+// identity end to end: the store's event_id column equals the published
+// Metadata.ID. (The relayed event's id always comes from the persisted
+// metadata document, under any generator; this default additionally makes the
+// row key match it.)
 //
 // Because CloudEvents ids are themselves UUIDs, this also scatters outbox
 // primary-key inserts across TiDB Regions the same way a freshly minted UUID
 // would (see storage ADR 012) — so the default gets hotspot avoidance and
 // identity preservation together, with no tradeoff between them.
 //
-// The relay orders pending rows by create_time, not by ID, so reusing the event
-// ID does not affect delivery ordering regardless of its format. The only
-// requirement is that Metadata.ID be unique (it is the row's primary key).
+// Delivery order is the log order (assigned seq for the TiDB runtime, oplog
+// commit order for the MongoDB runtime), never the row ID, so the ID format
+// does not affect ordering. The only requirement is that Metadata.ID be
+// unique (it is the row's primary key).
 func ReuseMetadataID(md *event.Metadata) (string, error) {
 	return md.ID, nil
 }
@@ -106,6 +109,10 @@ func NewSender(store Store, opts ...SenderOption) *Sender {
 // Send persists the event to the outbox store.
 // This should be called within the same transaction as business operations.
 func (s *Sender) Send(ctx context.Context, metadata *event.Metadata, data []byte) error {
+	if metadata == nil {
+		return errors.New("outbox: metadata must not be nil")
+	}
+
 	id, err := s.options.idGenerator(metadata)
 	if err != nil {
 		return err

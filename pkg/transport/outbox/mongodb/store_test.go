@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,14 +25,14 @@ func TestNewStoreConstructs(t *testing.T) {
 	}
 }
 
-func TestNewStoreWithMaxAwaitTime(t *testing.T) {
-	if mongodbstore.NewStore(nil, mongodbstore.WithMaxAwaitTime(300*time.Millisecond)) == nil {
+func TestNewStoreWithRetention(t *testing.T) {
+	if mongodbstore.NewStore(nil, mongodbstore.WithRetention(48*time.Hour)) == nil {
 		t.Fatal("NewStore returned nil")
 	}
 }
 
-func TestStoreSatisfiesStreamStore(t *testing.T) {
-	// Compile-time proof lives in watch.go (var _ stream.StreamStore = ...).
+func TestStoreSatisfiesStreamContract(t *testing.T) {
+	// Compile-time proof lives in watch.go (var _ stream.Store = ...).
 	// This test just ensures the package builds with Watch present.
 	_ = mongodbstore.NewStore(nil)
 }
@@ -45,6 +46,18 @@ func TestCreateOutboxMessageRejectsNilMetadata(t *testing.T) {
 	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id"})
 	if err == nil {
 		t.Fatal("expected error for nil Metadata, got nil")
+	}
+}
+
+// TestCreateOutboxMessageRejectsEmptyID proves the empty-ID guard fires before
+// any driver call (same nil-*mongo.Database trick as the nil-Metadata test).
+// Without it, an empty _id inserts fine ONCE and every later publish fails
+// with a far-from-cause duplicate-key error.
+func TestCreateOutboxMessageRejectsEmptyID(t *testing.T) {
+	st := mongodbstore.NewStore(nil)
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{Metadata: event.NewMetadata("t")})
+	if err == nil {
+		t.Fatal("expected error for empty ID, got nil")
 	}
 }
 
@@ -185,6 +198,35 @@ func TestEnsureIndexesCreatesTTL(t *testing.T) {
 	}
 }
 
+// TestEnsureIndexesRetentionConflictHinted proves the WithRetention knob
+// reaches the TTL index, and that changing retention on an EXISTING collection
+// surfaces MongoDB's IndexOptionsConflict with a collMod hint instead of
+// silently keeping the old TTL.
+func TestEnsureIndexesRetentionConflictHinted(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	ctx := context.Background()
+
+	if err := mongodbstore.NewStore(testDB, mongodbstore.WithRetention(48*time.Hour)).EnsureIndexes(ctx); err != nil {
+		t.Fatalf("ensure indexes (48h): %v", err)
+	}
+	// Re-ensuring with the SAME retention stays idempotent.
+	if err := mongodbstore.NewStore(testDB, mongodbstore.WithRetention(48*time.Hour)).EnsureIndexes(ctx); err != nil {
+		t.Fatalf("re-ensure with unchanged retention: %v", err)
+	}
+	// A DIFFERENT retention on the existing index must fail loudly, with the
+	// operational hint (collMod) in the message.
+	err := mongodbstore.NewStore(testDB, mongodbstore.WithRetention(24*time.Hour)).EnsureIndexes(ctx)
+	if err == nil {
+		t.Fatal("re-ensure with a different retention succeeded; want IndexOptionsConflict surfaced")
+	}
+	if !strings.Contains(err.Error(), "collMod") {
+		t.Fatalf("conflict error carries no collMod hint: %v", err)
+	}
+}
+
 func TestOffsetRoundTrip(t *testing.T) {
 	if testDB == nil {
 		t.Skip("no MongoDB")
@@ -205,6 +247,50 @@ func TestOffsetRoundTrip(t *testing.T) {
 	}
 	if !gotCT.Equal(ct) {
 		t.Fatalf("clusterTime = %v, want %v", gotCT, ct)
+	}
+}
+
+// TestSaveTokenMonotoneClusterTime proves SaveToken honors the stream.Store
+// contract's monotonicity clause: a save carrying an OLDER clusterTime than
+// the stored row (a stale leader finishing a slow window) is a silent no-op,
+// while a newer one still advances the position.
+func TestSaveTokenMonotoneClusterTime(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	ctx := context.Background()
+
+	t1 := time.Now().UTC().Truncate(time.Millisecond)
+	t0 := t1.Add(-time.Minute)
+	t2 := t1.Add(time.Minute)
+
+	if err := st.SaveToken(ctx, "c", "tok1", t1); err != nil {
+		t.Fatalf("save tok1: %v", err)
+	}
+	// Stale save: older clusterTime must not rewind the stored row — and must
+	// not error either (the no-op is deliberate, not a failure).
+	if err := st.SaveToken(ctx, "c", "tok0", t0); err != nil {
+		t.Fatalf("stale save returned an error, want silent no-op: %v", err)
+	}
+	tok, gotCT, err := st.LoadToken(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "tok1" || !gotCT.Equal(t1) {
+		t.Fatalf("after stale save: token = %q ct = %v, want tok1 %v (rewound!)", tok, gotCT, t1)
+	}
+	// Newer save still advances.
+	if err := st.SaveToken(ctx, "c", "tok2", t2); err != nil {
+		t.Fatalf("save tok2: %v", err)
+	}
+	tok, gotCT, err = st.LoadToken(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "tok2" || !gotCT.Equal(t2) {
+		t.Fatalf("after newer save: token = %q ct = %v, want tok2 %v", tok, gotCT, t2)
 	}
 }
 
@@ -270,5 +356,48 @@ func TestLeaderLockRenewalSameHolder(t *testing.T) {
 	}
 	if okB {
 		t.Fatal("B acquired while A holds a renewed lock")
+	}
+}
+
+// TestLeaderLockExpiredLeaseTakeover proves a standby takes over once the
+// lease expires — with the expiry decided by the SERVER clock ($$NOW), the
+// same clock that stamped the deadline, so the takeover works regardless of
+// skew between relay instances' local clocks.
+func TestLeaderLockExpiredLeaseTakeover(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	ctx := context.Background()
+
+	okA, err := st.TryAcquireLeaderLock(ctx, "lock", "A", 200*time.Millisecond)
+	if err != nil || !okA {
+		t.Fatalf("A acquire = %v, %v; want true", okA, err)
+	}
+	// B is denied while A's lease is live.
+	okB, err := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if okB {
+		t.Fatal("B acquired while A's lease is still live")
+	}
+	// Wait out A's lease (comfortably past 200ms), then B must win.
+	time.Sleep(700 * time.Millisecond)
+	okB2, err := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !okB2 {
+		t.Fatal("B failed to take over an expired lease")
+	}
+	// And A, whose lease B replaced, must now be denied.
+	okA2, err := st.TryAcquireLeaderLock(ctx, "lock", "A", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if okA2 {
+		t.Fatal("A re-acquired while B holds a live lease")
 	}
 }

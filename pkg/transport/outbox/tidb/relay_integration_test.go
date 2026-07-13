@@ -118,6 +118,73 @@ func TestRelayStartFromBeginningReplays(t *testing.T) {
 	}
 }
 
+// TestRelayRestartAfterPrimingDeliversPending is the regression test for a
+// live-reproduced silent event-loss bug: a new group primed on an EMPTY log
+// commits an offset row at 0; the old GREATEST-upsert InitOffsetLatest, re-run
+// after a relay restart (fresh in-memory latch), forward-jumped that committed
+// row 0 → MAX(seq) and silently skipped everything published while the relay
+// was down. Insert-if-absent must leave the committed row untouched, so the
+// restarted relay delivers all pending events.
+func TestRelayRestartAfterPrimingDeliversPending(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+	ctx := context.Background()
+
+	// First relay instance: prime the new group on the empty log — this
+	// commits its offset row at 0.
+	primer := &recordingSender{}
+	r1, err := sequence.NewRelay("restart", tidb.NewRelayStore(testDB), primer)
+	if err != nil {
+		t.Fatalf("NewRelay (first instance): %v", err)
+	}
+	if err := r1.RunOnce(ctx); err != nil {
+		t.Fatalf("priming RunOnce: %v", err)
+	}
+	if len(primer.ids) != 0 {
+		t.Fatalf("priming delivered %d, want 0", len(primer.ids))
+	}
+
+	// Simulate the process dying: RunOnce holds the leader lease (only Run
+	// releases it on shutdown), so drop the lock the way an expired lease
+	// would, letting the second instance take leadership immediately.
+	if _, err := testDB.Exec("DELETE FROM relay_lock"); err != nil {
+		t.Fatalf("expire leader lock: %v", err)
+	}
+
+	// Publish while the relay is "down".
+	wantIDs := make([]string, 0, 20)
+	for range 20 {
+		wantIDs = append(wantIDs, publish(t, "pending"))
+	}
+
+	// Second relay instance for the SAME group: its fresh in-memory latch
+	// re-runs InitOffsetLatest against the existing committed row at 0.
+	sender := &recordingSender{}
+	r2, err := sequence.NewRelay("restart", tidb.NewRelayStore(testDB), sender)
+	if err != nil {
+		t.Fatalf("NewRelay (second instance): %v", err)
+	}
+	if err := r2.RunOnce(ctx); err != nil {
+		t.Fatalf("post-restart RunOnce: %v", err)
+	}
+
+	if len(sender.ids) != 20 {
+		t.Fatalf("delivered %d, want 20 (InitOffsetLatest must not forward-jump a committed offset row)", len(sender.ids))
+	}
+	if !reflect.DeepEqual(sender.ids, wantIDs) {
+		t.Fatalf("delivered IDs =\n%v\nwant (published order)\n%v", sender.ids, wantIDs)
+	}
+	off, err := tidb.NewRelayStore(testDB).Offset(ctx, "restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != 20 {
+		t.Fatalf("offset = %d, want 20", off)
+	}
+}
+
 func TestLatePublishGetsHigherSeq(t *testing.T) {
 	if testDB == nil {
 		t.Skip("no TiDB")

@@ -12,10 +12,17 @@ type Message struct {
 	ID string
 
 	// Seq is the logical log offset assigned by the sequencer after commit.
-	// Zero until sequenced; set by the relay store on read.
+	// Zero until sequenced; set by the relay store on read. Only the
+	// sequenced-log (TiDB) runtime uses it — the MongoDB change-stream runtime
+	// orders by oplog commit order and always leaves Seq zero.
 	Seq int64
 
 	// Metadata contains CloudEvents metadata.
+	//
+	// Note on Extensions: stores persist Metadata as JSON, so extension values
+	// round-trip through encoding/json — numeric extension values come back as
+	// float64 regardless of the type the publisher set. Consumers needing
+	// exact numeric types should encode them as strings.
 	Metadata *event.Metadata
 
 	// Data is the serialized event payload.

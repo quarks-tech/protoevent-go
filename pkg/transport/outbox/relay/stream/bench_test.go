@@ -23,9 +23,9 @@ func BenchmarkDrainWindow(b *testing.B) {
 		b.StopTimer()
 		events := make([]*stream.Event, n)
 		for i := range events {
-			events[i] = ev(i, fmt.Sprintf("tok-%d", i), false)
+			events[i] = ev(fmt.Sprintf("tok-%d", i))
 		}
-		st := &fakeStreamStore{stream: &fakeStream{events: events}}
+		st := &fakeStore{stream: &fakeStream{events: events}}
 		r, err := stream.NewRelay("bench", st, sender)
 		if err != nil {
 			b.Fatalf("NewRelay: %v", err)
