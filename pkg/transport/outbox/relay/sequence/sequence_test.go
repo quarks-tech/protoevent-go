@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -74,31 +75,33 @@ func TestOptionsApply(t *testing.T) {
 
 func TestNewRelayRejectsZeroPollInterval(t *testing.T) {
 	// A zero PollInterval previously panicked inside time.NewTicker; it must
-	// now be rejected at construction time.
-	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithPollInterval(0))
-	if err == nil {
-		t.Fatal("expected error for zero PollInterval, got nil")
+	// now be rejected at construction time. Valid store and sender, so no
+	// earlier nil-guard can mask the guard under test; the message must name
+	// the violated field.
+	_, err := sequence.NewRelay("c", newFakeStore(), noopSender, sequence.WithPollInterval(0))
+	if err == nil || !strings.Contains(err.Error(), "PollInterval must be > 0") {
+		t.Fatalf("err = %v, want the PollInterval > 0 validation error", err)
 	}
 }
 
 func TestNewRelayRejectsZeroBatchSize(t *testing.T) {
-	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithBatchSize(0))
-	if err == nil {
-		t.Fatal("expected error for zero BatchSize, got nil")
+	_, err := sequence.NewRelay("c", newFakeStore(), noopSender, sequence.WithBatchSize(0))
+	if err == nil || !strings.Contains(err.Error(), "sequence: BatchSize") {
+		t.Fatalf("err = %v, want the BatchSize > 0 validation error", err)
 	}
 }
 
 func TestNewRelayRejectsZeroSequenceBatchSize(t *testing.T) {
-	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithSequenceBatchSize(0))
-	if err == nil {
-		t.Fatal("expected error for zero SequenceBatchSize, got nil")
+	_, err := sequence.NewRelay("c", newFakeStore(), noopSender, sequence.WithSequenceBatchSize(0))
+	if err == nil || !strings.Contains(err.Error(), "SequenceBatchSize") {
+		t.Fatalf("err = %v, want the SequenceBatchSize > 0 validation error", err)
 	}
 }
 
 func TestNewRelayRejectsZeroLeaseTTL(t *testing.T) {
-	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithLeaseTTL(0))
-	if err == nil {
-		t.Fatal("expected error for zero LeaseTTL, got nil")
+	_, err := sequence.NewRelay("c", newFakeStore(), noopSender, sequence.WithLeaseTTL(0))
+	if err == nil || !strings.Contains(err.Error(), "LeaseTTL must be > 0") {
+		t.Fatalf("err = %v, want the LeaseTTL > 0 validation error", err)
 	}
 }
 
@@ -106,9 +109,9 @@ func TestNewRelayRejectsRetentionWindowWithoutSweepCadence(t *testing.T) {
 	// A positive RetentionWindow with a zero sweep cadence/batch would make
 	// retention silently non-functional (maybeSweep's `<= 0` guard always
 	// skips it), so it must be rejected at construction time.
-	_, err := sequence.NewRelay("c", newFakeStore(), nil, sequence.WithRetention(24*time.Hour, 0, 0))
-	if err == nil {
-		t.Fatal("expected error for RetentionWindow with zero sweep cadence, got nil")
+	_, err := sequence.NewRelay("c", newFakeStore(), noopSender, sequence.WithRetention(24*time.Hour, 0, 0))
+	if err == nil || !strings.Contains(err.Error(), "RetentionWindow") {
+		t.Fatalf("err = %v, want the RetentionWindow sweep-cadence validation error", err)
 	}
 }
 
@@ -156,7 +159,14 @@ type fakeStore struct {
 	// the Store contract.
 	poisonSeq int64
 
-	seqCalls int // number of SequenceMessages invocations, for loop-count assertions
+	seqCalls  int // number of SequenceMessages invocations, for loop-count assertions
+	listCalls int // number of ListMessages invocations, for did-drain-run assertions
+
+	// Recorded by CommitOffset, so tests can assert the final commit on a
+	// shutdown path goes through a fresh bounded context (deadline set, not
+	// already canceled) instead of the dead run ctx.
+	commitHadDeadline bool
+	commitCtxErr      error
 
 	sweepErr        error
 	sweepCalls      int
@@ -196,6 +206,7 @@ func (s *fakeStore) SequenceMessages(_ context.Context, limit int) (int, error) 
 func (s *fakeStore) ListMessages(_ context.Context, afterSeq int64, limit int) ([]*outbox.Message, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.listCalls++
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -225,9 +236,11 @@ func (s *fakeStore) Offset(_ context.Context, name string) (int64, error) {
 	return s.offsets[name], nil
 }
 
-func (s *fakeStore) CommitOffset(_ context.Context, name string, seq int64) error {
+func (s *fakeStore) CommitOffset(ctx context.Context, name string, seq int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	_, s.commitHadDeadline = ctx.Deadline()
+	s.commitCtxErr = ctx.Err()
 	if s.commitErr != nil {
 		return s.commitErr
 	}
@@ -283,6 +296,13 @@ func (s *fakeStore) snapshotSeqCalls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.seqCalls
+}
+
+// snapshotListCalls reads the ListMessages invocation count under mu.
+func (s *fakeStore) snapshotListCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.listCalls
 }
 
 func (s *fakeStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, _ time.Duration) (bool, error) {
@@ -1072,6 +1092,94 @@ func TestDrainStopsWhenLeadershipLostBetweenPages(t *testing.T) {
 	}
 }
 
+// TestLeadershipLostDuringSequenceSkipsDrainAndSweep proves losing leadership
+// at the sequencer's between-pages renewal stops the WHOLE pass, not just the
+// sequencer loop: a known non-leader must not go on to drain (a full-page
+// duplicate burst against the new leader) or sweep. The pass still ends
+// cleanly — losing leadership is not an error.
+func TestLeadershipLostDuringSequenceSkipsDrainAndSweep(t *testing.T) {
+	st := &revokingLeaderStore{fakeStore: newFakeStore()}
+	st.allowed.Store(1) // RunOnce's opening acquire succeeds; the sequencer's renewal fails
+	for range 4 {
+		st.append(msg(0))
+	}
+	var sent int
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
+
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithSequenceBatchSize(2), sequence.WithStartFromBeginning(),
+		sequence.WithRetention(time.Hour, 1, 100))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if runErr := r.RunOnce(t.Context()); runErr != nil {
+		t.Fatalf("RunOnce = %v, want nil (losing leadership is not an error)", runErr)
+	}
+	if sent != 0 {
+		t.Fatalf("sent = %d, want 0 (drain must not run as a known non-leader)", sent)
+	}
+	if calls := st.snapshotListCalls(); calls != 0 {
+		t.Fatalf("ListMessages called %d times, want 0 (drain must not run as a known non-leader)", calls)
+	}
+	if calls, _ := st.snapshotSweep(); calls != 0 {
+		t.Fatalf("sweepCalls = %d, want 0 (sweep must not run as a known non-leader)", calls)
+	}
+}
+
+// erroringLeaderStore wraps fakeStore's leader lock but makes every
+// TryAcquireLeaderLock call numbered >= failFrom return err, simulating a
+// leader store that starts failing mid-pass and stays down.
+type erroringLeaderStore struct {
+	*fakeStore
+	calls    atomic.Int32
+	failFrom int32
+	err      error
+}
+
+func (s *erroringLeaderStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
+	if s.calls.Add(1) >= s.failFrom {
+		return false, s.err
+	}
+	return s.fakeStore.TryAcquireLeaderLock(ctx, name, holderID, ttl)
+}
+
+// TestRenewalErrorMidDrainEndsPassCleanly proves a between-pages renewal that
+// fails with an I/O ERROR (not just a lost lock) takes the same route as a
+// lost lease: the pass ends cleanly with what is already committed and no
+// further pages are drained. The persistent store error is not swallowed for
+// good — the next tick's opening TryAcquire surfaces it.
+func TestRenewalErrorMidDrainEndsPassCleanly(t *testing.T) {
+	sentinel := errors.New("lock store boom")
+	st := &erroringLeaderStore{fakeStore: newFakeStore(), failFrom: 2, err: sentinel}
+	for range 6 {
+		st.append(msg(0))
+	}
+	var sent int
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
+
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithBatchSize(2), sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	// First pass: the opening acquire (call 1) succeeds; the renewal after
+	// the first full page (call 2) errors — clean stop, one page committed.
+	if runErr := r.RunOnce(t.Context()); runErr != nil {
+		t.Fatalf("RunOnce = %v, want nil (a renewal error ends the pass cleanly)", runErr)
+	}
+	if sent != 2 {
+		t.Fatalf("sent = %d, want 2 (no further pages after the renewal error)", sent)
+	}
+	if off := st.offsets["c"]; off != 2 {
+		t.Fatalf("offset = %d, want 2 (first page committed before the pass ended)", off)
+	}
+	// Next tick: the opening TryAcquire (call 3) surfaces the persistent
+	// leader-store error.
+	if runErr := r.RunOnce(t.Context()); !errors.Is(runErr, sentinel) {
+		t.Fatalf("next RunOnce err = %v, want %v (opening TryAcquire must surface the store error)", runErr, sentinel)
+	}
+}
+
 // TestCancelDuringSendDoesNotPark proves drain's send-failure branch treats a
 // failure with a canceled run ctx as shutdown, not a message fault: no
 // ErrorHandler invocation, no offset advance past the last success.
@@ -1152,6 +1260,15 @@ func TestCancelBetweenSendsStopsLane(t *testing.T) {
 	}
 	if off := st.offsets["c"]; off != 2 {
 		t.Fatalf("offset = %d, want 2 (committed through the last success)", off)
+	}
+	// The final commit runs after the run ctx is already dead: it must go
+	// through commitOffset's fresh bounded context (a real store would fail
+	// the write on the canceled ctx and redeliver the acknowledged sends).
+	if st.commitCtxErr != nil {
+		t.Fatalf("final commit ctx already dead (%v), want a live fresh context", st.commitCtxErr)
+	}
+	if !st.commitHadDeadline {
+		t.Fatal("final commit ctx had no deadline, want a bounded fresh context")
 	}
 }
 
@@ -1279,5 +1396,63 @@ func TestObserveDrainedExcludesParkedMessages(t *testing.T) {
 	}
 	if total != 4 {
 		t.Fatalf("ObserveDrained total = %d, want 4 (parked message must not be counted)", total)
+	}
+}
+
+// fullDrainObserver records every ObserveDrained call's count, age, and more.
+type fullDrainObserver struct {
+	mu     sync.Mutex
+	counts []int
+	ages   []time.Duration
+	mores  []bool
+}
+
+func (o *fullDrainObserver) ObserveDrained(_ string, count int, age time.Duration, more bool) {
+	o.mu.Lock()
+	o.counts = append(o.counts, count)
+	o.ages = append(o.ages, age)
+	o.mores = append(o.mores, more)
+	o.mu.Unlock()
+}
+func (o *fullDrainObserver) ObserveSequenced(string, int) {}
+func (o *fullDrainObserver) ObserveError(string, error)   {}
+
+// TestPoisonOnlyPageObservesDrained proves a page whose decoded prefix is
+// empty but whose poison row is parked still reports ObserveDrained: the pass
+// disposed of a message, so it must not be invisible to the lag/throughput
+// signal. With no decoded row to anchor the lag on, oldestAge is zero; more
+// is true (rows may follow the parked poison).
+func TestPoisonOnlyPageObservesDrained(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg(0))
+	st.poisonSeq = 1
+
+	obs := &fullDrainObserver{}
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning(),
+		sequence.WithObserver(obs),
+		sequence.WithErrorHandler(func(context.Context, *outbox.Message, error) {}))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	obs.mu.Lock()
+	defer obs.mu.Unlock()
+	if len(obs.counts) != 1 {
+		t.Fatalf("ObserveDrained called %d times, want 1 (the poison-only page must be observed; the trailing empty page must not)", len(obs.counts))
+	}
+	if obs.counts[0] != 0 {
+		t.Fatalf("ObserveDrained count = %d, want 0 (the parked poison is not a successful send)", obs.counts[0])
+	}
+	if obs.ages[0] != 0 {
+		t.Fatalf("ObserveDrained oldestAge = %v, want 0 (no decoded row to anchor the lag on)", obs.ages[0])
+	}
+	if !obs.mores[0] {
+		t.Fatal("ObserveDrained more = false, want true (rows may follow the parked poison)")
+	}
+	if off := st.offsets["c"]; off != 1 {
+		t.Fatalf("offset = %d, want 1 (advanced past the parked poison row)", off)
 	}
 }

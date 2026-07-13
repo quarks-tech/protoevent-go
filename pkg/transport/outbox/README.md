@@ -11,11 +11,9 @@ This package implements a **sequenced-log** design: the outbox table is an
 append-only log, a leader-elected sequencer pass assigns a dense, gapless offset
 (`seq`) to committed rows after the fact (so a transaction that started earlier but
 committed later can never be skipped), and one or more relays drain the log in
-`seq` order per consumer group. See the full design docs for the rationale, schema,
-and race analysis:
-
-- [`docs/design/outbox-sequenced-log.md`](../../../docs/design/outbox-sequenced-log.md) — TiDB sequenced-log relay (this package's reference runtime).
-- [`docs/design/outbox-mongodb-changestream.md`](../../../docs/design/outbox-mongodb-changestream.md) — MongoDB companion design (change-stream tail, no sequencer needed).
+`seq` order per consumer group. This README is the design reference: rationale and
+guarantees live in the sections below, schema in the store modules' migrations and
+godoc.
 
 ## Package layout
 
@@ -89,6 +87,23 @@ avoidance and identity preservation come for free together. Pass
 generator. One fidelity caveat: stores persist metadata as JSON, so numeric
 extension values round-trip as `float64` (encode exact numeric types as
 strings).
+
+## Schema (TiDB)
+
+The `tidb` module embeds its schema as golang-migrate-compatible migrations
+(`tidb.Migrations`, an `embed.FS` over `tidb/migrations/`). Apply them once
+before publishing or relaying — the migration creates the `outbox_messages`,
+`outbox_sequencers`, `outbox_offsets`, and `relay_locks` tables and seeds the
+sequencer counter row:
+
+```go
+src, _ := iofs.New(tidb.Migrations, "migrations") // migrate/v4/source/iofs
+drv, _ := mysql.WithInstance(db, &mysql.Config{}) // migrate/v4/database/mysql
+m, _ := migrate.NewWithInstance("iofs", src, "mysql", drv)
+if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+    log.Fatal(err)
+}
+```
 
 ## Relaying
 
@@ -181,11 +196,10 @@ two coincide — to get effectively-once processing.
 `pkg/transport/outbox/relay/stream` is the second relay runtime, a sibling of
 `relay/sequence` that reuses the same shared `relay` primitives (`Observer`,
 `ErrorHandler`, `LeaderStore`). Instead of a leader-elected sequencer pass over a
-polled table, it tails a MongoDB **change stream** on the insert-only `outbox`
+polled table, it tails a MongoDB **change stream** on the insert-only `outbox_messages`
 collection: MongoDB's oplog already gives a total, gapless commit order, so no
-sequencer is needed. See
-[`docs/design/outbox-mongodb-changestream.md`](../../../docs/design/outbox-mongodb-changestream.md)
-for the full design — schema, lifecycle, and the resume-token cliff analysis.
+sequencer is needed. The lifecycle and resume-token cliff analysis are covered
+in the sections below.
 
 `pkg/transport/outbox/mongodb` is the reference `stream.Store` + publish
 implementation over `*mongo.Database` (its own Go module, since it pulls in
@@ -236,8 +250,8 @@ carries exactly the ID the publisher assigned.
 
 `stream.NewRelay` builds a relay for one named consumer group over a
 `stream.Store` (`LoadToken`/`SaveToken`/`Watch`, all `string` resume
-tokens — see the design doc §8.2 for why the boundary is `string` rather than
-the driver's `bson.Raw`). It errors if `name` is empty, if `DrainWindow`,
+tokens — `string` rather than the driver's `bson.Raw` keeps the runtime
+driver-free and the token immutable and comparable). It errors if `name` is empty, if `DrainWindow`,
 `LeaseTTL`, or `TokenBatchSize` is not strictly positive, or if
 `DrainWindow >= LeaseTTL/2`, since the leader lease must be renewable within a
 single drain window. As with the sequence runtime, a `Relay` is not safe for
@@ -289,8 +303,8 @@ messages.
 
 - **StartNow-only, no replay.** A consumer group with no stored token starts
   at "now" (no `resumeAfter`); there is currently no way to replay from the
-  beginning of the outbox. This is a deliberate scope cut (design §7/§11),
-  not a limitation of the change stream itself.
+  beginning of the outbox. This is a deliberate scope cut, not a limitation
+  of the change stream itself.
 - **Commit-order delivery**, per the single stream: causal order is preserved
   (a transaction that committed later is never delivered ahead of one that
   committed earlier), equivalent to one Kafka partition. As with the TiDB
@@ -300,10 +314,10 @@ messages.
 - **The resume-token cliff.** A relay that falls behind the oplog's retention
   window gets `ErrHistoryLost` (fatal — MongoDB's `ChangeStreamHistoryLost`)
   instead of resuming. This is handled with lag alerting on the committed
-  token's age plus a break-glass runbook (design §7), not automatic replay.
+  token's age plus a break-glass runbook, not automatic replay.
   Operators **must** size the deployment so that **outbox TTL (default 7
   days, `mongodb.WithRetention`) > oplog window > consumer-downtime SLO**
-  (design §7) and alert on
+  and alert on
   committed-token age well before it approaches the oplog window, so the
   cliff should never fire in practice.
 

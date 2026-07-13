@@ -34,8 +34,12 @@ var ErrHistoryLost = errors.New("stream: change stream history lost (resume toke
 // so a relay with an ErrorHandler can park the event and keep the lane moving;
 // without one the lane stops (at-least-once, order preserved).
 type DecodeError struct {
-	ID          string // event_id if extractable, else ""
-	ResumeToken string // token of the poison event — the relay resumes past it
+	ID string // event_id if extractable, else ""
+	// ResumeToken is the poison event's token — the relay resumes past it.
+	// Extraction is best-effort: "" makes the event non-parkable (the lane
+	// stops instead; parking would later persist the empty token and erase
+	// the group's position).
+	ResumeToken string
 	ClusterTime time.Time
 	Err         error
 }
@@ -115,7 +119,7 @@ type Options struct {
 	LeaderLockName string // defaults to the relay name
 	TokenBatchSize int    // max events processed before a forced token persist
 
-	Logger       *slog.Logger
+	Logger       *slog.Logger // defaults to a discard logger
 	Observer     relay.Observer
 	ErrorHandler relay.ErrorHandler
 }
@@ -134,10 +138,17 @@ func DefaultOptions() Options {
 // Option configures Options.
 type Option func(*Options)
 
+// WithDrainWindow sets the drain window — the single latency knob (see Options.DrainWindow).
 func WithDrainWindow(d time.Duration) Option { return func(o *Options) { o.DrainWindow = d } }
-func WithLeaseTTL(d time.Duration) Option    { return func(o *Options) { o.LeaseTTL = d } }
-func WithLeaderLockName(s string) Option     { return func(o *Options) { o.LeaderLockName = s } }
-func WithTokenBatchSize(n int) Option        { return func(o *Options) { o.TokenBatchSize = n } }
+
+// WithLeaseTTL sets the leader-lease TTL.
+func WithLeaseTTL(d time.Duration) Option { return func(o *Options) { o.LeaseTTL = d } }
+
+// WithLeaderLockName overrides the leader-lock name (defaults to the relay name).
+func WithLeaderLockName(s string) Option { return func(o *Options) { o.LeaderLockName = s } }
+
+// WithTokenBatchSize sets the max events processed before a forced token persist.
+func WithTokenBatchSize(n int) Option { return func(o *Options) { o.TokenBatchSize = n } }
 
 // WithLogger sets the error logger. A nil logger is ignored.
 func WithLogger(l *slog.Logger) Option {
@@ -198,16 +209,16 @@ type Relay struct {
 // mid-window. At-least-once still holds (the consumer's event_id dedup
 // absorbs the overlap), but the single-active-consumer property weakens.
 // Operators should size TokenBatchSize x worst-case Sender.Send latency <
-// LeaseTTL to keep a window inside one lease term (see design doc §8.2).
+// LeaseTTL to keep a window inside one lease term.
 func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) (*Relay, error) {
 	if name == "" {
-		return nil, fmt.Errorf("stream: name must not be empty")
+		return nil, errors.New("stream: name must not be empty (it keys the offset/token row and is the default leader-lock name)")
 	}
 	if store == nil {
-		return nil, fmt.Errorf("stream: store must not be nil")
+		return nil, errors.New("stream: store must not be nil")
 	}
 	if sender == nil {
-		return nil, fmt.Errorf("stream: sender must not be nil")
+		return nil, errors.New("stream: sender must not be nil")
 	}
 
 	options := DefaultOptions()

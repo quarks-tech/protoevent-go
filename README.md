@@ -26,9 +26,12 @@ For RabbitMQ transport:
 go get github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq
 ```
 
-For Transactional Outbox transport:
+For Transactional Outbox transport (the engine plus the store backend you use —
+each is its own module):
 ```bash
 go get github.com/quarks-tech/protoevent-go/pkg/transport/outbox
+go get github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb     # TiDB store
+go get github.com/quarks-tech/protoevent-go/pkg/transport/outbox/mongodb  # MongoDB store
 ```
 
 ## Usage
@@ -354,10 +357,8 @@ not exactly-once: consumers **must** dedup on the event's CloudEvents
 processing.
 
 See [`pkg/transport/outbox/README.md`](pkg/transport/outbox/README.md) for
-the full guide (package layout, ordering guarantees, benchmarks), and
-[`docs/design/outbox-sequenced-log.md`](docs/design/outbox-sequenced-log.md) /
-[`docs/design/outbox-mongodb-changestream.md`](docs/design/outbox-mongodb-changestream.md)
-for the design rationale and race analysis.
+the full guide (package layout, ordering guarantees, design rationale,
+benchmarks).
 
 ## License
 

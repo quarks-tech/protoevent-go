@@ -4,6 +4,7 @@ package sequence
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -97,7 +98,7 @@ type Options struct {
 	LeaseTTL          time.Duration
 	LeaderLockName    string // defaults to the relay name
 
-	SequencerDisabled bool
+	SequencerDisabled bool // disables this relay's sequencer pass (see WithoutSequencer)
 
 	// StartFromBeginning makes a NEW consumer group replay the retained log
 	// from the start instead of the default "latest" (future events only —
@@ -129,11 +130,20 @@ func DefaultOptions() Options {
 // Option configures relay options.
 type Option func(*Options)
 
-func WithBatchSize(size int) Option           { return func(o *Options) { o.BatchSize = size } }
-func WithSequenceBatchSize(size int) Option   { return func(o *Options) { o.SequenceBatchSize = size } }
+// WithBatchSize sets the drain page size (messages listed and sent per page).
+func WithBatchSize(size int) Option { return func(o *Options) { o.BatchSize = size } }
+
+// WithSequenceBatchSize sets the sequencer page size (rows assigned per pass).
+func WithSequenceBatchSize(size int) Option { return func(o *Options) { o.SequenceBatchSize = size } }
+
+// WithPollInterval sets the tick interval between relay passes.
 func WithPollInterval(d time.Duration) Option { return func(o *Options) { o.PollInterval = d } }
-func WithLeaseTTL(ttl time.Duration) Option   { return func(o *Options) { o.LeaseTTL = ttl } }
-func WithLeaderLockName(name string) Option   { return func(o *Options) { o.LeaderLockName = name } }
+
+// WithLeaseTTL sets the leader-lease TTL.
+func WithLeaseTTL(ttl time.Duration) Option { return func(o *Options) { o.LeaseTTL = ttl } }
+
+// WithLeaderLockName overrides the leader-lock name (defaults to the relay name).
+func WithLeaderLockName(name string) Option { return func(o *Options) { o.LeaderLockName = name } }
 
 // WithoutSequencer disables this relay's sequencer pass. When several consumer
 // groups share one store, run the sequencer in exactly one relay and configure
@@ -215,6 +225,7 @@ type Relay struct {
 //
 //   - name is empty: name is the offset-row key and the default leader-lock
 //     name, so two empty-named relays would silently share both;
+//   - store or sender is nil;
 //   - PollInterval, BatchSize, SequenceBatchSize, or LeaseTTL is not strictly
 //     positive: a zero PollInterval panics inside time.NewTicker, and a zero
 //     BatchSize or SequenceBatchSize would silently stall the relay;
@@ -232,13 +243,13 @@ type Relay struct {
 // relay and configure the others with WithoutSequencer() — see its doc.
 func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) (*Relay, error) {
 	if name == "" {
-		return nil, fmt.Errorf("sequence: name must not be empty (it is the offset-row key and the default leader-lock name)")
+		return nil, errors.New("sequence: name must not be empty (it is the offset-row key and the default leader-lock name)")
 	}
 	if store == nil {
-		return nil, fmt.Errorf("sequence: store must not be nil")
+		return nil, errors.New("sequence: store must not be nil")
 	}
 	if sender == nil {
-		return nil, fmt.Errorf("sequence: sender must not be nil")
+		return nil, errors.New("sequence: sender must not be nil")
 	}
 
 	options := DefaultOptions()

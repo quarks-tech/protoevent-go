@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strings"
@@ -66,6 +67,11 @@ func TestMain(m *testing.M) {
 	inst, cleanup, err := tidbtest.Start(context.Background())
 	if err != nil {
 		if errors.Is(err, tidbtest.ErrDockerUnavailable) {
+			// In CI a broken Docker daemon must fail the module loudly — an
+			// exit 0 here would silently pass the whole integration suite.
+			if os.Getenv("CI") != "" {
+				log.Fatalf("tidb integration tests require Docker in CI: %v", err)
+			}
 			fmt.Fprintf(os.Stderr, "skipping tidb integration tests: %v\n", err)
 			os.Exit(0)
 		}
@@ -83,8 +89,8 @@ func TestMain(m *testing.M) {
 func truncate(t testing.TB) {
 	t.Helper()
 	for _, q := range []string{
-		"DELETE FROM outbox", "DELETE FROM outbox_offsets", "DELETE FROM relay_lock",
-		"UPDATE outbox_sequencer SET next_seq = 1 WHERE name = 'default'",
+		"DELETE FROM outbox_messages", "DELETE FROM outbox_offsets", "DELETE FROM relay_locks",
+		"UPDATE outbox_sequencers SET next_seq = 1 WHERE name = 'default'",
 	} {
 		if _, err := testDB.Exec(q); err != nil {
 			t.Fatalf("reset (%s): %v", q, err)
@@ -143,7 +149,7 @@ func TestPublishInsertsUnsequencedRow(t *testing.T) {
 	publish(t, "s1")
 
 	var nullCount int
-	if err := testDB.QueryRow("SELECT COUNT(*) FROM outbox WHERE seq IS NULL AND tx_start_ts > 0").Scan(&nullCount); err != nil {
+	if err := testDB.QueryRow("SELECT COUNT(*) FROM outbox_messages WHERE seq IS NULL AND tx_start_ts > 0").Scan(&nullCount); err != nil {
 		t.Fatal(err)
 	}
 	if nullCount != 1 {
@@ -167,7 +173,7 @@ func TestSequenceAssignsDenseContiguousSeq(t *testing.T) {
 	if n != 5 {
 		t.Fatalf("sequenced %d, want 5", n)
 	}
-	rows, err := testDB.Query("SELECT seq FROM outbox ORDER BY seq")
+	rows, err := testDB.Query("SELECT seq FROM outbox_messages ORDER BY seq")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +226,7 @@ func TestConcurrentSequencersNoDuplicateNoGap(t *testing.T) {
 
 	// Assert seq is exactly 1..200 with no dup and no gap.
 	var count, minSeq, maxSeq, distinct int64
-	if err := testDB.QueryRow("SELECT COUNT(*), MIN(seq), MAX(seq), COUNT(DISTINCT seq) FROM outbox").
+	if err := testDB.QueryRow("SELECT COUNT(*), MIN(seq), MAX(seq), COUNT(DISTINCT seq) FROM outbox_messages").
 		Scan(&count, &minSeq, &maxSeq, &distinct); err != nil {
 		t.Fatal(err)
 	}
@@ -280,6 +286,52 @@ func TestLeaderLockMutualExclusionAndRelease(t *testing.T) {
 	}
 	if !okB2 {
 		t.Fatal("B failed to acquire after A released")
+	}
+}
+
+// TestLeaderLockExpiredLeaseTakeover proves a standby takes over once the
+// lease expires — the `expire_time < NOW(6)` branch of TryAcquireLeaderLock's
+// upsert, which the restart test bypasses via a manual DELETE. Expiry is
+// decided by the SERVER clock (NOW(6)), the same clock that stamped the
+// deadline, so the takeover works regardless of skew between relay instances'
+// local clocks.
+func TestLeaderLockExpiredLeaseTakeover(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+	st := tidb.NewRelayStore(testDB)
+	ctx := context.Background()
+
+	const shortTTL = 300 * time.Millisecond
+	okA, err := st.TryAcquireLeaderLock(ctx, "lock", "A", shortTTL)
+	if err != nil || !okA {
+		t.Fatalf("A acquire = %v, %v; want true", okA, err)
+	}
+	// B is denied while A's lease is live.
+	okB, err := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if okB {
+		t.Fatal("B acquired while A's lease is still live")
+	}
+	// Wait out A's lease with a generous margin (3x TTL), then B must win.
+	time.Sleep(3 * shortTTL)
+	okB2, err := st.TryAcquireLeaderLock(ctx, "lock", "B", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !okB2 {
+		t.Fatal("B failed to take over an expired lease")
+	}
+	// And A, whose lease B replaced, must now be denied.
+	okA2, err := st.TryAcquireLeaderLock(ctx, "lock", "A", 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if okA2 {
+		t.Fatal("A re-acquired while B holds a live lease")
 	}
 }
 
@@ -371,7 +423,7 @@ func TestCreateOutboxMessageRejectsAutocommit(t *testing.T) {
 	}
 
 	var count int
-	if err := testDB.QueryRow("SELECT COUNT(*) FROM outbox").Scan(&count); err != nil {
+	if err := testDB.QueryRow("SELECT COUNT(*) FROM outbox_messages").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
@@ -405,7 +457,7 @@ func TestListMessagesPoisonRowReturnsPrefixAndDecodeError(t *testing.T) {
 
 	// Corrupt the middle row: '[]' passes the JSON column's validity check but
 	// cannot decode into event.Metadata.
-	if _, err := testDB.Exec("UPDATE outbox SET metadata = '[]' WHERE seq = 2"); err != nil {
+	if _, err := testDB.Exec("UPDATE outbox_messages SET metadata = '[]' WHERE seq = 2"); err != nil {
 		t.Fatalf("corrupt row: %v", err)
 	}
 

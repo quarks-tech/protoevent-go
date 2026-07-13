@@ -8,12 +8,12 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 )
 
-// closeTimeout bounds Stream.Close on a fresh context.Background():
-// closeStream runs on shutdown paths where the run ctx may already be
-// canceled (killCursors would never be delivered on a dead context), so the
-// close gets its own bounded context — mirroring relay/leader.go's
+// shutdownTimeout bounds shutdown-path store I/O (closeStream's Stream.Close,
+// saveToken's final persist) on a fresh context.Background(): those paths run
+// where the run ctx may already be canceled, and a killCursors or token save
+// on a dead context would never be delivered — mirroring relay/leader.go's
 // releaseTimeout pattern.
-const closeTimeout = 5 * time.Second
+const shutdownTimeout = 5 * time.Second
 
 // errLaneStopped signals that drainWindow stopped the lane (send failure or
 // planned shutdown) and closed the stream so the next RunOnce reopens and
@@ -43,7 +43,7 @@ func (r *Relay) Run(ctx context.Context) error {
 		case errors.Is(err, ErrStreamInvalidated), errors.Is(err, ErrHistoryLost):
 			// Fatal: report and stop. The deferred closeStream releases the cursor.
 			r.options.Observer.ObserveError(r.name, err)
-			r.options.Logger.Error("stream relay stopped on fatal stream error", "relay", r.name, "err", err)
+			r.options.Logger.Error("stream relay: fatal stream error", "relay", r.name, "err", err)
 			return err
 		case ctx.Err() != nil:
 			// Planned shutdown (ctx is genuinely done): the ctx.Err() check at
@@ -57,7 +57,7 @@ func (r *Relay) Run(ctx context.Context) error {
 		default:
 			// transient (leadership, reopen, send/save): report, drop the stream, retry
 			r.options.Observer.ObserveError(r.name, err)
-			r.options.Logger.Error("stream relay pass failed", "relay", r.name, "err", err)
+			r.options.Logger.Error("stream relay: pass failed", "relay", r.name, "err", err)
 			r.closeStream()
 			r.sleep(ctx)
 		}
@@ -126,16 +126,30 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		e, ok, err := r.stream.Next(ctx)
 		if err != nil {
 			var de *DecodeError
-			if errors.As(err, &de) && r.options.ErrorHandler != nil && ctx.Err() == nil {
+			if errors.As(err, &de) && de.ResumeToken != "" && r.options.ErrorHandler != nil && ctx.Err() == nil {
 				// Poison event: park it and resume past it, keeping the lane
-				// moving. Without an ErrorHandler the error falls through below
-				// and stops the lane without advancing past the event
+				// moving. Requires the event's resume token: extraction is
+				// best-effort, and an empty one is non-parkable — advancing
+				// with it would later persist "" and erase the group's
+				// position (restart "at now", silently skipping events).
+				// Without a token or an ErrorHandler the error falls through
+				// below and stops the lane without advancing past the event
 				// (at-least-once, order preserved).
 				r.handleError(ctx, &outbox.Message{ID: de.ID}, err)
 				lastTok, lastCT = de.ResumeToken, de.ClusterTime
 				advanced = true
 				handled++
 				continue
+			}
+			// Non-parkable Next error: persist the sent prefix's position
+			// first (the same save the send-failure stop path gets via
+			// `case advanced:` below), so Run's close/reopen/backoff resumes
+			// after the last success — at the poison — instead of re-sending
+			// the prefix every DrainWindow.
+			if advanced {
+				if saveErr := r.saveToken(ctx, lastTok, lastCT); saveErr != nil {
+					return saveErr
+				}
 			}
 			return err
 		}
@@ -171,7 +185,7 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		}
 	case !stopped:
 		// Empty window: persist PBRT so a caught-up-connected consumer stays
-		// resumable and the lag anchor stays fresh (design §6c). Skip the write
+		// resumable and the lag anchor stays fresh. Skip the write
 		// when the token is unchanged since the last save (an idle stream would
 		// otherwise persist the same position every DrainWindow) — the lag
 		// bookkeeping still advances locally.
@@ -191,9 +205,11 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		// A change-stream cursor cannot rewind, so to actually redeliver the
 		// failed event we must reopen from the last-persisted token. Close the
 		// stream (next RunOnce reopens via LoadToken+Watch) and signal Run to
-		// back off. Persisted state is already correct: an advanced window saved
-		// the last success (reopen resumes just after it, at the failed event);
-		// a non-advanced one saved nothing (reopen resumes from the prior token).
+		// back off. An advanced window persisted the last success above (on
+		// shutdown, through saveToken's fresh bounded context — the run ctx is
+		// already dead there), so the reopen resumes just after it, at the
+		// failed event; a non-advanced one saved nothing (reopen resumes from
+		// the prior token).
 		r.closeStream()
 		return errLaneStopped
 	}
@@ -201,8 +217,17 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 }
 
 // saveToken persists the position and updates the local trackers used for
-// no-op-save skipping and lag reporting.
+// no-op-save skipping and lag reporting. When the run ctx is already canceled
+// (the final save on a planned shutdown), the store call gets a fresh bounded
+// context instead: a real store fails writes on a dead context, and losing
+// that save would redeliver up to TokenBatchSize-1 acknowledged sends per
+// deploy. Behavior on a live ctx is unchanged.
 func (r *Relay) saveToken(ctx context.Context, tok string, ct time.Time) error {
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+	}
 	if err := r.store.SaveToken(ctx, r.name, tok, ct); err != nil {
 		return err
 	}
@@ -212,7 +237,7 @@ func (r *Relay) saveToken(ctx context.Context, tok string, ct time.Time) error {
 }
 
 // committedTokenAge is the cliff proxy: how far the committed token trails the
-// oplog head (design §7). Cheap — no query.
+// oplog head — the resume-token-cliff early-warning signal. Cheap — no query.
 func (r *Relay) committedTokenAge() time.Duration {
 	if r.committedCT.IsZero() {
 		return 0
@@ -228,7 +253,7 @@ func (r *Relay) closeStream() {
 	if r.stream == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	_ = r.stream.Close(ctx)
 	r.stream = nil
@@ -248,5 +273,5 @@ func (r *Relay) handleError(ctx context.Context, msg *outbox.Message, err error)
 		r.options.ErrorHandler(ctx, msg, err)
 	}
 	r.options.Observer.ObserveError(r.name, err)
-	r.options.Logger.Error("stream relay failed to forward message", "relay", r.name, "event_id", msg.ID, "err", err)
+	r.options.Logger.Error("stream relay: message failed", "relay", r.name, "event_id", msg.ID, "err", err)
 }

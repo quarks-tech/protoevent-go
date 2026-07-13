@@ -1,3 +1,9 @@
+// Package tidb is the TiDB-backed outbox store: a transaction-scoped publish
+// Store (NewStore) that commits outbox rows atomically with business writes,
+// and a pool-backed RelayStore (NewRelayStore) implementing the relay and
+// relay/sequence store contracts (read/offset, sequencer, retention sweep,
+// leader election). Schema migrations are embedded as Migrations (see
+// migrations/).
 package tidb
 
 import (
@@ -50,10 +56,12 @@ func NewStore(r Runner) *Store { return &Store{r: r} }
 var _ outbox.Store = (*Store)(nil)
 
 // RelayStore is the pool-backed relay store: it embeds a publish-side Store
-// (built over db, so it can also publish) plus everything the relay
-// runtimes need — read/offset, the sequencer, the retention sweep, and leader
-// election. These all manage their own transactions against the pool, so they
-// require a *sql.DB rather than a transaction-scoped Runner.
+// (struct reuse only — the embedded Store runs over the autocommit pool, where
+// CreateOutboxMessage always fails; publishing requires a tx-scoped Store, see
+// NewStore) plus everything the relay runtimes need — read/offset, the
+// sequencer, the retention sweep, and leader election. These all manage their
+// own transactions against the pool, so they require a *sql.DB rather than a
+// transaction-scoped Runner.
 type RelayStore struct {
 	*Store
 	db *sql.DB
@@ -98,22 +106,22 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 	if err != nil {
 		return fmt.Errorf("outbox: marshal metadata: %w", err)
 	}
-	// occurred_at is kept as a queryable/indexable event-time column for
+	// occur_time is kept as a queryable/indexable event-time column for
 	// operators and future event-time features; the engine itself reads event
 	// time from the metadata JSON, and retention (SweepMessages) is
-	// create_time-anchored, not occurred_at-anchored.
+	// create_time-anchored, not occur_time-anchored.
 	//
 	// NULLIF(@@tidb_current_ts, 0): on an autocommit connection the variable
 	// reads 0, and a 0 tx_start_ts would silently sort the row before every
 	// transactional row in a sequencer batch. NULLIF turns that 0 into NULL so
 	// the NOT NULL column rejects the row loudly instead.
 	_, err = s.r.ExecContext(ctx, `
-INSERT INTO outbox (seq, tx_start_ts, event_id, metadata, data, create_time, occurred_at)
+INSERT INTO outbox_messages (seq, tx_start_ts, event_id, metadata, data, create_time, occur_time)
 VALUES (NULL, NULLIF(@@tidb_current_ts, 0), ?, ?, ?, ?, ?)`,
 		id[:], meta, m.Data, m.CreateTime, md.Time.UTC(),
 	)
 	if err != nil {
-		if strings.Contains(err.Error(), "tx_start_ts") {
+		if isNullColumn(err, "tx_start_ts") {
 			return fmt.Errorf("outbox: CreateOutboxMessage must run inside a transaction (tx_start_ts is only available on transactional connections): %w", err)
 		}
 		return fmt.Errorf("outbox: insert: %w", err)
@@ -128,7 +136,7 @@ VALUES (NULL, NULLIF(@@tidb_current_ts, 0), ?, ?, ?, ?, ?)`,
 func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit int) ([]*outbox.Message, error) {
 	rows, err := rs.db.QueryContext(ctx, `
 SELECT seq, event_id, metadata, data, create_time
-FROM outbox
+FROM outbox_messages
 WHERE seq > ?
 ORDER BY seq
 LIMIT ?`, afterSeq, limit)
@@ -218,7 +226,7 @@ ON DUPLICATE KEY UPDATE
 func (rs *RelayStore) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
 	_, err := rs.db.ExecContext(ctx, `
 INSERT INTO outbox_offsets (name, last_seq, update_time)
-SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM outbox`, name)
+SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM outbox_messages`, name)
 	if err != nil && !isDuplicateKey(err) {
 		return 0, fmt.Errorf("outbox: init offset latest: %w", err)
 	}
@@ -235,6 +243,15 @@ SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM outbox`, name)
 func isDuplicateKey(err error) bool {
 	var me *mysql.MySQLError
 	return errors.As(err, &me) && me.Number == 1062
+}
+
+// isNullColumn reports whether err is MySQL/TiDB ER_BAD_NULL_ERROR (1048,
+// "Column '<col>' cannot be null") on the named column. The number alone is
+// not enough — any NOT NULL column raises 1048 (e.g. a nil Data on the data
+// column), so the message is matched for the specific column too.
+func isNullColumn(err error, col string) bool {
+	var me *mysql.MySQLError
+	return errors.As(err, &me) && me.Number == 1048 && strings.Contains(me.Message, col)
 }
 
 // DeleteOffset removes the named consumer group's offset row. It is the
@@ -261,7 +278,7 @@ func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, err
 	// row every PollInterval per relay. Racing a freshly committed row merely
 	// defers it one tick — the same cadence the poll already imposes.
 	var one int
-	err := rs.db.QueryRowContext(ctx, `SELECT 1 FROM outbox WHERE seq IS NULL LIMIT 1`).Scan(&one)
+	err := rs.db.QueryRowContext(ctx, `SELECT 1 FROM outbox_messages WHERE seq IS NULL LIMIT 1`).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -277,7 +294,7 @@ func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, err
 
 	var next int64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT next_seq FROM outbox_sequencer WHERE name = 'default' FOR UPDATE`,
+		`SELECT next_seq FROM outbox_sequencers WHERE name = 'default' FOR UPDATE`,
 	).Scan(&next); err != nil {
 		return 0, fmt.Errorf("outbox: lock sequencer: %w", err)
 	}
@@ -290,11 +307,11 @@ func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, err
 	// the TopN is pushed into TiKV and only the page reaches the root, where
 	// the window numbers just those rows.
 	res, err := tx.ExecContext(ctx, `
-UPDATE outbox o
+UPDATE outbox_messages o
 JOIN (
     SELECT id, ROW_NUMBER() OVER (ORDER BY tx_start_ts, id) AS rn
     FROM (
-        SELECT id, tx_start_ts FROM outbox
+        SELECT id, tx_start_ts FROM outbox_messages
         WHERE seq IS NULL
         ORDER BY tx_start_ts, id
         LIMIT ?
@@ -311,7 +328,7 @@ SET o.seq = ? + b.rn - 1`, limit, next)
 
 	if assigned > 0 {
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE outbox_sequencer SET next_seq = ? WHERE name = 'default'`, next+assigned,
+			`UPDATE outbox_sequencers SET next_seq = ? WHERE name = 'default'`, next+assigned,
 		); err != nil {
 			return 0, fmt.Errorf("outbox: bump sequencer: %w", err)
 		}
@@ -327,7 +344,7 @@ SET o.seq = ? + b.rn - 1`, limit, next)
 // the lock is free (expired) or already theirs. TTL is applied via DB clock.
 func (rs *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
 	if _, err := rs.db.ExecContext(ctx, `
-INSERT INTO relay_lock (name, holder_id, expire_time)
+INSERT INTO relay_locks (name, holder_id, expire_time)
 VALUES (?, ?, NOW(6) + INTERVAL ? MICROSECOND)
 ON DUPLICATE KEY UPDATE
     holder_id   = IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), VALUES(holder_id), holder_id),
@@ -339,7 +356,7 @@ ON DUPLICATE KEY UPDATE
 
 	var holder string
 	if err := rs.db.QueryRowContext(ctx,
-		`SELECT holder_id FROM relay_lock WHERE name = ?`, name,
+		`SELECT holder_id FROM relay_locks WHERE name = ?`, name,
 	).Scan(&holder); err != nil {
 		return false, fmt.Errorf("outbox: read lock holder: %w", err)
 	}
@@ -349,7 +366,7 @@ ON DUPLICATE KEY UPDATE
 // ReleaseLeaderLock drops the lock if still held by holderID.
 func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
 	_, err := rs.db.ExecContext(ctx,
-		`DELETE FROM relay_lock WHERE name = ? AND holder_id = ?`, name, holderID)
+		`DELETE FROM relay_locks WHERE name = ? AND holder_id = ?`, name, holderID)
 	if err != nil {
 		return fmt.Errorf("outbox: release lock: %w", err)
 	}
@@ -373,7 +390,7 @@ func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID stri
 // Decommission a retired consumer group with DeleteOffset to unpin retention.
 func (rs *RelayStore) SweepMessages(ctx context.Context, before time.Time, limit int) (int, error) {
 	res, err := rs.db.ExecContext(ctx, `
-DELETE FROM outbox
+DELETE FROM outbox_messages
 WHERE seq IS NOT NULL
   AND seq <= (SELECT MIN(last_seq) FROM outbox_offsets)
   AND create_time < ?

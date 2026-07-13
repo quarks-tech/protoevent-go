@@ -57,7 +57,7 @@ func BenchmarkWatchDrainRead(b *testing.B) {
 	}
 
 	for b.Loop() {
-		cur, err := testDB.Collection("outbox").Find(ctx, bson.M{})
+		cur, err := testDB.Collection("outbox_messages").Find(ctx, bson.M{})
 		if err != nil {
 			b.Fatalf("find: %v", err)
 		}

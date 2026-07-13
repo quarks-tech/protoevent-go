@@ -19,12 +19,12 @@ import (
 )
 
 const (
-	outboxCollection  = "outbox"
+	outboxCollection  = "outbox_messages"
 	offsetsCollection = "outbox_offsets"
-	lockCollection    = "relay_lock"
+	lockCollection    = "relay_locks"
 
 	// defaultRetention is the default outbox TTL; MUST exceed the oplog window
-	// (design §7). Override with WithRetention.
+	// (see the README's resume-token-cliff sizing rule). Override with WithRetention.
 	defaultRetention = 7 * 24 * time.Hour
 
 	// indexOptionsConflictCode is the MongoDB server error code for
@@ -63,7 +63,7 @@ type Store struct {
 type Option func(*Store)
 
 // WithRetention sets the outbox TTL applied by EnsureIndexes. Default 7 days;
-// it MUST exceed the oplog window (design §7). A non-positive d is ignored
+// it MUST exceed the oplog window (see the README's resume-token-cliff sizing rule). A non-positive d is ignored
 // (mirrors WithLogger/WithObserver's nil-guard style elsewhere in this
 // codebase), leaving the default (or a prior option's value) intact.
 //
@@ -158,16 +158,30 @@ func (s *Store) LoadToken(ctx context.Context, name string) (string, time.Time, 
 // SaveToken upserts the consumer group's resume token + clusterTime. token is
 // the opaque resume token as a string; it is stored as BSON binary bytes.
 //
+// token must be non-empty: LoadToken maps "" to "no stored position", so an
+// empty-token save would ERASE the group's persisted position (the next Watch
+// restarts "at now", silently skipping every event in between). The store
+// rejects it with an error rather than trusting every caller to guard.
+//
 // The save is monotone in clusterTime (per the stream.Store contract): the
 // filter only matches a stored row whose cluster_time <= the incoming one, so
 // a stale leader finishing a slow window cannot rewind a newer position. When
 // the stored row is newer, the filter matches nothing and the upsert attempts
 // an insert, which hits the _id unique index — that duplicate-key error MEANS
 // "stored token is newer" and the stale save is deliberately swallowed as a
-// no-op.
+// no-op. A stored row LACKING cluster_time (never written by this package;
+// external tampering or manual repair) also matches, so a legacy/damaged row
+// is healed by the next save instead of freezing the token forever behind the
+// same swallowed duplicate-key path.
 func (s *Store) SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) error {
+	if token == "" {
+		return fmt.Errorf("outbox: save token: empty resume token for group %q; an empty token is never a valid position (it would erase the stored one)", name)
+	}
 	_, err := s.db.Collection(offsetsCollection).UpdateOne(ctx,
-		bson.M{"_id": name, "cluster_time": bson.M{"$lte": clusterTime.UTC()}},
+		bson.M{"_id": name, "$or": bson.A{
+			bson.M{"cluster_time": bson.M{"$lte": clusterTime.UTC()}},
+			bson.M{"cluster_time": bson.M{"$exists": false}},
+		}},
 		bson.M{"$set": bson.M{
 			"resume_token": []byte(token),
 			"cluster_time": clusterTime.UTC(),
@@ -205,12 +219,15 @@ func (s *Store) TryAcquireLeaderLock(ctx context.Context, name, holderID string,
 	// it (and the upsert path copies it from the filter), so setting it too is
 	// redundant (and would be fragile if it ever diverged). $$NOW is a Date;
 	// expire_time stays a Date, with ttl added as milliseconds.
+	// A sub-millisecond ttl truncates to 0ms — a lease born expired (silent
+	// dual-leader churn) — so clamp to at least 1ms.
+	millis := max(ttl.Milliseconds(), 1)
 	update := mongo.Pipeline{
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "holder_id", Value: bson.D{{Key: "$cond", Value: bson.A{canTake, holderID, "$holder_id"}}}},
 			{Key: "expire_time", Value: bson.D{{Key: "$cond", Value: bson.A{
 				canTake,
-				bson.D{{Key: "$add", Value: bson.A{"$$NOW", ttl.Milliseconds()}}},
+				bson.D{{Key: "$add", Value: bson.A{"$$NOW", millis}}},
 				"$expire_time",
 			}}}},
 		}}},

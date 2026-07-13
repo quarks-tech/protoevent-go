@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,29 +30,34 @@ func TestDefaultOptions(t *testing.T) {
 }
 
 func TestNewRelayRejectsDrainWindowTooLarge(t *testing.T) {
-	// DrainWindow must be < LeaseTTL/2 so the lease can be renewed within a window.
-	_, err := stream.NewRelay("c", nil, nil,
+	// DrainWindow must be < LeaseTTL/2 so the lease can be renewed within a
+	// window. Valid store and sender, so no earlier nil-guard can mask the
+	// guard under test; the message must name the violated relation.
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	_, err := stream.NewRelay("c", &fakeStore{}, sender,
 		stream.WithLeaseTTL(10*time.Second), stream.WithDrainWindow(6*time.Second))
-	if err == nil {
-		t.Fatal("expected error for DrainWindow >= LeaseTTL/2, got nil")
+	if err == nil || !strings.Contains(err.Error(), "LeaseTTL/2") {
+		t.Fatalf("err = %v, want the DrainWindow < LeaseTTL/2 validation error", err)
 	}
 }
 
 func TestNewRelayRejectsZeroDrainWindow(t *testing.T) {
 	// A zero DrainWindow would busy-spin r.sleep (time.NewTimer(0) fires
 	// immediately), so it must be rejected at construction time.
-	_, err := stream.NewRelay("c", nil, nil, stream.WithDrainWindow(0))
-	if err == nil {
-		t.Fatal("expected error for zero DrainWindow, got nil")
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	_, err := stream.NewRelay("c", &fakeStore{}, sender, stream.WithDrainWindow(0))
+	if err == nil || !strings.Contains(err.Error(), "DrainWindow must be > 0") {
+		t.Fatalf("err = %v, want the DrainWindow > 0 validation error", err)
 	}
 }
 
 func TestNewRelayRejectsZeroTokenBatchSize(t *testing.T) {
 	// A zero TokenBatchSize would make drainWindow's `for range` loop no-op
 	// every call, spinning without ever draining anything.
-	_, err := stream.NewRelay("c", nil, nil, stream.WithTokenBatchSize(0))
-	if err == nil {
-		t.Fatal("expected error for zero TokenBatchSize, got nil")
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	_, err := stream.NewRelay("c", &fakeStore{}, sender, stream.WithTokenBatchSize(0))
+	if err == nil || !strings.Contains(err.Error(), "TokenBatchSize") {
+		t.Fatalf("err = %v, want the TokenBatchSize validation error", err)
 	}
 }
 
@@ -174,6 +180,12 @@ type fakeStore struct {
 	loadErr  error
 	watchErr error
 	saveErr  error
+
+	// Recorded by SaveToken, so tests can assert the final save on a shutdown
+	// path goes through a fresh bounded context (deadline set, not already
+	// canceled) instead of the dead run ctx.
+	saveHadDeadline bool
+	saveCtxErr      error
 }
 
 func (s *fakeStore) LoadToken(context.Context, string) (string, time.Time, error) {
@@ -187,9 +199,11 @@ func (s *fakeStore) LoadToken(context.Context, string) (string, time.Time, error
 
 // SaveToken records the save and also updates loadTok/loadCT, mimicking a
 // real store: the next LoadToken reflects what was just persisted.
-func (s *fakeStore) SaveToken(_ context.Context, _ string, tok string, ct time.Time) error {
+func (s *fakeStore) SaveToken(ctx context.Context, _ string, tok string, ct time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	_, s.saveHadDeadline = ctx.Deadline()
+	s.saveCtxErr = ctx.Err()
 	if s.saveErr != nil {
 		return s.saveErr
 	}
@@ -220,6 +234,8 @@ func (s *fakeStore) watchCountSnapshot() int {
 	return s.watchCount
 }
 func (s *fakeStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, _ time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.leader == "" || s.leader == holderID {
 		s.leader = holderID
 		return true, nil
@@ -227,6 +243,8 @@ func (s *fakeStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, 
 	return false, nil
 }
 func (s *fakeStore) ReleaseLeaderLock(_ context.Context, _, holderID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.leader == holderID {
 		s.leader = ""
 	}
@@ -575,6 +593,51 @@ func TestShutdownDoesNotParkBufferedEvents(t *testing.T) {
 	}
 }
 
+// TestCancelBetweenEventsStopsLane proves drainWindow's top-of-loop ctx
+// check: a ctx canceled after a successful send stops the lane before the
+// next client-buffered event is even pulled — no park, no delivery of the
+// buffered remainder — and the final token save for the acknowledged prefix
+// goes through a fresh bounded context (the run ctx is already dead), so a
+// real store would not fail it and redeliver the prefix on restart.
+func TestCancelBetweenEventsStopsLane(t *testing.T) {
+	fs := &fakeStream{events: []*stream.Event{ev("a"), ev("b"), ev("c")}}
+	st := &fakeStore{stream: fs, loadTok: "existing"} // existing group: no baseline save
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var got []string
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		got = append(got, md.ID)
+		if md.ID == "a" {
+			cancel() // shutdown lands after this send succeeds; b and c stay buffered
+		}
+		return nil
+	})
+	var parked []string
+	r, _ := stream.NewRelay("c", st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+		parked = append(parked, msg.ID)
+	}))
+	_ = r.RunOnce(ctx)
+
+	if len(got) != 1 || got[0] != "a" {
+		t.Fatalf("delivered %v, want [a] (buffered events must not be pulled after cancel)", got)
+	}
+	if len(parked) != 0 {
+		t.Fatalf("parked %v on shutdown, want none", parked)
+	}
+	if st.savedTok != "a" {
+		t.Fatalf("saved token = %q, want a (the acknowledged prefix)", st.savedTok)
+	}
+	if fs.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (lane stopped on shutdown)", fs.closeCount)
+	}
+	if st.saveCtxErr != nil {
+		t.Fatalf("final save ctx already dead (%v), want a live fresh context", st.saveCtxErr)
+	}
+	if !st.saveHadDeadline {
+		t.Fatal("final save ctx had no deadline, want a bounded fresh context")
+	}
+}
+
 // TestDecodeErrorParksAndContinues proves the poison-event path: with an
 // ErrorHandler, a *DecodeError from Next is parked exactly once, the window
 // keeps draining, subsequent events are delivered, and the token advances
@@ -618,9 +681,10 @@ func TestDecodeErrorParksAndContinues(t *testing.T) {
 }
 
 // TestDecodeErrorWithoutHandlerStopsLane proves that without an ErrorHandler
-// a *DecodeError stops the lane like any stream error: the token is NOT
-// advanced past the poison event, preserving order (at-least-once redelivery
-// on reopen).
+// a *DecodeError stops the lane: the sent prefix's token IS persisted (so the
+// reopen resumes at the poison instead of re-sending the prefix every
+// DrainWindow), but the token is NOT advanced past the poison event itself,
+// preserving order (at-least-once redelivery on reopen).
 func TestDecodeErrorWithoutHandlerStopsLane(t *testing.T) {
 	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", ClusterTime: time.Now(), Err: errors.New("bad bson")}
 	fs := &fakeStream{
@@ -643,8 +707,47 @@ func TestDecodeErrorWithoutHandlerStopsLane(t *testing.T) {
 	if len(got) != 1 || got[0] != "a" {
 		t.Fatalf("delivered %v, want [a]", got)
 	}
-	if st.saveCount != 0 {
-		t.Fatalf("saveCount = %d, want 0 (token must not advance past the poison event)", st.saveCount)
+	if st.saveCount != 1 || st.savedTok != "a" {
+		t.Fatalf("saveCount = %d, savedTok = %q, want the pre-poison success token %q saved exactly once (prefix persisted; not advanced past the poison)", st.saveCount, st.savedTok, "a")
+	}
+}
+
+// TestDecodeErrorWithEmptyTokenIsNotParkable proves an empty ResumeToken makes
+// a poison event non-parkable even with an ErrorHandler configured: the
+// store's token extraction is best-effort, and parking would later persist ""
+// and erase the group's position (restart "at now", silently skipping
+// events). The lane stops instead — the prefix's token is saved, the poison
+// is not advanced past, and no save ever carries "".
+func TestDecodeErrorWithEmptyTokenIsNotParkable(t *testing.T) {
+	de := &stream.DecodeError{ID: "p", ResumeToken: "", ClusterTime: time.Now(), Err: errors.New("bad bson")}
+	fs := &fakeStream{
+		events: []*stream.Event{ev("a"), nil},
+		errs:   map[int]error{1: de},
+	}
+	st := &fakeStore{stream: fs, loadTok: "existing"} // existing group: no baseline save
+	var got []string
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		got = append(got, md.ID)
+		return nil
+	})
+	var parked []string
+	r, _ := stream.NewRelay("c", st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+		parked = append(parked, msg.ID)
+	}))
+	runErr := r.RunOnce(t.Context())
+
+	var gotDE *stream.DecodeError
+	if !errors.As(runErr, &gotDE) {
+		t.Fatalf("RunOnce err = %v, want a *DecodeError (lane must stop)", runErr)
+	}
+	if len(parked) != 0 {
+		t.Fatalf("parked %v, want none (an empty-token poison event is non-parkable)", parked)
+	}
+	if len(got) != 1 || got[0] != "a" {
+		t.Fatalf("delivered %v, want [a]", got)
+	}
+	if st.saveCount != 1 || st.savedTok != "a" {
+		t.Fatalf("saveCount = %d, savedTok = %q, want exactly one save of %q (never the empty token)", st.saveCount, st.savedTok, "a")
 	}
 }
 
@@ -837,9 +940,10 @@ func (h *countingHandler) snapshot() int {
 func TestNewRelayRejectsZeroLeaseTTL(t *testing.T) {
 	// DrainWindow stays at its positive default (1s), so this isolates the
 	// LeaseTTL <= 0 branch specifically.
-	_, err := stream.NewRelay("c", nil, nil, stream.WithLeaseTTL(0))
-	if err == nil {
-		t.Fatal("expected error for zero LeaseTTL, got nil")
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	_, err := stream.NewRelay("c", &fakeStore{}, sender, stream.WithLeaseTTL(0))
+	if err == nil || !strings.Contains(err.Error(), "LeaseTTL must be > 0") {
+		t.Fatalf("err = %v, want the LeaseTTL > 0 validation error", err)
 	}
 }
 

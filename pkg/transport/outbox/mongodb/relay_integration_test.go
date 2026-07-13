@@ -90,8 +90,8 @@ func TestStreamRelayEndToEnd(t *testing.T) {
 	// released its leader lock; drop it directly so r2 can acquire
 	// leadership (this is a test-only shortcut for what a graceful shutdown's
 	// Run-deferred Release would otherwise do).
-	if err := testDB.Collection("relay_lock").Drop(context.Background()); err != nil {
-		t.Fatalf("drop relay_lock: %v", err)
+	if err := testDB.Collection("relay_locks").Drop(context.Background()); err != nil {
+		t.Fatalf("drop relay_locks: %v", err)
 	}
 
 	sender2 := &recordingSender{}

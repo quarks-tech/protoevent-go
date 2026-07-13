@@ -31,12 +31,6 @@ func TestNewStoreWithRetention(t *testing.T) {
 	}
 }
 
-func TestStoreSatisfiesStreamContract(t *testing.T) {
-	// Compile-time proof lives in watch.go (var _ stream.Store = ...).
-	// This test just ensures the package builds with Watch present.
-	_ = mongodbstore.NewStore(nil)
-}
-
 // TestCreateOutboxMessageRejectsNilMetadata proves the nil-Metadata guard
 // fires before any driver call: a nil *mongo.Database (via NewStore(nil))
 // would panic on the first Collection(...) call if the guard didn't run
@@ -67,6 +61,12 @@ func TestMain(m *testing.M) {
 	inst, cleanup, err := mongodbtest.Start(context.Background())
 	if err != nil {
 		if errors.Is(err, mongodbtest.ErrDockerUnavailable) {
+			if os.Getenv("CI") != "" {
+				// In CI a missing Docker must fail loudly: os.Exit(0) would
+				// silently "pass" the whole module with zero tests run.
+				fmt.Fprintf(os.Stderr, "CI is set but Docker is unavailable; refusing to skip mongo integration tests: %v\n", err)
+				os.Exit(1)
+			}
 			fmt.Fprintf(os.Stderr, "skipping mongo integration tests: %v\n", err)
 			os.Exit(0)
 		}
@@ -83,7 +83,7 @@ func TestMain(m *testing.M) {
 // *testing.T) so both tests and benchmarks in this package can share them.
 func reset(t testing.TB) {
 	t.Helper()
-	for _, c := range []string{"outbox", "outbox_offsets", "relay_lock"} {
+	for _, c := range []string{"outbox_messages", "outbox_offsets", "relay_locks"} {
 		if err := testDB.Collection(c).Drop(context.Background()); err != nil {
 			t.Fatalf("drop %s: %v", c, err)
 		}
@@ -130,7 +130,7 @@ func TestPublishInsertsEnvelope(t *testing.T) {
 	}
 	reset(t)
 	id := publish(t, "s1")
-	n, err := testDB.Collection("outbox").CountDocuments(context.Background(), bson.M{"_id": id})
+	n, err := testDB.Collection("outbox_messages").CountDocuments(context.Background(), bson.M{"_id": id})
 	if err != nil || n != 1 {
 		t.Fatalf("count = %d err = %v, want 1", n, err)
 	}
@@ -144,7 +144,7 @@ func TestEnsureIndexesCreatesTTL(t *testing.T) {
 	if err := mongodbstore.NewStore(testDB).EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("ensure indexes: %v", err)
 	}
-	cur, err := testDB.Collection("outbox").Indexes().List(context.Background())
+	cur, err := testDB.Collection("outbox_messages").Indexes().List(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,8 +152,9 @@ func TestEnsureIndexesCreatesTTL(t *testing.T) {
 	if err := cur.All(context.Background(), &idx); err != nil {
 		t.Fatal(err)
 	}
-	// Same meaning as the unexported mongodb.retentionSeconds (7 days); this is
-	// an external test package so it can't reference the constant directly.
+	// Same meaning as the unexported mongodb.defaultRetention (7 days, a
+	// time.Duration); this is an external test package so it can't reference
+	// the constant directly.
 	const wantTTLSeconds = int32(7 * 24 * 60 * 60)
 	found := false
 	for _, ix := range idx {
@@ -291,6 +292,85 @@ func TestSaveTokenMonotoneClusterTime(t *testing.T) {
 	}
 	if tok != "tok2" || !gotCT.Equal(t2) {
 		t.Fatalf("after newer save: token = %q ct = %v, want tok2 %v", tok, gotCT, t2)
+	}
+	// EQUAL clusterTime, different token: must UPDATE ($lte's equality path).
+	// Event clusterTimes carry whole-second granularity, so a train of events
+	// committed in the same second all save at the same clusterTime — treating
+	// equality as stale would freeze the token at the first of them.
+	if err := st.SaveToken(ctx, "c", "tok3", t2); err != nil {
+		t.Fatalf("equal-clusterTime save: %v", err)
+	}
+	tok, gotCT, err = st.LoadToken(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "tok3" || !gotCT.Equal(t2) {
+		t.Fatalf("after equal-clusterTime save: token = %q ct = %v, want tok3 %v", tok, gotCT, t2)
+	}
+}
+
+// TestSaveTokenRejectsEmptyToken proves the store defends its own invariant:
+// an empty token is never a valid position (LoadToken maps "" to "no stored
+// position"), so saving one would erase the group's persisted offset and make
+// the next Watch restart "at now", silently skipping events. The save must
+// error and leave the stored row untouched.
+func TestSaveTokenRejectsEmptyToken(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	ctx := context.Background()
+
+	ct := time.Now().UTC().Truncate(time.Millisecond)
+	if err := st.SaveToken(ctx, "c", "tok1", ct); err != nil {
+		t.Fatalf("save tok1: %v", err)
+	}
+	if err := st.SaveToken(ctx, "c", "", ct.Add(time.Minute)); err == nil {
+		t.Fatal("SaveToken with empty token succeeded; want an error")
+	}
+	tok, gotCT, err := st.LoadToken(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "tok1" || !gotCT.Equal(ct) {
+		t.Fatalf("stored row changed after rejected empty-token save: token = %q ct = %v, want tok1 %v", tok, gotCT, ct)
+	}
+}
+
+// TestSaveTokenHealsRowWithoutClusterTime proves a stored row LACKING
+// cluster_time (never written by this package — external tampering or manual
+// repair) does not stall the group forever: without the $exists guard the
+// monotone $lte filter never matches such a row, the upsert hits the _id
+// index, and the duplicate-key error is swallowed as "stale" — freezing the
+// token silently. The next save must instead update the row in place.
+func TestSaveTokenHealsRowWithoutClusterTime(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	ctx := context.Background()
+
+	// Hand-insert a legacy/damaged row via the raw driver: token bytes present,
+	// cluster_time absent.
+	if _, err := testDB.Collection("outbox_offsets").InsertOne(ctx, bson.M{
+		"_id":          "c",
+		"resume_token": []byte("legacy"),
+	}); err != nil {
+		t.Fatalf("hand-insert legacy row: %v", err)
+	}
+
+	st := mongodbstore.NewStore(testDB)
+	ct := time.Now().UTC().Truncate(time.Millisecond)
+	if err := st.SaveToken(ctx, "c", "tok1", ct); err != nil {
+		t.Fatalf("save over legacy row: %v", err)
+	}
+	tok, gotCT, err := st.LoadToken(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "tok1" || !gotCT.Equal(ct) {
+		t.Fatalf("legacy row not healed: token = %q ct = %v, want tok1 %v", tok, gotCT, ct)
 	}
 }
 

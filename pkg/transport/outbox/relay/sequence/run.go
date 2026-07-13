@@ -8,6 +8,20 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 )
 
+// commitTimeout bounds the final CommitOffset on a planned shutdown with a
+// fresh context.Background(): that commit runs after the run ctx is already
+// canceled, and a real store would fail the write on a dead context —
+// mirroring relay/leader.go's releaseTimeout pattern.
+const commitTimeout = 5 * time.Second
+
+// errLostLeadership signals that a between-pages lease renewal reported the
+// lock lost or failed: the current pass must stop as a whole (a known
+// non-leader draining another page would duplicate it, and its sweep would
+// run without the lease). RunOnce maps it to a clean nil stop — losing
+// leadership is not an error; a persistent leader-store error resurfaces via
+// the next tick's opening TryAcquire.
+var errLostLeadership = errors.New("sequence: leadership lost mid-pass")
+
 // Run drives the relay until ctx is canceled, then releases leadership so a
 // planned shutdown fails over in well under LeaseTTL.
 func (r *Relay) Run(ctx context.Context) error {
@@ -25,7 +39,7 @@ func (r *Relay) Run(ctx context.Context) error {
 			// Only observe if this isn't a planned shutdown (see the
 			// same-shaped handling in the loop below for the rationale).
 			r.options.Observer.ObserveError(r.name, err)
-			r.options.Logger.Error("outbox relay: pass failed", "relay", r.name, "err", err)
+			r.options.Logger.Error("sequence relay: pass failed", "relay", r.name, "err", err)
 		}
 	}
 
@@ -45,7 +59,7 @@ func (r *Relay) Run(ctx context.Context) error {
 					continue
 				}
 				r.options.Observer.ObserveError(r.name, err)
-				r.options.Logger.Error("outbox relay: pass failed", "relay", r.name, "err", err)
+				r.options.Logger.Error("sequence relay: pass failed", "relay", r.name, "err", err)
 			}
 		}
 	}
@@ -55,7 +69,9 @@ func (r *Relay) Run(ctx context.Context) error {
 // cadence) sweep. Rows sequenced this tick are drained this tick because the
 // sequencer pass commits before the drain query runs. The lease acquired here
 // is additionally renewed between pages inside sequence and drain, so a pass
-// over a long backlog cannot outlive it.
+// over a long backlog cannot outlive it. Losing leadership at one of those
+// renewals stops the whole pass cleanly (nil): the remaining phases are
+// skipped rather than run as a known non-leader.
 func (r *Relay) RunOnce(ctx context.Context) error {
 	isLeader, err := r.leader.TryAcquire(ctx)
 	if err != nil {
@@ -66,9 +82,15 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 	}
 
 	if err := r.sequence(ctx); err != nil {
+		if errors.Is(err, errLostLeadership) {
+			return nil // clean stop: losing leadership is not an error
+		}
 		return err
 	}
 	if err := r.drain(ctx); err != nil {
+		if errors.Is(err, errLostLeadership) {
+			return nil
+		}
 		return err
 	}
 	return r.maybeSweep(ctx)
@@ -97,12 +119,14 @@ func (r *Relay) sequence(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// Full page: renew the lease before the next pass. Losing leadership
-		// mid-pass is not an error — end the pass cleanly; a persistent
-		// leader-store error resurfaces via the next tick's opening
-		// TryAcquire.
+		// Full page: renew the lease before the next pass. A renewal that
+		// reports the lock lost — or fails outright — stops the whole pass
+		// via errLostLeadership: a known non-leader must not keep sequencing,
+		// draining, or sweeping. RunOnce maps the sentinel to a clean nil
+		// stop; a persistent leader-store error resurfaces via the next
+		// tick's opening TryAcquire.
 		if isLeader, err := r.leader.TryAcquire(ctx); err != nil || !isLeader {
-			return nil
+			return errLostLeadership
 		}
 	}
 }
@@ -185,14 +209,12 @@ func (r *Relay) drain(ctx context.Context) error {
 		parkedPoison := false
 		if poison != nil && !stopped && !canceled && r.options.ErrorHandler != nil && ctx.Err() == nil {
 			r.handleError(ctx, &outbox.Message{ID: poison.ID, Seq: poison.Seq}, poison)
-			if poison.Seq > maxSeq {
-				maxSeq = poison.Seq
-			}
+			maxSeq = max(maxSeq, poison.Seq)
 			parkedPoison = true
 		}
 
 		if maxSeq > offset {
-			if err := r.store.CommitOffset(ctx, r.name, maxSeq); err != nil {
+			if err := r.commitOffset(ctx, maxSeq); err != nil {
 				return err
 			}
 			// A single leader owns the watermark, so the value we just
@@ -203,17 +225,26 @@ func (r *Relay) drain(ctx context.Context) error {
 		}
 
 		full := len(msgs) == r.options.BatchSize
-		if len(msgs) > 0 {
+		if len(msgs) > 0 || parkedPoison {
 			// `sent` counts successful sends only; parked messages are
 			// reported via ObserveError and excluded (relay.Observer contract).
+			// A poison-only page (empty decoded prefix, poison parked) still
+			// disposed of a message, so it is observed too — with a zero
+			// oldestAge, since there is no decoded row to anchor the lag on.
 			more := stopped || canceled || full || poison != nil
-			r.options.Observer.ObserveDrained(r.name, sent, time.Since(msgs[0].CreateTime), more)
+			oldestAge := time.Duration(0)
+			if len(msgs) > 0 {
+				oldestAge = time.Since(msgs[0].CreateTime)
+			}
+			r.options.Observer.ObserveDrained(r.name, sent, oldestAge, more)
 		}
 
 		switch {
 		case canceled:
-			// Shutdown: successes are already committed above; Run's
-			// pass-level quieting keeps this silent.
+			// Shutdown: successes are already committed above (the final
+			// commit goes through commitOffset's fresh bounded context — the
+			// run ctx is already dead here); Run's pass-level quieting keeps
+			// this silent.
 			return ctx.Err()
 		case stopped:
 			return nil
@@ -228,17 +259,33 @@ func (r *Relay) drain(ctx context.Context) error {
 		// Full page (or a parked poison row with possibly more behind it):
 		// another page follows. Renew the lease first — without this a long
 		// backlog could outlast LeaseTTL and the whole drain would run
-		// concurrently with a new leader. Losing leadership mid-pass is not
-		// an error: end the pass with what is already committed; a persistent
-		// leader-store error resurfaces via the next tick's opening
-		// TryAcquire.
+		// concurrently with a new leader. A renewal that reports the lock
+		// lost — or fails outright — stops the whole pass via
+		// errLostLeadership: what is already committed stands, and RunOnce
+		// skips the sweep instead of running it as a known non-leader; a
+		// persistent leader-store error resurfaces via the next tick's
+		// opening TryAcquire.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if isLeader, err := r.leader.TryAcquire(ctx); err != nil || !isLeader {
-			return nil
+			return errLostLeadership
 		}
 	}
+}
+
+// commitOffset persists the watermark. When the run ctx is already canceled
+// (the final commit on a planned shutdown), the store call gets a fresh
+// bounded context instead: a real store fails writes on a dead context, and
+// losing that commit would redeliver the page's acknowledged sends on
+// restart. Behavior on a live ctx is unchanged.
+func (r *Relay) commitOffset(ctx context.Context, seq int64) error {
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), commitTimeout)
+		defer cancel()
+	}
+	return r.store.CommitOffset(ctx, r.name, seq)
 }
 
 func (r *Relay) maybeSweep(ctx context.Context) error {
@@ -262,5 +309,5 @@ func (r *Relay) handleError(ctx context.Context, msg *outbox.Message, err error)
 		r.options.ErrorHandler(ctx, msg, err)
 	}
 	r.options.Observer.ObserveError(r.name, err)
-	r.options.Logger.Error("outbox relay: send message failed", "relay", r.name, "event_id", msg.ID, "err", err)
+	r.options.Logger.Error("sequence relay: message failed", "relay", r.name, "event_id", msg.ID, "err", err)
 }

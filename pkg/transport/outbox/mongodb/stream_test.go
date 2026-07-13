@@ -235,7 +235,7 @@ func TestWatchSurfacesInvalidateOnDrop(t *testing.T) {
 
 	_ = publish(t, "before-drop")
 
-	if err := testDB.Collection("outbox").Drop(ctx); err != nil {
+	if err := testDB.Collection("outbox_messages").Drop(ctx); err != nil {
 		t.Fatalf("drop outbox: %v", err)
 	}
 
@@ -277,7 +277,7 @@ func TestWatchPoisonEventReturnsDecodeError(t *testing.T) {
 	// A raw driver insert bypasses CreateOutboxMessage's marshaling: metadata
 	// is stored as bytes that are NOT valid CloudEvents JSON, so decodeMessage
 	// must fail on this event.
-	if _, err := testDB.Collection("outbox").InsertOne(ctx, bson.M{
+	if _, err := testDB.Collection("outbox_messages").InsertOne(ctx, bson.M{
 		"_id":         "poison",
 		"metadata":    []byte("{corrupt"),
 		"data":        []byte("x"),
