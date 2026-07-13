@@ -161,8 +161,8 @@ func decodeErrorFromRaw(raw bson.Raw, err error) *stream.DecodeError {
 // error (code 286), signaled either by the bare code or by the
 // NonResumableChangeStreamError label the server attaches to it.
 func isHistoryLost(err error) bool {
-	var se mongo.ServerError
-	if !errors.As(err, &se) {
+	se, ok := errors.AsType[mongo.ServerError](err)
+	if !ok {
 		return false
 	}
 	return se.HasErrorCode(changeStreamHistoryLostCode) || se.HasErrorLabel(nonResumableChangeStreamErrorLabel)

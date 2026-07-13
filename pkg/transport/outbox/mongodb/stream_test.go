@@ -291,9 +291,11 @@ func TestWatchPoisonEventReturnsDecodeError(t *testing.T) {
 	for de == nil {
 		e, ok, err := strm.Next(ctx)
 		if err != nil {
-			if !errors.As(err, &de) {
+			d, isPoison := errors.AsType[*stream.DecodeError](err)
+			if !isPoison {
 				t.Fatalf("next returned %T (%v), want *stream.DecodeError", err, err)
 			}
+			de = d
 			continue
 		}
 		if ok {

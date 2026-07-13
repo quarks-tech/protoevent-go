@@ -192,7 +192,7 @@ func (s *fakeStore) SequenceMessages(_ context.Context, limit int) (int, error) 
 		return 0, s.seqErr
 	}
 	n := min(limit, len(s.pending))
-	for i := 0; i < n; i++ {
+	for i := range n {
 		m := s.pending[i]
 		m.Seq = s.nextSeq
 		m.Metadata.ID = strconv.FormatInt(s.nextSeq, 10)
@@ -1304,11 +1304,11 @@ func TestPoisonRowParkedWithErrorHandler(t *testing.T) {
 	if len(got) != 4 || got[0] != 1 || got[1] != 2 || got[2] != 4 || got[3] != 5 {
 		t.Fatalf("delivered = %v, want [1 2 4 5]", got)
 	}
-	if len(parked) != 1 || parked[0].Seq != 3 {
-		t.Fatalf("parked = %+v, want exactly the seq-3 poison row once", parked)
+	if len(parked) != 1 || len(parkedErrs) != 1 || parked[0].Seq != 3 {
+		t.Fatalf("parked = %+v (errs %v), want exactly the seq-3 poison row once", parked, parkedErrs)
 	}
-	var de *sequence.DecodeError
-	if !errors.As(parkedErrs[0], &de) || de.Seq != 3 {
+	de, ok := errors.AsType[*sequence.DecodeError](parkedErrs[0])
+	if !ok || de.Seq != 3 {
 		t.Fatalf("parked err = %v, want *sequence.DecodeError with Seq 3", parkedErrs[0])
 	}
 	if off := st.offsets["c"]; off != 5 {
@@ -1337,8 +1337,8 @@ func TestPoisonRowStopsLaneWithoutErrorHandler(t *testing.T) {
 	}
 
 	runErr := r.RunOnce(t.Context())
-	var de *sequence.DecodeError
-	if !errors.As(runErr, &de) || de.Seq != 3 {
+	de, ok := errors.AsType[*sequence.DecodeError](runErr)
+	if !ok || de.Seq != 3 {
 		t.Fatalf("RunOnce err = %v, want *sequence.DecodeError with Seq 3", runErr)
 	}
 	if len(got) != 2 {

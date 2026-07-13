@@ -241,8 +241,8 @@ SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM outbox_messages`, name)
 
 // isDuplicateKey reports whether err is MySQL/TiDB ER_DUP_ENTRY (1062).
 func isDuplicateKey(err error) bool {
-	var me *mysql.MySQLError
-	return errors.As(err, &me) && me.Number == 1062
+	me, ok := errors.AsType[*mysql.MySQLError](err)
+	return ok && me.Number == 1062
 }
 
 // isNullColumn reports whether err is MySQL/TiDB ER_BAD_NULL_ERROR (1048,
@@ -250,8 +250,8 @@ func isDuplicateKey(err error) bool {
 // not enough — any NOT NULL column raises 1048 (e.g. a nil Data on the data
 // column), so the message is matched for the specific column too.
 func isNullColumn(err error, col string) bool {
-	var me *mysql.MySQLError
-	return errors.As(err, &me) && me.Number == 1048 && strings.Contains(me.Message, col)
+	me, ok := errors.AsType[*mysql.MySQLError](err)
+	return ok && me.Number == 1048 && strings.Contains(me.Message, col)
 }
 
 // DeleteOffset removes the named consumer group's offset row. It is the

@@ -261,6 +261,18 @@ func ev(tok string) *stream.Event {
 	}
 }
 
+// mustRelay builds a relay for the "c" test group, failing the test on a
+// construction error instead of discarding it (a discarded error would turn
+// a validation regression into a nil-receiver panic in the body).
+func mustRelay(t *testing.T, st stream.Store, sender senderFunc, opts ...stream.Option) *stream.Relay {
+	t.Helper()
+	r, err := stream.NewRelay("c", st, sender, opts...)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	return r
+}
+
 func TestRunOnceDeliversAndPersistsLastToken(t *testing.T) {
 	st := &fakeStore{stream: &fakeStream{events: []*stream.Event{ev("a"), ev("b")}}}
 	var got []string
@@ -268,7 +280,7 @@ func TestRunOnceDeliversAndPersistsLastToken(t *testing.T) {
 		got = append(got, md.ID)
 		return nil
 	})
-	r, _ := stream.NewRelay("c", st, sender)
+	r := mustRelay(t, st, sender)
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -301,7 +313,7 @@ func TestWatchReceivesDrainWindowAsMaxAwait(t *testing.T) {
 func TestRunOncePersistsPBRTOnEmptyWindow(t *testing.T) {
 	st := &fakeStore{stream: &fakeStream{events: nil, pbrt: "pbrt", pbrtCT: time.Now()}}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
-	r, _ := stream.NewRelay("c", st, sender)
+	r := mustRelay(t, st, sender)
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -318,7 +330,7 @@ func TestIdleWindowsSkipIdenticalTokenSaves(t *testing.T) {
 	fs := &fakeStream{pbrt: "p1", pbrtCT: time.Now()}
 	st := &fakeStore{stream: fs, loadTok: "existing"} // existing group: no fresh-group baseline save
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
-	r, _ := stream.NewRelay("c", st, sender)
+	r := mustRelay(t, st, sender)
 
 	for range 3 {
 		if err := r.RunOnce(t.Context()); err != nil {
@@ -351,7 +363,7 @@ func TestRunOnceStopTheLane(t *testing.T) {
 		got = append(got, md.ID)
 		return nil
 	})
-	r, _ := stream.NewRelay("c", st, sender)
+	r := mustRelay(t, st, sender)
 	_ = r.RunOnce(t.Context())
 	// Delivered a; stopped at b; c not attempted; token persisted up to a.
 	if len(got) != 1 || got[0] != "a" {
@@ -365,7 +377,7 @@ func TestRunOnceStopTheLane(t *testing.T) {
 func TestRunOnceInvalidateIsFatal(t *testing.T) {
 	st := &fakeStore{stream: &fakeStream{nextErr: stream.ErrStreamInvalidated}}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
-	r, _ := stream.NewRelay("c", st, sender)
+	r := mustRelay(t, st, sender)
 	err := r.RunOnce(t.Context())
 	if !errors.Is(err, stream.ErrStreamInvalidated) {
 		t.Fatalf("err = %v, want ErrStreamInvalidated", err)
@@ -380,7 +392,7 @@ func TestRunOnceNonLeaderIdles(t *testing.T) {
 	// DrainWindow (F3, avoids busy-spinning TryAcquireLeaderLock) before
 	// returning, so keep this test fast (DrainWindow < LeaseTTL/2 guard still
 	// satisfied: 10ms < 500ms).
-	r, _ := stream.NewRelay("c", st, sender, stream.WithLeaderLockName("lock"),
+	r := mustRelay(t, st, sender, stream.WithLeaderLockName("lock"),
 		stream.WithDrainWindow(10*time.Millisecond), stream.WithLeaseTTL(1*time.Second))
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -401,7 +413,7 @@ func TestRunOnceStopClosesStreamForRedelivery(t *testing.T) {
 		got = append(got, md.ID)
 		return nil
 	})
-	r, _ := stream.NewRelay("c", st, sender)
+	r := mustRelay(t, st, sender)
 	// RunOnce returns errLaneStopped, which is unexported and unreferenceable
 	// here; assert the observable effects instead.
 	_ = r.RunOnce(t.Context())
@@ -429,7 +441,7 @@ func TestRunOncePicksUpWhereItLeftOff(t *testing.T) {
 		got = append(got, md.ID)
 		return nil
 	})
-	r, _ := stream.NewRelay("c", st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
 	if err := r.RunOnce(t.Context()); err != nil {
@@ -482,7 +494,7 @@ func TestObserveDrainedCountsOnlySent(t *testing.T) {
 		return nil
 	})
 	obs := &countingObserver{}
-	r, _ := stream.NewRelay("c", st, sender,
+	r := mustRelay(t, st, sender,
 		stream.WithObserver(obs),
 		stream.WithErrorHandler(func(context.Context, *outbox.Message, error) {}))
 	if err := r.RunOnce(t.Context()); err != nil {
@@ -574,7 +586,7 @@ func TestShutdownDoesNotParkBufferedEvents(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r, _ := stream.NewRelay("c", st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
 	_ = r.RunOnce(ctx)
@@ -613,7 +625,7 @@ func TestCancelBetweenEventsStopsLane(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r, _ := stream.NewRelay("c", st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
 	_ = r.RunOnce(ctx)
@@ -655,9 +667,8 @@ func TestDecodeErrorParksAndContinues(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r, _ := stream.NewRelay("c", st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, err error) {
-		var got *stream.DecodeError
-		if !errors.As(err, &got) {
+	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, err error) {
+		if _, ok := errors.AsType[*stream.DecodeError](err); !ok {
 			t.Errorf("ErrorHandler err = %v, want a *DecodeError", err)
 		}
 		parked = append(parked, msg.ID)
@@ -697,11 +708,10 @@ func TestDecodeErrorWithoutHandlerStopsLane(t *testing.T) {
 		got = append(got, md.ID)
 		return nil
 	})
-	r, _ := stream.NewRelay("c", st, sender)
+	r := mustRelay(t, st, sender)
 	runErr := r.RunOnce(t.Context())
 
-	var gotDE *stream.DecodeError
-	if !errors.As(runErr, &gotDE) {
+	if _, ok := errors.AsType[*stream.DecodeError](runErr); !ok {
 		t.Fatalf("RunOnce err = %v, want a *DecodeError", runErr)
 	}
 	if len(got) != 1 || got[0] != "a" {
@@ -731,13 +741,12 @@ func TestDecodeErrorWithEmptyTokenIsNotParkable(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r, _ := stream.NewRelay("c", st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
 	runErr := r.RunOnce(t.Context())
 
-	var gotDE *stream.DecodeError
-	if !errors.As(runErr, &gotDE) {
+	if _, ok := errors.AsType[*stream.DecodeError](runErr); !ok {
 		t.Fatalf("RunOnce err = %v, want a *DecodeError (lane must stop)", runErr)
 	}
 	if len(parked) != 0 {
@@ -820,7 +829,7 @@ func TestRunOnceFreshGroupPersistsBaselineBeforeDrain(t *testing.T) {
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
 		return errors.New("boom") // first event fails; no ErrorHandler -> stop-the-lane
 	})
-	r, _ := stream.NewRelay("c", st, sender)
+	r := mustRelay(t, st, sender)
 	_ = r.RunOnce(t.Context())
 
 	if len(st.watchTokens) != 1 || st.watchTokens[0] != "" {

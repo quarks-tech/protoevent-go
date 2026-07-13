@@ -156,8 +156,8 @@ func (r *Relay) drain(ctx context.Context) error {
 
 	for {
 		msgs, listErr := r.store.ListMessages(ctx, offset, r.options.BatchSize)
-		var poison *DecodeError
-		if listErr != nil && !errors.As(listErr, &poison) {
+		poison, isPoison := errors.AsType[*DecodeError](listErr)
+		if listErr != nil && !isPoison {
 			return listErr
 		}
 		if len(msgs) == 0 && poison == nil {

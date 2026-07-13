@@ -462,8 +462,8 @@ func TestListMessagesPoisonRowReturnsPrefixAndDecodeError(t *testing.T) {
 	}
 
 	msgs, err := st.ListMessages(ctx, 0, 10)
-	var de *sequence.DecodeError
-	if !errors.As(err, &de) {
+	de, ok := errors.AsType[*sequence.DecodeError](err)
+	if !ok {
 		t.Fatalf("err = %v, want *sequence.DecodeError", err)
 	}
 	if de.ID != poisonID || de.Seq != 2 {

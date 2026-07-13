@@ -115,8 +115,7 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 		Options: options.Index().SetExpireAfterSeconds(int32(secs)),
 	})
 	if err != nil {
-		var se mongo.ServerError
-		if errors.As(err, &se) && se.HasErrorCode(indexOptionsConflictCode) {
+		if se, ok := errors.AsType[mongo.ServerError](err); ok && se.HasErrorCode(indexOptionsConflictCode) {
 			return fmt.Errorf("outbox: ensure ttl index: retention differs from the existing TTL index; "+
 				"changing retention on an existing collection requires collMod on the create_time index, "+
 				"not index re-creation: %w", err)

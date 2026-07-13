@@ -125,8 +125,7 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		}
 		e, ok, err := r.stream.Next(ctx)
 		if err != nil {
-			var de *DecodeError
-			if errors.As(err, &de) && de.ResumeToken != "" && r.options.ErrorHandler != nil && ctx.Err() == nil {
+			if de, isPoison := errors.AsType[*DecodeError](err); isPoison && de.ResumeToken != "" && r.options.ErrorHandler != nil && ctx.Err() == nil {
 				// Poison event: park it and resume past it, keeping the lane
 				// moving. Requires the event's resume token: extraction is
 				// best-effort, and an empty one is non-parkable — advancing
@@ -155,6 +154,12 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		}
 		if !ok {
 			break // window elapsed with no more events (caught up)
+		}
+		if e == nil || e.Message == nil {
+			// Contract violation by the Store's Stream implementation (ok
+			// promises a decoded event): fail loudly as a stream error rather
+			// than panic the relay goroutine.
+			return errors.New("stream: Next returned ok with a nil event or message")
 		}
 		if sendErr := r.sender.Send(ctx, e.Message.Metadata, e.Message.Data); sendErr != nil {
 			if ctx.Err() != nil {
