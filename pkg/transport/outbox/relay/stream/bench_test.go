@@ -14,7 +14,7 @@ import (
 // stream/store are rebuilt per iteration OUTSIDE the timed section
 // (b.StopTimer/b.StartTimer) so only the RunOnce call itself is measured.
 func BenchmarkDrainWindow(b *testing.B) {
-	const n = 100 // matches stream.DefaultOptions().TokenBatchSize
+	const n = 100 // matches the default TokenBatchSize
 
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 

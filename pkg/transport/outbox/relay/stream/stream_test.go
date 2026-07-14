@@ -16,19 +16,6 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/stream"
 )
 
-func TestDefaultOptions(t *testing.T) {
-	o := stream.DefaultOptions()
-	if o.DrainWindow != time.Second {
-		t.Fatalf("DrainWindow = %v, want 1s", o.DrainWindow)
-	}
-	if o.LeaseTTL != 15*time.Second {
-		t.Fatalf("LeaseTTL = %v, want 15s", o.LeaseTTL)
-	}
-	if o.TokenBatchSize != 100 {
-		t.Fatalf("TokenBatchSize = %d, want 100", o.TokenBatchSize)
-	}
-}
-
 func TestNewRelayRejectsDrainWindowTooLarge(t *testing.T) {
 	// DrainWindow must be < LeaseTTL/2 so the lease can be renewed within a
 	// window. Valid store and sender, so no earlier nil-guard can mask the
@@ -96,24 +83,6 @@ func TestNewRelayRejectsNilSender(t *testing.T) {
 	}
 }
 
-// TestNewRelayRedefaultsNiledObserverAndLogger proves a raw Option that nils
-// Observer/Logger past the With* nil guards is repaired by NewRelay, so run
-// paths never hit a nil sink.
-func TestNewRelayRedefaultsNiledObserverAndLogger(t *testing.T) {
-	fs := &fakeStream{pbrt: "p", pbrtCT: time.Now()}
-	st := &fakeStore{stream: fs}
-	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
-	nilAll := func(o *stream.Options) { o.Observer, o.Logger = nil, nil }
-	r, err := stream.NewRelay("c", st, sender, nilAll)
-	if err != nil {
-		t.Fatalf("NewRelay: %v", err)
-	}
-	// RunOnce drains an empty window and reports via Observer: it must not panic.
-	if err := r.RunOnce(t.Context()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
-	}
-}
-
 // senderFunc adapts a func to eventbus.Sender.
 type senderFunc func(context.Context, *event.Metadata, []byte) error
 
@@ -177,9 +146,10 @@ type fakeStore struct {
 	watchMaxAwait time.Duration
 	leader        string
 
-	loadErr  error
-	watchErr error
-	saveErr  error
+	loadErr     error
+	watchErr    error
+	saveErr     error
+	denyPersist bool // SaveToken reports (false, nil): stale save skipped by the monotone guard
 
 	// Recorded by SaveToken, so tests can assert the final save on a shutdown
 	// path goes through a fresh bounded context (deadline set, not already
@@ -198,18 +168,24 @@ func (s *fakeStore) LoadToken(context.Context, string) (string, time.Time, error
 }
 
 // SaveToken records the save and also updates loadTok/loadCT, mimicking a
-// real store: the next LoadToken reflects what was just persisted.
-func (s *fakeStore) SaveToken(ctx context.Context, _ string, tok string, ct time.Time) error {
+// real store: the next LoadToken reflects what was just persisted. With
+// denyPersist set it reports (false, nil) without storing anything — the
+// monotone guard's "stale save skipped" path.
+func (s *fakeStore) SaveToken(ctx context.Context, _ string, tok string, ct time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, s.saveHadDeadline = ctx.Deadline()
 	s.saveCtxErr = ctx.Err()
 	if s.saveErr != nil {
-		return s.saveErr
+		return false, s.saveErr
 	}
-	s.savedTok, s.savedCT, s.saveCount = tok, ct, s.saveCount+1
+	s.saveCount++
+	if s.denyPersist {
+		return false, nil
+	}
+	s.savedTok, s.savedCT = tok, ct
 	s.loadTok, s.loadCT = tok, ct
-	return nil
+	return true, nil
 }
 func (s *fakeStore) Watch(_ context.Context, token string, maxAwait time.Duration) (stream.Stream, error) {
 	s.mu.Lock()
@@ -429,7 +405,14 @@ func TestRunOnceStopClosesStreamForRedelivery(t *testing.T) {
 	}
 }
 
-func TestRunOncePicksUpWhereItLeftOff(t *testing.T) {
+// TestSendFailureStopsLaneEvenWithErrorHandler pins the ErrorHandler's scope:
+// it parks POISON events only, never send failures. A send failure is
+// downstream trouble (broker down), and parking healthy events during an
+// outage would bulk-divert the backlog to the DLQ while advancing the
+// persisted position past it — trading away the delivery guarantee that is
+// the outbox's whole point. The lane must stop at the failed event, persist
+// only the sent prefix, and redeliver the failure on reopen.
+func TestSendFailureStopsLaneEvenWithErrorHandler(t *testing.T) {
 	fs := &fakeStream{events: []*stream.Event{ev("a"), ev("b"), ev("c")}}
 	st := &fakeStore{stream: fs}
 	var got []string
@@ -444,21 +427,19 @@ func TestRunOncePicksUpWhereItLeftOff(t *testing.T) {
 	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
-	if err := r.RunOnce(t.Context()); err != nil {
-		t.Fatalf("RunOnce: %v", err)
-	}
+	_ = r.RunOnce(t.Context())
 
-	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
-		t.Fatalf("delivered %v, want [a c] (b parked, not delivered)", got)
+	if len(parked) != 0 {
+		t.Fatalf("parked %v, want none (send failures must never be parked)", parked)
 	}
-	if len(parked) != 1 || parked[0] != "b" {
-		t.Fatalf("parked %v, want [b]", parked)
+	if len(got) != 1 || got[0] != "a" {
+		t.Fatalf("delivered %v, want [a] (lane stops at the send failure)", got)
 	}
-	if st.savedTok != "c" {
-		t.Fatalf("saved token = %q, want c (advanced past the parked event)", st.savedTok)
+	if st.savedTok != "a" {
+		t.Fatalf("saved token = %q, want a (not advanced past the failure)", st.savedTok)
 	}
-	if fs.closeCount != 0 {
-		t.Fatalf("closeCount = %d, want 0 (park-and-continue keeps draining the same cursor)", fs.closeCount)
+	if fs.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (stream closed so the reopen redelivers b)", fs.closeCount)
 	}
 }
 
@@ -483,16 +464,15 @@ func (o *countingObserver) ObserveError(string, error) {
 }
 
 // TestObserveDrainedCountsOnlySent proves the ObserveDrained count excludes
-// parked messages: they are surfaced via ObserveError instead.
+// parked messages: a parked poison event is surfaced via ObserveError instead.
 func TestObserveDrainedCountsOnlySent(t *testing.T) {
-	fs := &fakeStream{events: []*stream.Event{ev("a"), ev("b"), ev("c")}}
+	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", ClusterTime: time.Now(), Err: errors.New("bad bson")}
+	fs := &fakeStream{
+		events: []*stream.Event{ev("a"), nil, ev("c")},
+		errs:   map[int]error{1: de},
+	}
 	st := &fakeStore{stream: fs}
-	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
-		if md.ID == "b" {
-			return errors.New("boom")
-		}
-		return nil
-	})
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &countingObserver{}
 	r := mustRelay(t, st, sender,
 		stream.WithObserver(obs),
@@ -504,10 +484,10 @@ func TestObserveDrainedCountsOnlySent(t *testing.T) {
 	obs.mu.Lock()
 	defer obs.mu.Unlock()
 	if len(obs.drained) != 1 || obs.drained[0] != 2 {
-		t.Fatalf("ObserveDrained counts = %v, want [2] (a and c sent; parked b not counted)", obs.drained)
+		t.Fatalf("ObserveDrained counts = %v, want [2] (a and c sent; parked poison not counted)", obs.drained)
 	}
 	if !obs.errObserved {
-		t.Fatal("ObserveError not called for the parked message")
+		t.Fatal("ObserveError not called for the parked poison event")
 	}
 }
 
@@ -956,13 +936,71 @@ func TestNewRelayRejectsZeroLeaseTTL(t *testing.T) {
 	}
 }
 
-func TestWithLoggerNilIsNoop(t *testing.T) {
-	o := stream.DefaultOptions()
-	real := slog.New(&countingHandler{})
-	stream.WithLogger(real)(&o)
-	stream.WithLogger(nil)(&o)
-	if o.Logger != real {
-		t.Fatal("WithLogger(nil) replaced a previously set logger")
+// TestLeaderDemotionClosesStreamAndReloadsToken pins the demoted-leader
+// hazard: once TryAcquire reports the lease lost, the open cursor MUST be
+// closed (a demoted leader consuming a live cursor would race the new
+// leader), and a later re-promotion MUST reload the position from the store
+// (LoadToken → Watch) rather than resume the stale in-memory cursor — the
+// interim leader may have advanced the persisted token, and resuming the old
+// cursor would re-send everything it delivered.
+func TestLeaderDemotionClosesStreamAndReloadsToken(t *testing.T) {
+	fs := &fakeStream{events: []*stream.Event{ev("a"), ev("b")}}
+	st := &fakeStore{stream: fs}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r := mustRelay(t, st, sender,
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second))
+
+	// Window 1: leader, delivers a+b, persists token "b".
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[leader]: %v", err)
+	}
+	if st.savedTok != "b" {
+		t.Fatalf("saved token = %q, want b", st.savedTok)
+	}
+
+	// Demotion: another instance holds the lock.
+	st.mu.Lock()
+	st.leader = "other"
+	st.mu.Unlock()
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[demoted]: %v", err)
+	}
+	if fs.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (demotion must close the live cursor)", fs.closeCount)
+	}
+
+	// Re-promotion: the lock frees up; the relay must reopen from the STORED
+	// token, not the stale cursor.
+	st.mu.Lock()
+	st.leader = ""
+	st.mu.Unlock()
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[re-promoted]: %v", err)
+	}
+	if got := st.watchTokens; len(got) != 2 || got[1] != "b" {
+		t.Fatalf("watch tokens = %v, want a second Watch resuming from the stored token b", got)
+	}
+}
+
+// TestUnpersistedSaveDoesNotAdvanceLocalTrackers pins the persisted=false
+// contract: a save the store's monotone guard skipped must not advance the
+// relay's local committed-position trackers. Observable via the idle-window
+// no-op-save skip: with persistence denied, lastSavedTok never latches, so an
+// unchanged PBRT is re-saved every window instead of being skipped after the
+// first.
+func TestUnpersistedSaveDoesNotAdvanceLocalTrackers(t *testing.T) {
+	fs := &fakeStream{pbrt: "p1", pbrtCT: time.Now()}
+	st := &fakeStore{stream: fs, loadTok: "existing", denyPersist: true}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r := mustRelay(t, st, sender)
+
+	for range 3 {
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+	}
+	if st.saveCount != 3 {
+		t.Fatalf("saveCount = %d, want 3 (an unpersisted save must not latch lastSavedTok and suppress retries)", st.saveCount)
 	}
 }
 

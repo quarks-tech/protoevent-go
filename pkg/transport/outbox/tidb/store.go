@@ -50,7 +50,8 @@ type Store struct {
 // DSN note: with go-sql-driver/mysql, set interpolateParams=true — without it
 // every parameterized query pays a prepare/exec/close cycle (3 wire round
 // trips), including the publish INSERT inside the caller's business
-// transaction.
+// transaction. For relay use, parseTime=true is REQUIRED too (see
+// NewRelayStore).
 func NewStore(r Runner) *Store { return &Store{r: r} }
 
 var _ outbox.Store = (*Store)(nil)
@@ -68,6 +69,13 @@ type RelayStore struct {
 }
 
 // NewRelayStore builds a relay store over db.
+//
+// DSN note: with go-sql-driver/mysql, parseTime=true is REQUIRED — ListMessages
+// scans create_time (DATETIME(6)) into time.Time, and with the driver default
+// (parseTime=false) every relay page fails with a []uint8→time.Time scan
+// error. The failure only appears once the relay runs (publishing works fine),
+// far from the misconfiguration. interpolateParams=true is additionally
+// recommended (see NewStore).
 func NewRelayStore(db *sql.DB) *RelayStore { return &RelayStore{Store: NewStore(db), db: db} }
 
 var (
@@ -101,6 +109,11 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 		// A zero time would be sent as 0001-01-01, below DATETIME(6)'s minimum,
 		// and surface as an opaque driver error; reject it up front instead.
 		return fmt.Errorf("outbox: message metadata time is zero; set Metadata.Time before publishing")
+	}
+	if m.CreateTime.IsZero() {
+		// Same DATETIME(6) hazard as md.Time above — and create_time also
+		// anchors retention, so a zero value would be swept immediately.
+		return fmt.Errorf("outbox: message create time is zero; set Message.CreateTime before publishing")
 	}
 	meta, err := json.Marshal(md)
 	if err != nil {
@@ -355,9 +368,18 @@ ON DUPLICATE KEY UPDATE
 	}
 
 	var holder string
-	if err := rs.db.QueryRowContext(ctx,
+	err := rs.db.QueryRowContext(ctx,
 		`SELECT holder_id FROM relay_locks WHERE name = ?`, name,
-	).Scan(&holder); err != nil {
+	).Scan(&holder)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The upsert and the read-back are two non-transactional statements: a
+		// live holder's graceful ReleaseLeaderLock can delete the row between
+		// them. No row simply means we don't hold the lock — the semantically
+		// correct answer is false, not an error (which would cost the caller a
+		// spurious pass failure); the next tick's acquire takes the free lock.
+		return false, nil
+	}
+	if err != nil {
 		return false, fmt.Errorf("outbox: read lock holder: %w", err)
 	}
 	return holder == holderID, nil

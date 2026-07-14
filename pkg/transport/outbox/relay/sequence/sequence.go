@@ -90,8 +90,12 @@ type RetentionStore interface {
 	SweepMessages(ctx context.Context, before time.Time, limit int) (int, error)
 }
 
-// Options contains configuration for a sequence relay instance.
-type Options struct {
+// options contains configuration for a sequence relay instance. It is
+// unexported on purpose: the only way to configure a relay is the With*
+// option constructors, whose nil/zero guards are then the single validation
+// surface — an exported mutable struct alongside ...Option would make invalid
+// states representable and force defensive re-defaulting in NewRelay.
+type options struct {
 	BatchSize         int // drain page size (network sends)
 	SequenceBatchSize int // sequencer page size (cheap UPDATE)
 	PollInterval      time.Duration
@@ -106,18 +110,18 @@ type Options struct {
 	// group has a committed offset.
 	StartFromBeginning bool
 
-	RetentionWindow     time.Duration // 0 disables the sweep
-	RetentionSweepEvery int           // run sweep every N ticks
-	RetentionSweepBatch int
+	RetentionWindow        time.Duration // 0 disables the sweep
+	RetentionSweepInterval time.Duration // minimum time between sweeps
+	RetentionSweepBatch    int
 
 	Logger       *slog.Logger // defaults to a discard logger
 	Observer     Observer
 	ErrorHandler relay.ErrorHandler
 }
 
-// DefaultOptions returns the default relay configuration.
-func DefaultOptions() Options {
-	return Options{
+// defaultOptions returns the default relay configuration.
+func defaultOptions() options {
+	return options{
 		BatchSize:         100,
 		SequenceBatchSize: 1000,
 		PollInterval:      time.Second,
@@ -128,33 +132,33 @@ func DefaultOptions() Options {
 }
 
 // Option configures relay options.
-type Option func(*Options)
+type Option func(*options)
 
 // WithBatchSize sets the drain page size (messages listed and sent per page).
-func WithBatchSize(size int) Option { return func(o *Options) { o.BatchSize = size } }
+func WithBatchSize(size int) Option { return func(o *options) { o.BatchSize = size } }
 
 // WithSequenceBatchSize sets the sequencer page size (rows assigned per pass).
-func WithSequenceBatchSize(size int) Option { return func(o *Options) { o.SequenceBatchSize = size } }
+func WithSequenceBatchSize(size int) Option { return func(o *options) { o.SequenceBatchSize = size } }
 
 // WithPollInterval sets the tick interval between relay passes.
-func WithPollInterval(d time.Duration) Option { return func(o *Options) { o.PollInterval = d } }
+func WithPollInterval(d time.Duration) Option { return func(o *options) { o.PollInterval = d } }
 
 // WithLeaseTTL sets the leader-lease TTL.
-func WithLeaseTTL(ttl time.Duration) Option { return func(o *Options) { o.LeaseTTL = ttl } }
+func WithLeaseTTL(ttl time.Duration) Option { return func(o *options) { o.LeaseTTL = ttl } }
 
 // WithLeaderLockName overrides the leader-lock name (defaults to the relay name).
-func WithLeaderLockName(name string) Option { return func(o *Options) { o.LeaderLockName = name } }
+func WithLeaderLockName(name string) Option { return func(o *options) { o.LeaderLockName = name } }
 
 // WithoutSequencer disables this relay's sequencer pass. When several consumer
 // groups share one store, run the sequencer in exactly one relay and configure
 // the others with WithoutSequencer(): each extra relay would otherwise run a
 // redundant sequencer pass every tick — correctness is unaffected (passes
 // serialize on the counter row), but the serialized DB work is wasted.
-func WithoutSequencer() Option { return func(o *Options) { o.SequencerDisabled = true } }
+func WithoutSequencer() Option { return func(o *options) { o.SequencerDisabled = true } }
 
 // WithLogger sets the error logger. A nil logger is ignored.
 func WithLogger(l *slog.Logger) Option {
-	return func(o *Options) {
+	return func(o *options) {
 		if l != nil {
 			o.Logger = l
 		}
@@ -166,30 +170,37 @@ func WithLogger(l *slog.Logger) Option {
 // "latest" (future events only — parity with the stream runtime's
 // start-at-now). Has no effect once the group has a committed offset.
 func WithStartFromBeginning() Option {
-	return func(o *Options) { o.StartFromBeginning = true }
+	return func(o *options) { o.StartFromBeginning = true }
 }
 
 // WithObserver sets the observability sink. A nil observer is ignored.
 func WithObserver(obs Observer) Option {
-	return func(o *Options) {
+	return func(o *options) {
 		if obs != nil {
 			o.Observer = obs
 		}
 	}
 }
 
-// WithErrorHandler switches send-failure handling from stop-the-lane (default,
-// order-preserving) to park-and-continue: the handler is called and the relay
-// advances past the failed message. This trades per-event order for liveness.
+// WithErrorHandler installs the poison-parking hook: a row whose PERSISTED
+// METADATA fails to decode (*DecodeError) is handed to h and the relay
+// advances past it — retrying a poison row can never succeed, so parking it is
+// the only way to keep the lane moving. Send failures are NOT parked
+// regardless of this option: a send failure is downstream trouble, and the
+// lane always stops and retries the same message next tick (order and
+// delivery preserved). Without an ErrorHandler a poison row stops the lane.
 func WithErrorHandler(h relay.ErrorHandler) Option {
-	return func(o *Options) { o.ErrorHandler = h }
+	return func(o *options) { o.ErrorHandler = h }
 }
 
-// WithRetention enables the retention sweep on the leader.
-func WithRetention(window time.Duration, sweepEvery, sweepBatch int) Option {
-	return func(o *Options) {
+// WithRetention enables the retention sweep on the leader: at most one sweep
+// per sweepInterval, deleting up to sweepBatch fully-consumed rows older than
+// window per sweep. sweepInterval is wall-clock time, decoupled from
+// PollInterval — retuning the tick does not silently change sweep cadence.
+func WithRetention(window, sweepInterval time.Duration, sweepBatch int) Option {
+	return func(o *options) {
 		o.RetentionWindow = window
-		o.RetentionSweepEvery = sweepEvery
+		o.RetentionSweepInterval = sweepInterval
 		o.RetentionSweepBatch = sweepBatch
 	}
 }
@@ -203,13 +214,13 @@ type Relay struct {
 	name    string
 	store   Store
 	sender  eventbus.Sender
-	options Options
+	options options
 	leader  *relay.LeaderElector
 
 	sequencer SequencerStore // nil if store lacks the capability or WithoutSequencer
 	retention RetentionStore // nil if store lacks the capability or retention not configured
 
-	tickCount int // for retention cadence
+	lastSweep time.Time // for retention cadence (see maybeSweep)
 
 	// offsetInitialized latches once InitOffsetLatest has run for this Relay
 	// instance. With insert-if-absent semantics a re-run is harmless (an
@@ -220,11 +231,22 @@ type Relay struct {
 	offsetInitialized bool
 }
 
+// maxNameLen bounds the consumer-group and leader-lock names. The reference
+// schema (migrations/) keys outbox_offsets, relay_locks, and outbox_sequencers
+// on VARCHAR(64): under strict sql_mode a longer name fails every tick with a
+// generic 1406 far from the misconfiguration, and under a relaxed sql_mode it
+// is SILENTLY TRUNCATED — two groups sharing a 64-char prefix would then share
+// one offset row and one leader lock (cross-group event loss + broken mutual
+// exclusion). Rejected at construction instead.
+const maxNameLen = 64
+
 // NewRelay creates a relay for the named consumer group. It validates the
 // configuration and returns an error if:
 //
 //   - name is empty: name is the offset-row key and the default leader-lock
 //     name, so two empty-named relays would silently share both;
+//   - name (or an overridden LeaderLockName) exceeds 64 bytes: the reference
+//     schema's key columns are VARCHAR(64), see maxNameLen;
 //   - store or sender is nil;
 //   - PollInterval, BatchSize, SequenceBatchSize, or LeaseTTL is not strictly
 //     positive: a zero PollInterval panics inside time.NewTicker, and a zero
@@ -233,7 +255,7 @@ type Relay struct {
 //     once per tick (and between pages), so it must be renewable at least
 //     twice per TTL or it expires between renewals and leadership silently
 //     flaps every tick (mirrors the stream runtime's DrainWindow guard);
-//   - RetentionWindow is set without a positive sweep cadence and batch.
+//   - RetentionWindow is set without a positive sweep interval and batch.
 //
 // name identifies the consumer (its offset row) and is the default leader-lock
 // name. store reads the log and holds offsets; sender is the downstream
@@ -245,6 +267,9 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	if name == "" {
 		return nil, errors.New("sequence: name must not be empty (it is the offset-row key and the default leader-lock name)")
 	}
+	if len(name) > maxNameLen {
+		return nil, fmt.Errorf("sequence: name %q exceeds %d bytes (the reference schema's VARCHAR(64) key columns; a relaxed sql_mode would silently truncate it into another group's offset row and leader lock)", name, maxNameLen)
+	}
 	if store == nil {
 		return nil, errors.New("sequence: store must not be nil")
 	}
@@ -252,20 +277,15 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		return nil, errors.New("sequence: sender must not be nil")
 	}
 
-	options := DefaultOptions()
+	options := defaultOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
-	// A raw Option (not the With* helpers, which guard against nil) can nil
-	// these out; re-default so the runtime never nil-derefs on its hot path.
-	if options.Observer == nil {
-		options.Observer = newNopObserver()
-	}
-	if options.Logger == nil {
-		options.Logger = slog.New(slog.DiscardHandler)
-	}
 	if options.LeaderLockName == "" {
 		options.LeaderLockName = name
+	}
+	if len(options.LeaderLockName) > maxNameLen {
+		return nil, fmt.Errorf("sequence: LeaderLockName %q exceeds %d bytes (the reference schema's VARCHAR(64) key column)", options.LeaderLockName, maxNameLen)
 	}
 	if options.PollInterval <= 0 {
 		return nil, fmt.Errorf("sequence: PollInterval must be > 0, got %v", options.PollInterval)
@@ -282,9 +302,9 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	if options.PollInterval >= options.LeaseTTL/2 {
 		return nil, fmt.Errorf("sequence: PollInterval (%v) must be < LeaseTTL/2 (%v)", options.PollInterval, options.LeaseTTL/2)
 	}
-	if options.RetentionWindow > 0 && (options.RetentionSweepEvery <= 0 || options.RetentionSweepBatch <= 0) {
-		return nil, fmt.Errorf("sequence: RetentionWindow (%v) requires RetentionSweepEvery > 0 and RetentionSweepBatch > 0, got %d and %d",
-			options.RetentionWindow, options.RetentionSweepEvery, options.RetentionSweepBatch)
+	if options.RetentionWindow > 0 && (options.RetentionSweepInterval <= 0 || options.RetentionSweepBatch <= 0) {
+		return nil, fmt.Errorf("sequence: RetentionWindow (%v) requires RetentionSweepInterval > 0 and RetentionSweepBatch > 0, got %v and %d",
+			options.RetentionWindow, options.RetentionSweepInterval, options.RetentionSweepBatch)
 	}
 
 	ls, _ := store.(relay.LeaderStore)

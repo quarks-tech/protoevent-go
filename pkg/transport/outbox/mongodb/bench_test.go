@@ -89,7 +89,7 @@ func BenchmarkSaveToken(b *testing.B) {
 	ct := time.Now().UTC()
 
 	for b.Loop() {
-		if err := st.SaveToken(ctx, "bench", token, ct); err != nil {
+		if _, err := st.SaveToken(ctx, "bench", token, ct); err != nil {
 			b.Fatalf("save token: %v", err)
 		}
 	}

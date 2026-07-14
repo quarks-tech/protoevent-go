@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
 // shutdownTimeout bounds shutdown-path store I/O (closeStream's Stream.Close,
@@ -66,8 +67,16 @@ func (r *Relay) Run(ctx context.Context) error {
 
 // RunOnce performs one leader-gated drain window. Non-leaders return nil without
 // touching the stream. Exposed for tests; Run calls it in a loop.
+//
+// The setup store calls here (TryAcquire, LoadToken, Watch) are bounded by
+// LeaseTTL via opCtx: without a deadline, a Mongo call that wedges at the
+// network layer would block this single Run goroutine forever — the lease
+// silently expires, a standby takes over, and this instance neither errors
+// nor logs (a silent permanent stall), then resumes as a stale leader when
+// the call finally unblocks. Beyond LeaseTTL the call's success is moot
+// anyway: the lease is already lost.
 func (r *Relay) RunOnce(ctx context.Context) error {
-	leader, err := r.leader.TryAcquire(ctx)
+	leader, err := r.tryAcquireBounded(ctx)
 	if err != nil {
 		return err
 	}
@@ -77,11 +86,11 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 		return nil
 	}
 	if r.stream == nil {
-		token, ct, err := r.store.LoadToken(ctx, r.name)
+		token, ct, err := r.loadTokenBounded(ctx)
 		if err != nil {
 			return err
 		}
-		s, err := r.store.Watch(ctx, token, r.options.DrainWindow)
+		s, err := r.watchBounded(ctx, token)
 		if err != nil {
 			return err
 		}
@@ -134,8 +143,19 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 				// Without a token or an ErrorHandler the error falls through
 				// below and stops the lane without advancing past the event
 				// (at-least-once, order preserved).
-				r.handleError(ctx, &outbox.Message{ID: de.ID}, err)
-				lastTok, lastCT = de.ResumeToken, de.ClusterTime
+				r.handleError(ctx, r.options.ErrorHandler, &outbox.Message{ID: de.ID}, err)
+				lastTok = de.ResumeToken
+				// ClusterTime extraction is best-effort too: a zero one would
+				// (a) be swallowed by the store's monotone guard, freezing the
+				// persisted position at the pre-poison token forever (the lane
+				// reopens onto the poison every window), and (b) zero
+				// committedCT, silencing committedTokenAge()'s cliff alarm
+				// exactly during a poison episode. Anchor on the last
+				// committed clusterTime instead: equal passes the monotone
+				// $lte filter, so the token still advances.
+				if lastCT = de.ClusterTime; lastCT.IsZero() {
+					lastCT = r.committedCT
+				}
 				advanced = true
 				handled++
 				continue
@@ -147,7 +167,12 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 			// the prefix every DrainWindow.
 			if advanced {
 				if saveErr := r.saveToken(ctx, lastTok, lastCT); saveErr != nil {
-					return saveErr
+					// Join rather than replace: returning only saveErr would
+					// launder a fatal Next error (ErrStreamInvalidated /
+					// ErrHistoryLost) into a transient one for this pass, and
+					// Run would do a spurious close/backoff/reopen before the
+					// fatal resurfaced.
+					return errors.Join(err, saveErr)
 				}
 			}
 			return err
@@ -169,15 +194,17 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 				stopped = true
 				break
 			}
-			r.handleError(ctx, e.Message, sendErr)
-			if r.options.ErrorHandler == nil {
-				stopped = true
-				break // stop-the-lane: do not advance past the failure
-			}
-			// park-and-continue: advance past the parked message
-		} else {
-			sent++
+			// A send failure ALWAYS stops the lane, ErrorHandler or not: it is
+			// downstream trouble (broker down, timeout), not an event fault,
+			// and parking healthy events during an outage would bulk-divert
+			// the backlog to the DLQ while advancing the persisted position
+			// past it. The lane reopens at this event — order and delivery
+			// preserved. (The nil handler keeps it out of the DLQ.)
+			r.handleError(ctx, nil, e.Message, sendErr)
+			stopped = true
+			break
 		}
+		sent++
 		lastTok, lastCT = e.ResumeToken, e.ClusterTime
 		advanced = true
 		handled++
@@ -222,23 +249,51 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 }
 
 // saveToken persists the position and updates the local trackers used for
-// no-op-save skipping and lag reporting. When the run ctx is already canceled
-// (the final save on a planned shutdown), the store call gets a fresh bounded
-// context instead: a real store fails writes on a dead context, and losing
-// that save would redeliver up to TokenBatchSize-1 acknowledged sends per
-// deploy. Behavior on a live ctx is unchanged.
+// no-op-save skipping and lag reporting — but ONLY when the store confirms it
+// persisted: a save the monotone guard classified as stale (persisted=false,
+// e.g. a stale leader finishing a slow window) must not advance
+// lastSavedTok/committedCT, or committedTokenAge() — the resume-token-cliff
+// early warning — would report freshness the stored row doesn't have.
+//
+// The store call is bounded via relay.BoundContext: by LeaseTTL while the run
+// ctx is alive (a wedged network call must not silently stall the relay past
+// its own lease), and by shutdownTimeout on a fresh context once the run ctx
+// is canceled (the final save on a planned shutdown — a real store fails
+// writes on a dead context, and losing that save would redeliver up to
+// TokenBatchSize-1 acknowledged sends per deploy).
 func (r *Relay) saveToken(ctx context.Context, tok string, ct time.Time) error {
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-	}
-	if err := r.store.SaveToken(ctx, r.name, tok, ct); err != nil {
+	ctx, cancel := relay.BoundContext(ctx, r.options.LeaseTTL, shutdownTimeout)
+	defer cancel()
+	persisted, err := r.store.SaveToken(ctx, r.name, tok, ct)
+	if err != nil {
 		return err
 	}
-	r.lastSavedTok = tok
-	r.committedCT = ct
+	if persisted {
+		r.lastSavedTok = tok
+		r.committedCT = ct
+	}
 	return nil
+}
+
+// tryAcquireBounded, loadTokenBounded, and watchBounded bound the setup store
+// calls by LeaseTTL (see RunOnce's doc). The Watch bound covers only opening
+// the stream (the initial aggregate); the returned cursor is not tied to it.
+func (r *Relay) tryAcquireBounded(ctx context.Context) (bool, error) {
+	ctx, cancel := relay.BoundContext(ctx, r.options.LeaseTTL, shutdownTimeout)
+	defer cancel()
+	return r.leader.TryAcquire(ctx)
+}
+
+func (r *Relay) loadTokenBounded(ctx context.Context) (string, time.Time, error) {
+	ctx, cancel := relay.BoundContext(ctx, r.options.LeaseTTL, shutdownTimeout)
+	defer cancel()
+	return r.store.LoadToken(ctx, r.name)
+}
+
+func (r *Relay) watchBounded(ctx context.Context, token string) (Stream, error) {
+	ctx, cancel := relay.BoundContext(ctx, r.options.LeaseTTL, shutdownTimeout)
+	defer cancel()
+	return r.store.Watch(ctx, token, r.options.DrainWindow)
 }
 
 // committedTokenAge is the cliff proxy: how far the committed token trails the
@@ -273,10 +328,10 @@ func (r *Relay) sleep(ctx context.Context) {
 	}
 }
 
-func (r *Relay) handleError(ctx context.Context, msg *outbox.Message, err error) {
-	if r.options.ErrorHandler != nil {
-		r.options.ErrorHandler(ctx, msg, err)
-	}
-	r.options.Observer.ObserveError(r.name, err)
-	r.options.Logger.Error("stream relay: message failed", "relay", r.name, "event_id", msg.ID, "err", err)
+// handleError routes a genuine per-message failure to the shared relay error
+// policy. h is the configured ErrorHandler for parkable poison events and nil
+// for stop-the-lane send failures (observe+log only — the event will be
+// redelivered, not parked).
+func (r *Relay) handleError(ctx context.Context, h relay.ErrorHandler, msg *outbox.Message, err error) {
+	relay.HandleMessageError(ctx, h, r.options.Observer, r.options.Logger, "stream", r.name, msg, err)
 }

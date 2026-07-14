@@ -62,10 +62,14 @@ type Store interface {
 	LoadToken(ctx context.Context, name string) (token string, clusterTime time.Time, err error)
 
 	// SaveToken persists the resume token + its clusterTime for the consumer
-	// group. Implementations SHOULD be monotone in clusterTime: a save carrying
+	// group. Implementations MUST be monotone in clusterTime: a save carrying
 	// an older clusterTime than the stored row must not rewind it (a stale
-	// leader finishing a slow window could otherwise overwrite a newer position).
-	SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) error
+	// leader finishing a slow window could otherwise overwrite a newer
+	// position). persisted reports whether the row now holds THIS token: false
+	// means the save was classified stale and skipped — the caller must not
+	// advance its local committed-position trackers on a false return, or its
+	// lag/cliff reporting diverges from what is actually stored.
+	SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) (persisted bool, err error)
 
 	// Watch opens a change stream on the outbox collection, filtered to inserts,
 	// resumed from token (or from "now" when token is ""). maxAwait is the longest
@@ -108,8 +112,12 @@ type Event struct {
 	ClusterTime time.Time
 }
 
-// Options configures a stream relay.
-type Options struct {
+// options configures a stream relay. It is unexported on purpose: the only
+// way to configure a relay is the With* option constructors, whose nil/zero
+// guards are then the single validation surface — an exported mutable struct
+// alongside ...Option would make invalid states representable and force
+// defensive re-defaulting in NewRelay.
+type options struct {
 	// DrainWindow is the single latency knob: it is both the relay loop tick
 	// (the idle/backoff sleep between passes) and the change stream's
 	// maxAwaitTime — passed to Store.Watch as maxAwait, bounding how long a
@@ -124,9 +132,9 @@ type Options struct {
 	ErrorHandler relay.ErrorHandler
 }
 
-// DefaultOptions returns the default stream relay configuration.
-func DefaultOptions() Options {
-	return Options{
+// defaultOptions returns the default stream relay configuration.
+func defaultOptions() options {
+	return options{
 		DrainWindow:    time.Second,
 		LeaseTTL:       15 * time.Second,
 		TokenBatchSize: 100,
@@ -135,24 +143,25 @@ func DefaultOptions() Options {
 	}
 }
 
-// Option configures Options.
-type Option func(*Options)
+// Option configures the relay.
+type Option func(*options)
 
-// WithDrainWindow sets the drain window — the single latency knob (see Options.DrainWindow).
-func WithDrainWindow(d time.Duration) Option { return func(o *Options) { o.DrainWindow = d } }
+// WithDrainWindow sets the drain window — the single latency knob: both the
+// relay loop tick (idle/backoff sleep) and the change stream's maxAwaitTime.
+func WithDrainWindow(d time.Duration) Option { return func(o *options) { o.DrainWindow = d } }
 
 // WithLeaseTTL sets the leader-lease TTL.
-func WithLeaseTTL(d time.Duration) Option { return func(o *Options) { o.LeaseTTL = d } }
+func WithLeaseTTL(d time.Duration) Option { return func(o *options) { o.LeaseTTL = d } }
 
 // WithLeaderLockName overrides the leader-lock name (defaults to the relay name).
-func WithLeaderLockName(s string) Option { return func(o *Options) { o.LeaderLockName = s } }
+func WithLeaderLockName(s string) Option { return func(o *options) { o.LeaderLockName = s } }
 
 // WithTokenBatchSize sets the max events processed before a forced token persist.
-func WithTokenBatchSize(n int) Option { return func(o *Options) { o.TokenBatchSize = n } }
+func WithTokenBatchSize(n int) Option { return func(o *options) { o.TokenBatchSize = n } }
 
 // WithLogger sets the error logger. A nil logger is ignored.
 func WithLogger(l *slog.Logger) Option {
-	return func(o *Options) {
+	return func(o *options) {
 		if l != nil {
 			o.Logger = l
 		}
@@ -161,17 +170,23 @@ func WithLogger(l *slog.Logger) Option {
 
 // WithObserver sets the observability sink. A nil observer is ignored.
 func WithObserver(obs relay.Observer) Option {
-	return func(o *Options) {
+	return func(o *options) {
 		if obs != nil {
 			o.Observer = obs
 		}
 	}
 }
 
-// WithErrorHandler switches send-failure handling from stop-the-lane (default,
-// order-preserving) to park-and-continue.
+// WithErrorHandler installs the poison-parking hook: an event whose payload
+// fails to decode (*DecodeError with a usable resume token) is handed to h
+// and the relay advances past it — retrying a poison event can never succeed,
+// so parking it is the only way to keep the lane moving. Send failures are
+// NOT parked regardless of this option: a send failure is downstream trouble,
+// and the lane always stops and redelivers the same event on reopen (order
+// and delivery preserved). Without an ErrorHandler a poison event stops the
+// lane.
 func WithErrorHandler(h relay.ErrorHandler) Option {
-	return func(o *Options) { o.ErrorHandler = h }
+	return func(o *options) { o.ErrorHandler = h }
 }
 
 // Relay tails the outbox change stream for one consumer group and forwards to
@@ -181,7 +196,7 @@ type Relay struct {
 	name    string
 	store   Store
 	sender  eventbus.Sender
-	options Options
+	options options
 	leader  *relay.LeaderElector
 
 	// Runtime state, populated by Run/RunOnce (pkg/.../stream/run.go).
@@ -221,17 +236,9 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		return nil, errors.New("stream: sender must not be nil")
 	}
 
-	options := DefaultOptions()
+	options := defaultOptions()
 	for _, opt := range opts {
 		opt(&options)
-	}
-	// Re-default after applying options: a raw Option can nil these past the
-	// With* nil guards.
-	if options.Observer == nil {
-		options.Observer = relay.NopObserver()
-	}
-	if options.Logger == nil {
-		options.Logger = slog.New(slog.DiscardHandler)
 	}
 	if options.LeaderLockName == "" {
 		options.LeaderLockName = name

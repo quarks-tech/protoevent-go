@@ -55,13 +55,27 @@ func TestCreateOutboxMessageRejectsEmptyID(t *testing.T) {
 	}
 }
 
+// TestCreateOutboxMessageRejectsZeroCreateTime proves the TTL-anchor guard:
+// create_time drives the TTL index, and a zero value (0001-01-01) is already
+// past every retention window — the TTL monitor would silently reap the row
+// before the relay drains it. Fires before any driver call (nil db).
+func TestCreateOutboxMessageRejectsZeroCreateTime(t *testing.T) {
+	st := mongodbstore.NewStore(nil)
+	md := event.NewMetadata("books.created")
+	md.ID = "id-1"
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: md.ID, Metadata: md})
+	if err == nil || !strings.Contains(err.Error(), "create time is zero") {
+		t.Fatalf("err = %v, want descriptive zero-create-time error", err)
+	}
+}
+
 // TestCreateOutboxMessageRejectsTransactionlessCtx proves the tx guard: a
 // valid message published on a ctx with no running transaction is rejected
 // (an outbox row committing independently of the business write would be a
 // phantom event), before any driver call — same nil-*mongo.Database trick.
 func TestCreateOutboxMessageRejectsTransactionlessCtx(t *testing.T) {
 	st := mongodbstore.NewStore(nil)
-	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id", Metadata: event.NewMetadata("t")})
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id", Metadata: event.NewMetadata("t"), CreateTime: time.Now()})
 	if err == nil || !strings.Contains(err.Error(), "transaction") {
 		t.Fatalf("expected transactionless-ctx rejection, got %v", err)
 	}
@@ -73,6 +87,29 @@ func TestCreateOutboxMessageRejectsTransactionlessCtx(t *testing.T) {
 // call (nil *mongo.Database).
 func TestEnsureIndexesRejectsSubSecondRetention(t *testing.T) {
 	st := mongodbstore.NewStore(nil, mongodbstore.WithRetention(500*time.Millisecond))
+	err := st.EnsureIndexes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "retention") {
+		t.Fatalf("expected retention range rejection, got %v", err)
+	}
+}
+
+// TestEnsureIndexesRejectsFractionalRetention proves a retention that is not
+// a whole number of seconds is rejected rather than silently truncated:
+// 1500ms would otherwise become a 1s TTL, expiring rows earlier than the
+// configured window.
+func TestEnsureIndexesRejectsFractionalRetention(t *testing.T) {
+	st := mongodbstore.NewStore(nil, mongodbstore.WithRetention(1500*time.Millisecond))
+	err := st.EnsureIndexes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "whole number of seconds") {
+		t.Fatalf("expected fractional-retention rejection, got %v", err)
+	}
+}
+
+// TestEnsureIndexesRejectsRetentionAboveTTLRange is the regression test for
+// the upper bound: expireAfterSeconds is int32, and 2^31 seconds would
+// overflow the cast.
+func TestEnsureIndexesRejectsRetentionAboveTTLRange(t *testing.T) {
+	st := mongodbstore.NewStore(nil, mongodbstore.WithRetention((1<<31)*time.Second))
 	err := st.EnsureIndexes(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "retention") {
 		t.Fatalf("expected retention range rejection, got %v", err)
@@ -260,8 +297,8 @@ func TestOffsetRoundTrip(t *testing.T) {
 	st := mongodbstore.NewStore(testDB)
 	ctx := context.Background()
 	ct := time.Now().UTC().Truncate(time.Millisecond)
-	if err := st.SaveToken(ctx, "c", "\x01\x02", ct); err != nil {
-		t.Fatal(err)
+	if persisted, err := st.SaveToken(ctx, "c", "\x01\x02", ct); err != nil || !persisted {
+		t.Fatalf("SaveToken: persisted=%v err=%v, want true, nil", persisted, err)
 	}
 	tok, gotCT, err := st.LoadToken(ctx, "c") // tok is string
 	if err != nil {
@@ -291,13 +328,14 @@ func TestSaveTokenMonotoneClusterTime(t *testing.T) {
 	t0 := t1.Add(-time.Minute)
 	t2 := t1.Add(time.Minute)
 
-	if err := st.SaveToken(ctx, "c", "tok1", t1); err != nil {
-		t.Fatalf("save tok1: %v", err)
+	if persisted, err := st.SaveToken(ctx, "c", "tok1", t1); err != nil || !persisted {
+		t.Fatalf("save tok1: persisted=%v err=%v, want true, nil", persisted, err)
 	}
-	// Stale save: older clusterTime must not rewind the stored row — and must
-	// not error either (the no-op is deliberate, not a failure).
-	if err := st.SaveToken(ctx, "c", "tok0", t0); err != nil {
-		t.Fatalf("stale save returned an error, want silent no-op: %v", err)
+	// Stale save: older clusterTime must not rewind the stored row — no error
+	// (the skip is deliberate, not a failure), but persisted=false so the
+	// caller knows its position was NOT stored and must not advance trackers.
+	if persisted, err := st.SaveToken(ctx, "c", "tok0", t0); err != nil || persisted {
+		t.Fatalf("stale save: persisted=%v err=%v, want false, nil", persisted, err)
 	}
 	tok, gotCT, err := st.LoadToken(ctx, "c")
 	if err != nil {
@@ -307,8 +345,8 @@ func TestSaveTokenMonotoneClusterTime(t *testing.T) {
 		t.Fatalf("after stale save: token = %q ct = %v, want tok1 %v (rewound!)", tok, gotCT, t1)
 	}
 	// Newer save still advances.
-	if err := st.SaveToken(ctx, "c", "tok2", t2); err != nil {
-		t.Fatalf("save tok2: %v", err)
+	if persisted, err := st.SaveToken(ctx, "c", "tok2", t2); err != nil || !persisted {
+		t.Fatalf("save tok2: persisted=%v err=%v, want true, nil", persisted, err)
 	}
 	tok, gotCT, err = st.LoadToken(ctx, "c")
 	if err != nil {
@@ -321,8 +359,8 @@ func TestSaveTokenMonotoneClusterTime(t *testing.T) {
 	// Event clusterTimes carry whole-second granularity, so a train of events
 	// committed in the same second all save at the same clusterTime — treating
 	// equality as stale would freeze the token at the first of them.
-	if err := st.SaveToken(ctx, "c", "tok3", t2); err != nil {
-		t.Fatalf("equal-clusterTime save: %v", err)
+	if persisted, err := st.SaveToken(ctx, "c", "tok3", t2); err != nil || !persisted {
+		t.Fatalf("equal-clusterTime save: persisted=%v err=%v, want true, nil", persisted, err)
 	}
 	tok, gotCT, err = st.LoadToken(ctx, "c")
 	if err != nil {
@@ -347,10 +385,10 @@ func TestSaveTokenRejectsEmptyToken(t *testing.T) {
 	ctx := context.Background()
 
 	ct := time.Now().UTC().Truncate(time.Millisecond)
-	if err := st.SaveToken(ctx, "c", "tok1", ct); err != nil {
-		t.Fatalf("save tok1: %v", err)
+	if persisted, err := st.SaveToken(ctx, "c", "tok1", ct); err != nil || !persisted {
+		t.Fatalf("save tok1: persisted=%v err=%v, want true, nil", persisted, err)
 	}
-	if err := st.SaveToken(ctx, "c", "", ct.Add(time.Minute)); err == nil {
+	if _, err := st.SaveToken(ctx, "c", "", ct.Add(time.Minute)); err == nil {
 		t.Fatal("SaveToken with empty token succeeded; want an error")
 	}
 	tok, gotCT, err := st.LoadToken(ctx, "c")
@@ -386,8 +424,8 @@ func TestSaveTokenHealsRowWithoutClusterTime(t *testing.T) {
 
 	st := mongodbstore.NewStore(testDB)
 	ct := time.Now().UTC().Truncate(time.Millisecond)
-	if err := st.SaveToken(ctx, "c", "tok1", ct); err != nil {
-		t.Fatalf("save over legacy row: %v", err)
+	if persisted, err := st.SaveToken(ctx, "c", "tok1", ct); err != nil || !persisted {
+		t.Fatalf("save over legacy row: persisted=%v err=%v, want true, nil", persisted, err)
 	}
 	tok, gotCT, err := st.LoadToken(ctx, "c")
 	if err != nil {

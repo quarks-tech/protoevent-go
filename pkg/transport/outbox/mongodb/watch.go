@@ -2,6 +2,8 @@ package mongodb
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -14,6 +16,10 @@ import (
 )
 
 var _ stream.Store = (*Store)(nil)
+
+// resumeTokenTimestampMarker is the KeyString type marker that opens a resume
+// token's _data payload, immediately followed by the big-endian clusterTime.
+const resumeTokenTimestampMarker = 0x82
 
 // changeStreamHistoryLostCode is the MongoDB server error code for
 // ChangeStreamHistoryLost: the resume token has fallen off the oplog window.
@@ -115,19 +121,51 @@ func (m *mongoStream) Next(ctx context.Context) (*stream.Event, bool, error) {
 }
 
 // PBRT returns the postBatchResumeToken after an empty window. The driver
-// surfaces the batch-level token via ResumeToken(); the token's embedded
-// clusterTime is not exposed, so we stamp "now" as the anchor (a connected,
-// caught-up consumer's head is approximately now). The stamp is truncated to
-// seconds to match the granularity of event clusterTimes (bson.Timestamp
-// carries whole seconds): a millisecond-precision "now" would compare as
-// NEWER than an event committed in the same second, making SaveToken's
-// monotone guard misclassify the very next event-token save as stale.
+// surfaces the batch-level token via ResumeToken(); the anchor clusterTime is
+// decoded from the token itself (clusterTimeFromToken), so it lives in the
+// SAME clock domain as event clusterTimes — the server's. Stamping client
+// time.Now() here instead would poison SaveToken's monotone guard under clock
+// skew: a host clock N ahead of the server persists an idle-window anchor N
+// in the future, and every real event-token save for the next N is silently
+// classified stale (nothing persists while committedTokenAge reports fresh).
+//
+// Fallback for a token whose payload defies the known layout: client "now"
+// truncated to whole seconds (bson.Timestamp granularity — millisecond
+// precision would compare NEWER than a same-second event and misclassify the
+// very next event-token save as stale).
 func (m *mongoStream) PBRT() (string, time.Time) {
 	tok := m.cs.ResumeToken()
 	if tok == nil {
 		return "", time.Time{}
 	}
+	if ct, ok := clusterTimeFromToken(tok); ok {
+		return string(tok), ct
+	}
 	return string(tok), time.Now().UTC().Truncate(time.Second)
+}
+
+// clusterTimeFromToken extracts the clusterTime embedded in a resume token.
+// A resume token is a {"_data": "<hex>"} document whose payload is a
+// KeyString: byte 0 is the Timestamp type marker (0x82) and bytes 1-8 are the
+// big-endian bson.Timestamp (4 bytes seconds, 4 bytes increment). This layout
+// is stable across server versions ≥4.2 (it is what makes tokens comparable
+// server-side), but decoding stays best-effort: ok=false on any surprise, and
+// the caller falls back rather than fails.
+func clusterTimeFromToken(tok bson.Raw) (time.Time, bool) {
+	v, err := tok.LookupErr("_data")
+	if err != nil {
+		return time.Time{}, false
+	}
+	s, ok := v.StringValueOK()
+	if !ok {
+		return time.Time{}, false
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) < 5 || b[0] != resumeTokenTimestampMarker {
+		return time.Time{}, false
+	}
+	secs := binary.BigEndian.Uint32(b[1:5])
+	return time.Unix(int64(secs), 0).UTC(), true
 }
 
 func (m *mongoStream) Close(ctx context.Context) error { return m.cs.Close(ctx) }

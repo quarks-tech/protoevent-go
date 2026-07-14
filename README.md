@@ -28,6 +28,7 @@ go get github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq
 
 For Transactional Outbox transport (the engine plus the store backend you use —
 each is its own module):
+
 ```bash
 go get github.com/quarks-tech/protoevent-go/pkg/transport/outbox
 go get github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb     # TiDB store
@@ -316,7 +317,7 @@ the ID the publisher assigned. Pass
 
 ```go
 r, err := sequence.NewRelay("broker-publish", tidb.NewRelayStore(db), rabbitSender,
-    sequence.WithRetention(7*24*time.Hour, 256, 5000),
+    sequence.WithRetention(7*24*time.Hour, 5*time.Minute, 5000),
 )
 if err != nil {
     log.Fatal(err)

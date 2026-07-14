@@ -105,7 +105,12 @@ var (
 // is loud: expireAfterSeconds is an int32 of whole seconds, and a sub-second
 // retention would truncate to 0 — a TTL that expires every outbox row as soon
 // as create_time passes, silently losing events the relay hasn't drained.
+// Fractional seconds are rejected outright rather than silently truncated
+// (1500ms would otherwise become a 1s TTL that fires earlier than configured).
 func (s *Store) EnsureIndexes(ctx context.Context) error {
+	if s.retention%time.Second != 0 {
+		return fmt.Errorf("outbox: ensure ttl index: retention %v is not a whole number of seconds (expireAfterSeconds is int32 seconds; truncating would expire rows earlier than configured)", s.retention)
+	}
 	secs := int64(s.retention / time.Second)
 	if secs < 1 || secs > math.MaxInt32 {
 		return fmt.Errorf("outbox: ensure ttl index: retention %v outside the TTL range [1s, ~68y]", s.retention)
@@ -141,6 +146,12 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) er
 	}
 	if msg.Metadata == nil {
 		return fmt.Errorf("outbox: message metadata is nil")
+	}
+	if msg.CreateTime.IsZero() {
+		// create_time is the TTL anchor: a zero value (0001-01-01) is already
+		// past every retention window, so the TTL monitor would silently reap
+		// the row on its next pass — an event lost before the relay drains it.
+		return fmt.Errorf("outbox: message create time is zero; set Message.CreateTime before publishing")
 	}
 	if sess := mongo.SessionFromContext(ctx); sess == nil || !sess.TransactionRunning() {
 		return fmt.Errorf("outbox: create message: ctx has no running transaction; " +
@@ -184,14 +195,15 @@ func (s *Store) LoadToken(ctx context.Context, name string) (string, time.Time, 
 // a stale leader finishing a slow window cannot rewind a newer position. When
 // the stored row is newer, the filter matches nothing and the upsert attempts
 // an insert, which hits the _id unique index — that duplicate-key error MEANS
-// "stored token is newer" and the stale save is deliberately swallowed as a
-// no-op. A stored row LACKING cluster_time (never written by this package;
-// external tampering or manual repair) also matches, so a legacy/damaged row
-// is healed by the next save instead of freezing the token forever behind the
-// same swallowed duplicate-key path.
-func (s *Store) SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) error {
+// "stored token is newer" and the stale save is skipped, reported as
+// persisted=false so the caller does not advance its local trackers past a
+// position that was never stored. A stored row LACKING cluster_time (never
+// written by this package; external tampering or manual repair) also matches,
+// so a legacy/damaged row is healed by the next save instead of freezing the
+// token forever behind the same duplicate-key path.
+func (s *Store) SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) (bool, error) {
 	if token == "" {
-		return fmt.Errorf("outbox: save token: empty resume token for group %q; an empty token is never a valid position (it would erase the stored one)", name)
+		return false, fmt.Errorf("outbox: save token: empty resume token for group %q; an empty token is never a valid position (it would erase the stored one)", name)
 	}
 	_, err := s.db.Collection(offsetsCollection).UpdateOne(ctx,
 		bson.M{"_id": name, "$or": bson.A{
@@ -207,11 +219,11 @@ func (s *Store) SaveToken(ctx context.Context, name string, token string, cluste
 	)
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
-			return nil // stored row carries a newer clusterTime; stale save is a no-op
+			return false, nil // stored row carries a newer clusterTime; stale save skipped
 		}
-		return fmt.Errorf("outbox: save token: %w", err)
+		return false, fmt.Errorf("outbox: save token: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // TryAcquireLeaderLock acquires or renews the lock via a conditional

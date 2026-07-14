@@ -61,6 +61,22 @@ func TestCreateOutboxMessageRejectsZeroTime(t *testing.T) {
 	}
 }
 
+// TestCreateOutboxMessageRejectsZeroCreateTime proves the symmetric guard for
+// Message.CreateTime: it shares md.Time's DATETIME(6) below-minimum hazard AND
+// anchors retention (a zero create_time would be swept immediately). The
+// production Sender stamps it, but CreateOutboxMessage is exported for direct
+// use.
+func TestCreateOutboxMessageRejectsZeroCreateTime(t *testing.T) {
+	st := tidb.NewStore(nil)
+	md := event.NewMetadata("books.created")
+	md.ID = uuid.NewString()
+	md.Time = time.Now()
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: md.ID, Metadata: md})
+	if err == nil || !strings.Contains(err.Error(), "create time is zero") {
+		t.Fatalf("err = %v, want descriptive zero-create-time error", err)
+	}
+}
+
 var testDB *sql.DB
 
 func TestMain(m *testing.M) {

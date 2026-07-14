@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
 // commitTimeout bounds the final CommitOffset on a planned shutdown with a
@@ -13,6 +14,15 @@ import (
 // canceled, and a real store would fail the write on a dead context —
 // mirroring relay/leader.go's releaseTimeout pattern.
 const commitTimeout = 5 * time.Second
+
+// maxPagesPerTick bounds the full-page loops in sequence() and drain() within
+// one RunOnce. Without a cap, a producer that keeps every page full pins the
+// pass in one phase indefinitely — sequence() would starve drain() (nothing
+// delivered at all while the sequencer treadmills) and both would starve the
+// retention sweep. Hitting the cap ends the phase cleanly; the next tick
+// continues where the offset/sequencer left off. Generous on purpose: at the
+// default page sizes this is 64k rows sequenced / 6.4k sends per tick.
+const maxPagesPerTick = 64
 
 // errLostLeadership signals that a between-pages lease renewal reported the
 // lock lost or failed: the current pass must stop as a whole (a known
@@ -97,13 +107,15 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 }
 
 // sequence assigns offsets to committed pending rows, looping while pages are
-// full so a burst is fully sequenced within the tick. The leader lease is
-// renewed between full pages (see drain for the rationale).
+// full so a burst is fully sequenced within the tick — bounded by
+// maxPagesPerTick so a sustained full-rate producer cannot pin the pass here
+// and starve drain and the sweep. The leader lease is renewed between full
+// pages (see drain for the rationale).
 func (r *Relay) sequence(ctx context.Context) error {
 	if r.sequencer == nil {
 		return nil
 	}
-	for {
+	for range maxPagesPerTick {
 		n, err := r.sequencer.SequenceMessages(ctx, r.options.SequenceBatchSize)
 		if err != nil {
 			return err
@@ -129,13 +141,17 @@ func (r *Relay) sequence(ctx context.Context) error {
 			return errLostLeadership
 		}
 	}
+	return nil // maxPagesPerTick full pages: yield to drain; the next tick continues
 }
 
 // drain forwards messages in Seq order, committing the offset only after a
-// successful send. On send failure it stops the lane (default) or parks and
-// continues (WithErrorHandler). Loops while pages are full, renewing the
-// leader lease between pages so a long backlog cannot outlive the lease —
-// bounding stale-leader overlap to a single page.
+// successful send. A send failure ALWAYS stops the lane — the failed message
+// retries next tick, preserving both order and delivery. Only a poison row
+// (persisted metadata that fails to decode, *DecodeError) is ever parked via
+// the ErrorHandler: retrying it can never succeed. Loops while pages are full
+// (bounded by maxPagesPerTick so a sustained backlog cannot starve the sweep),
+// renewing the leader lease between pages so a long backlog cannot outlive
+// the lease — bounding stale-leader overlap to a single page.
 func (r *Relay) drain(ctx context.Context) error {
 	offset, err := r.store.Offset(ctx, r.name)
 	if err != nil {
@@ -154,7 +170,7 @@ func (r *Relay) drain(ctx context.Context) error {
 		r.offsetInitialized = true
 	}
 
-	for {
+	for range maxPagesPerTick {
 		msgs, listErr := r.store.ListMessages(ctx, offset, r.options.BatchSize)
 		poison, isPoison := errors.AsType[*DecodeError](listErr)
 		if listErr != nil && !isPoison {
@@ -181,21 +197,19 @@ func (r *Relay) drain(ctx context.Context) error {
 				if ctx.Err() != nil {
 					// The send failed because the run context was canceled
 					// mid-flight: same shutdown case — no park, no advance.
-					// A genuine op-level error (e.g. DeadlineExceeded while
-					// the run ctx is alive) falls through to handleError.
 					canceled = true
 					break
 				}
-				r.handleError(ctx, m, sendErr)
-				if r.options.ErrorHandler == nil {
-					stopped = true
-					break // stop-the-lane: leave this seq for the next tick
-				}
-				// park-and-continue: advance past the parked message. It is
-				// reported via ObserveError (in handleError) and NOT counted
-				// as sent.
-				maxSeq = m.Seq
-				continue
+				// A send failure ALWAYS stops the lane, ErrorHandler or not:
+				// it is downstream trouble (broker down, timeout), not a
+				// message fault, and parking healthy messages during an
+				// outage would bulk-divert the entire backlog to the DLQ
+				// while permanently advancing the offset past it. The failed
+				// message retries next tick — order and delivery preserved.
+				// (The nil handler keeps it out of the DLQ; observe+log only.)
+				r.handleError(ctx, nil, m, sendErr)
+				stopped = true
+				break // stop-the-lane: leave this seq for the next tick
 			}
 			maxSeq = m.Seq
 			sent++
@@ -208,7 +222,7 @@ func (r *Relay) drain(ctx context.Context) error {
 		// and when the lane already stopped before reaching it.
 		parkedPoison := false
 		if poison != nil && !stopped && !canceled && r.options.ErrorHandler != nil && ctx.Err() == nil {
-			r.handleError(ctx, &outbox.Message{ID: poison.ID, Seq: poison.Seq}, poison)
+			r.handleError(ctx, r.options.ErrorHandler, &outbox.Message{ID: poison.ID, Seq: poison.Seq}, poison)
 			maxSeq = max(maxSeq, poison.Seq)
 			parkedPoison = true
 		}
@@ -272,42 +286,43 @@ func (r *Relay) drain(ctx context.Context) error {
 			return errLostLeadership
 		}
 	}
+	return nil // maxPagesPerTick full pages: yield to the sweep; the next tick continues
 }
 
 // commitOffset persists the watermark. When the run ctx is already canceled
 // (the final commit on a planned shutdown), the store call gets a fresh
-// bounded context instead: a real store fails writes on a dead context, and
-// losing that commit would redeliver the page's acknowledged sends on
-// restart. Behavior on a live ctx is unchanged.
+// bounded context instead (relay.BoundContext): a real store fails writes on
+// a dead context, and losing that commit would redeliver the page's
+// acknowledged sends on restart. Behavior on a live ctx is unchanged.
 func (r *Relay) commitOffset(ctx context.Context, seq int64) error {
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.Background(), commitTimeout)
-		defer cancel()
-	}
+	ctx, cancel := relay.BoundContext(ctx, 0, commitTimeout)
+	defer cancel()
 	return r.store.CommitOffset(ctx, r.name, seq)
 }
 
+// maybeSweep runs the retention sweep at most once per RetentionSweepInterval
+// of wall-clock time — decoupled from PollInterval, so retuning the tick does
+// not silently change sweep cadence. The first leader tick sweeps immediately
+// (lastSweep zero); the sweep is bounded by RetentionSweepBatch, so an early
+// first sweep is cheap.
 func (r *Relay) maybeSweep(ctx context.Context) error {
 	if r.retention == nil {
 		return nil
 	}
-	r.tickCount++
-	if r.tickCount%r.options.RetentionSweepEvery != 0 {
+	if !r.lastSweep.IsZero() && time.Since(r.lastSweep) < r.options.RetentionSweepInterval {
 		return nil
 	}
+	r.lastSweep = time.Now()
 	before := time.Now().UTC().Add(-r.options.RetentionWindow)
 	_, err := r.retention.SweepMessages(ctx, before, r.options.RetentionSweepBatch)
 	return err
 }
 
-// handleError routes a genuine per-message failure (send or decode) to the
-// ErrorHandler (if configured), the Observer, and the Logger. Never called
-// for shutdown cancellation: a canceled run context stops the lane instead.
-func (r *Relay) handleError(ctx context.Context, msg *outbox.Message, err error) {
-	if r.options.ErrorHandler != nil {
-		r.options.ErrorHandler(ctx, msg, err)
-	}
-	r.options.Observer.ObserveError(r.name, err)
-	r.options.Logger.Error("sequence relay: message failed", "relay", r.name, "event_id", msg.ID, "err", err)
+// handleError routes a genuine per-message failure to the shared relay error
+// policy. h is the configured ErrorHandler for parkable poison rows and nil
+// for stop-the-lane send failures (observe+log only — the message will be
+// retried, not parked). Never called for shutdown cancellation: a canceled
+// run context stops the lane instead.
+func (r *Relay) handleError(ctx context.Context, h relay.ErrorHandler, msg *outbox.Message, err error) {
+	relay.HandleMessageError(ctx, h, r.options.Observer, r.options.Logger, "sequence", r.name, msg, err)
 }

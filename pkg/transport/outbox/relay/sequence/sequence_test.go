@@ -36,43 +36,6 @@ func mdSeq(md *event.Metadata) int64 {
 	return n
 }
 
-func TestDefaultOptions(t *testing.T) {
-	o := sequence.DefaultOptions()
-	if o.BatchSize != 100 {
-		t.Fatalf("BatchSize = %d, want 100", o.BatchSize)
-	}
-	if o.SequenceBatchSize != 1000 {
-		t.Fatalf("SequenceBatchSize = %d, want 1000", o.SequenceBatchSize)
-	}
-	if o.PollInterval != time.Second {
-		t.Fatalf("PollInterval = %v, want 1s", o.PollInterval)
-	}
-	if o.LeaseTTL != 15*time.Second {
-		t.Fatalf("LeaseTTL = %v, want 15s", o.LeaseTTL)
-	}
-}
-
-func TestOptionsApply(t *testing.T) {
-	o := sequence.DefaultOptions()
-	for _, opt := range []sequence.Option{
-		sequence.WithBatchSize(50),
-		sequence.WithSequenceBatchSize(500),
-		sequence.WithoutSequencer(),
-		sequence.WithRetention(7*24*time.Hour, 256, 5000),
-	} {
-		opt(&o)
-	}
-	if o.BatchSize != 50 || o.SequenceBatchSize != 500 {
-		t.Fatalf("batch sizes not applied: %+v", o)
-	}
-	if !o.SequencerDisabled {
-		t.Fatal("WithoutSequencer did not set SequencerDisabled")
-	}
-	if o.RetentionWindow != 7*24*time.Hour || o.RetentionSweepEvery != 256 || o.RetentionSweepBatch != 5000 {
-		t.Fatalf("retention not applied: %+v", o)
-	}
-}
-
 func TestNewRelayRejectsZeroPollInterval(t *testing.T) {
 	// A zero PollInterval previously panicked inside time.NewTicker; it must
 	// now be rejected at construction time. Valid store and sender, so no
@@ -432,7 +395,13 @@ func TestNonLeaderDoesNothing(t *testing.T) {
 	}
 }
 
-func TestParkAndContinueAdvancesPastFailure(t *testing.T) {
+// TestSendFailureStopsLaneEvenWithErrorHandler pins the ErrorHandler's scope:
+// it parks POISON rows only, never send failures. A send failure is
+// downstream trouble (broker down), and parking healthy messages during an
+// outage would bulk-divert the backlog to the DLQ while permanently advancing
+// the offset past it. The lane must stop at the failure and retry it next
+// tick — order and delivery preserved.
+func TestSendFailureStopsLaneEvenWithErrorHandler(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
 		st.append(msg(0))
@@ -455,15 +424,26 @@ func TestParkAndContinueAdvancesPastFailure(t *testing.T) {
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
-	// 3 parked; 1,2,4,5 delivered; offset advances to 5.
-	if off := st.offsets["c"]; off != 5 {
-		t.Fatalf("offset = %d, want 5 (park-and-continue advances past failure)", off)
+	if len(parked) != 0 {
+		t.Fatalf("parked = %v, want none (send failures must never be parked)", parked)
 	}
-	if len(parked) != 1 || parked[0] != 3 {
-		t.Fatalf("parked = %v, want [3]", parked)
+	if off := st.offsets["c"]; off != 2 {
+		t.Fatalf("offset = %d, want 2 (lane stops at the send failure)", off)
 	}
-	if len(got) != 4 {
-		t.Fatalf("delivered = %v, want 4 messages", got)
+	if len(got) != 2 {
+		t.Fatalf("delivered = %v, want [1 2]", got)
+	}
+
+	// While downstream stays broken, subsequent ticks keep stopping at seq 3 —
+	// nothing is skipped and nothing reaches the DLQ.
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[retry]: %v", err)
+	}
+	if off := st.offsets["c"]; off != 2 {
+		t.Fatalf("offset = %d, want 2 (still stopped while downstream is down)", off)
+	}
+	if len(parked) != 0 {
+		t.Fatalf("parked = %v after retry tick, want none", parked)
 	}
 }
 
@@ -720,33 +700,42 @@ func (s noRetentionStore) ReleaseLeaderLock(ctx context.Context, name, holderID 
 
 // --- maybeSweep ---------------------------------------------------------------
 
-// TestMaybeSweepRunsOnCadence proves the retention sweep fires exactly every
-// RetentionSweepEvery-th RunOnce, with a `before` cutoff approximately
-// now-minus-window.
-func TestMaybeSweepRunsOnCadence(t *testing.T) {
-	st := newFakeStore()
-	window := 24 * time.Hour
-	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(window, 3, 100))
-	if err != nil {
-		t.Fatalf("NewRelay: %v", err)
-	}
+// TestMaybeSweepRunsOnInterval proves the retention sweep cadence is
+// wall-clock time (RetentionSweepInterval), decoupled from PollInterval: the
+// first leader tick sweeps immediately, ticks within the interval skip, and a
+// tick after the interval elapses sweeps again — with a `before` cutoff of
+// now-minus-window. Uses synctest's fake clock for deterministic elapsing.
+func TestMaybeSweepRunsOnInterval(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		window := 24 * time.Hour
+		interval := 5 * time.Minute
+		r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(window, interval, 100))
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
 
-	for i := 1; i <= 6; i++ {
-		if err := r.RunOnce(t.Context()); err != nil {
-			t.Fatalf("RunOnce[%d]: %v", i, err)
-		}
-		calls, before := st.snapshotSweep()
-		wantCalls := i / 3
-		if calls != wantCalls {
-			t.Fatalf("after RunOnce %d: sweepCalls = %d, want %d (every 3rd tick)", i, calls, wantCalls)
-		}
-		if wantCalls > 0 {
-			wantBefore := time.Now().Add(-window)
-			if diff := wantBefore.Sub(before); diff < -time.Minute || diff > time.Minute {
-				t.Fatalf("sweep `before` = %v, want ~%v (within a minute)", before, wantBefore)
+		// First tick sweeps immediately; two more inside the interval skip.
+		for i := range 3 {
+			if err := r.RunOnce(context.Background()); err != nil {
+				t.Fatalf("RunOnce[%d]: %v", i, err)
 			}
 		}
-	}
+		if calls, before := st.snapshotSweep(); calls != 1 {
+			t.Fatalf("sweepCalls = %d within the interval, want 1", calls)
+		} else if diff := time.Now().Add(-window).Sub(before); diff < -time.Minute || diff > time.Minute {
+			t.Fatalf("sweep `before` = %v, want ~now-window", before)
+		}
+
+		// After the interval elapses, the next tick sweeps again.
+		time.Sleep(interval + time.Second)
+		if err := r.RunOnce(context.Background()); err != nil {
+			t.Fatalf("RunOnce[after interval]: %v", err)
+		}
+		if calls, _ := st.snapshotSweep(); calls != 2 {
+			t.Fatalf("sweepCalls = %d after the interval elapsed, want 2", calls)
+		}
+	})
 }
 
 // TestMaybeSweepNoopWithoutRetentionStore proves a store lacking
@@ -755,7 +744,7 @@ func TestMaybeSweepRunsOnCadence(t *testing.T) {
 func TestMaybeSweepNoopWithoutRetentionStore(t *testing.T) {
 	inner := newFakeStore()
 	st := noRetentionStore{inner: inner}
-	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, 1, 100))
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, time.Minute, 100))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -774,7 +763,7 @@ func TestMaybeSweepErrorPropagates(t *testing.T) {
 	sentinel := errors.New("sweep boom")
 	st := newFakeStore()
 	st.sweepErr = sentinel
-	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, 1, 100))
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, time.Minute, 100))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -976,16 +965,6 @@ func TestDrainStopsImmediatelyOnPreCanceledCtx(t *testing.T) {
 
 // --- WithLogger ----------------------------------------------------------------
 
-func TestWithLoggerNilIsNoop(t *testing.T) {
-	o := sequence.DefaultOptions()
-	real := slog.New(&recordingHandler{})
-	sequence.WithLogger(real)(&o)
-	sequence.WithLogger(nil)(&o)
-	if o.Logger != real {
-		t.Fatal("WithLogger(nil) replaced a previously set logger")
-	}
-}
-
 func TestWithLoggerReceivesTransientError(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
@@ -1029,22 +1008,22 @@ func TestNewRelayRejectsPollIntervalNotBelowHalfLeaseTTL(t *testing.T) {
 	}
 }
 
-// TestNewRelayRedefaultsNilObserverAndLogger proves a raw Option that nils
-// Observer/Logger (bypassing the With* nil guards) does not leave the runtime
-// with a latent nil-deref: NewRelay re-defaults both after applying options.
-func TestNewRelayRedefaultsNilObserverAndLogger(t *testing.T) {
-	st := newFakeStore()
-	st.append(msg(0))
-	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
-		return errors.New("boom") // exercises the Observer+Logger error path
-	})
-	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
-		func(o *sequence.Options) { o.Observer = nil; o.Logger = nil })
-	if err != nil {
-		t.Fatalf("NewRelay: %v", err)
+// TestNewRelayRejectsOverlongName pins the maxNameLen guard: the reference
+// schema keys outbox_offsets/relay_locks/outbox_sequencers on VARCHAR(64), and
+// under a relaxed sql_mode a longer name would be silently truncated into
+// another group's offset row and leader lock. Same guard for an overridden
+// LeaderLockName.
+func TestNewRelayRejectsOverlongName(t *testing.T) {
+	long := strings.Repeat("g", 65)
+	if _, err := sequence.NewRelay(long, newFakeStore(), noopSender); err == nil || !strings.Contains(err.Error(), "64") {
+		t.Fatalf("err = %v, want the 64-byte name guard", err)
 	}
-	if err := r.RunOnce(t.Context()); err != nil { // must not panic
-		t.Fatalf("RunOnce: %v", err)
+	if _, err := sequence.NewRelay("c", newFakeStore(), noopSender, sequence.WithLeaderLockName(long)); err == nil || !strings.Contains(err.Error(), "64") {
+		t.Fatalf("err = %v, want the 64-byte LeaderLockName guard", err)
+	}
+	// 64 bytes exactly is the schema's limit and must be accepted.
+	if _, err := sequence.NewRelay(strings.Repeat("g", 64), newFakeStore(), noopSender); err != nil {
+		t.Fatalf("64-byte name rejected: %v", err)
 	}
 }
 
@@ -1108,7 +1087,7 @@ func TestLeadershipLostDuringSequenceSkipsDrainAndSweep(t *testing.T) {
 
 	r, err := sequence.NewRelay("c", st, sender,
 		sequence.WithSequenceBatchSize(2), sequence.WithStartFromBeginning(),
-		sequence.WithRetention(time.Hour, 1, 100))
+		sequence.WithRetention(time.Hour, time.Minute, 100))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -1364,21 +1343,16 @@ func (o *drainCountObserver) ObserveSequenced(string, int) {}
 func (o *drainCountObserver) ObserveError(string, error)   {}
 
 // TestObserveDrainedExcludesParkedMessages pins the relay.Observer contract:
-// ObserveDrained's count is successful sends only — a parked message is
+// ObserveDrained's count is successful sends only — a parked poison row is
 // surfaced via ObserveError and not counted.
 func TestObserveDrainedExcludesParkedMessages(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
 		st.append(msg(0))
 	}
-	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
-		if mdSeq(md) == 3 {
-			return errors.New("boom")
-		}
-		return nil
-	})
+	st.poisonSeq = 3
 	obs := &drainCountObserver{}
-	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning(),
 		sequence.WithObserver(obs),
 		sequence.WithErrorHandler(func(context.Context, *outbox.Message, error) {}))
 	if err != nil {
@@ -1395,7 +1369,66 @@ func TestObserveDrainedExcludesParkedMessages(t *testing.T) {
 		total += c
 	}
 	if total != 4 {
-		t.Fatalf("ObserveDrained total = %d, want 4 (parked message must not be counted)", total)
+		t.Fatalf("ObserveDrained total = %d, want 4 (parked poison row must not be counted)", total)
+	}
+}
+
+// TestSequenceLoopBoundedPerTick pins the maxPagesPerTick fairness cap on the
+// sequencer loop: a backlog that keeps every page full must not pin the pass
+// in sequence() forever (starving drain and the sweep). One tick sequences at
+// most 64 pages; the next tick continues.
+func TestSequenceLoopBoundedPerTick(t *testing.T) {
+	st := newFakeStore()
+	for range 70 {
+		st.append(msg(0))
+	}
+	r, err := sequence.NewRelay("c", st, noopSender,
+		sequence.WithSequenceBatchSize(1), sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if calls := st.snapshotSeqCalls(); calls != 64 {
+		t.Fatalf("SequenceMessages called %d times in one tick, want 64 (the per-tick cap)", calls)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[2]: %v", err)
+	}
+	if len(st.log) != 70 {
+		t.Fatalf("sequenced %d after two ticks, want 70 (the next tick continues)", len(st.log))
+	}
+}
+
+// TestDrainLoopBoundedPerTick pins the same cap on the drain loop: at most 64
+// full pages per tick, with the remainder delivered next tick.
+func TestDrainLoopBoundedPerTick(t *testing.T) {
+	st := newFakeStore()
+	for range 70 {
+		st.append(msg(0))
+	}
+	var sent int
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithBatchSize(1), sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if sent != 64 {
+		t.Fatalf("sent = %d in one tick, want 64 (the per-tick cap)", sent)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[2]: %v", err)
+	}
+	if sent != 70 {
+		t.Fatalf("sent = %d after two ticks, want 70", sent)
+	}
+	if off := st.offsets["c"]; off != 70 {
+		t.Fatalf("offset = %d, want 70", off)
 	}
 }
 

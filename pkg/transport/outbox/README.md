@@ -97,9 +97,18 @@ before publishing or relaying — the migration creates the `outbox_messages`,
 sequencer counter row:
 
 ```go
-src, _ := iofs.New(tidb.Migrations, "migrations") // migrate/v4/source/iofs
-drv, _ := mysql.WithInstance(db, &mysql.Config{}) // migrate/v4/database/mysql
-m, _ := migrate.NewWithInstance("iofs", src, "mysql", drv)
+src, err := iofs.New(tidb.Migrations, "migrations") // migrate/v4/source/iofs
+if err != nil {
+    log.Fatal(err)
+}
+drv, err := mysql.WithInstance(db, &mysql.Config{}) // migrate/v4/database/mysql
+if err != nil {
+    log.Fatal(err)
+}
+m, err := migrate.NewWithInstance("iofs", src, "mysql", drv)
+if err != nil {
+    log.Fatal(err)
+}
 if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
     log.Fatal(err)
 }
@@ -118,13 +127,16 @@ is the downstream transport, any `eventbus.Sender`. `NewRelay` returns an error
 if `name` is empty (it keys the offset row and the default leader lock); if
 `PollInterval`, `BatchSize`, `SequenceBatchSize`, or `LeaseTTL` is not strictly
 positive; if `PollInterval` is not strictly less than `LeaseTTL/2` (the lease
-must be renewable at least twice per TTL); and if `WithRetention` is given a
-nonzero window without a strictly positive `sweepEvery` and `sweepBatch`. A
+must be renewable at least twice per TTL); if `name` (or an overridden
+`LeaderLockName`) exceeds 64 bytes (the reference schema's `VARCHAR(64)` key
+columns — a relaxed `sql_mode` would silently truncate a longer name into
+another group's offset row and leader lock); and if `WithRetention` is given a
+nonzero window without a strictly positive `sweepInterval` and `sweepBatch`. A
 `Relay` is not safe for concurrent use: call `Run` from a single goroutine.
 
 ```go
 r, err := sequence.NewRelay("broker-publish", tidb.NewRelayStore(db), rabbitSender,
-    sequence.WithRetention(7*24*time.Hour, 256, 5000),
+    sequence.WithRetention(7*24*time.Hour, 5*time.Minute, 5000),
     sequence.WithObserver(promObserver),
 )
 if err != nil {
@@ -165,14 +177,16 @@ an offset.
 `ObserveSequenced`) to your metrics system — e.g. Prometheus — for lag and
 throughput; `ObserveDrained`'s count is successfully sent messages only (parked
 messages surface via `ObserveError`). `sequence.WithLogger` wires a
-`*log/slog.Logger` for pass-level errors. `sequence.WithErrorHandler` switches
-failure handling from stop-the-lane (default, order-preserving) to
-park-and-continue: the `relay.ErrorHandler` is called for a message that failed
-to send — or for a poison row whose persisted metadata fails to decode
-(`sequence.DecodeError`) — and the relay advances past it; without a handler
-the lane stops at the failed row. Shutdown cancellation is never routed to the
-handler: a canceled run context stops the lane instead of parking healthy
-messages.
+`*log/slog.Logger` for pass-level errors. `sequence.WithErrorHandler` installs
+the poison-parking hook: a row whose persisted metadata fails to decode
+(`sequence.DecodeError`) is handed to the `relay.ErrorHandler` and the relay
+advances past it — retrying a poison row can never succeed. Send failures are
+NEVER parked, handler or not: a send failure is downstream trouble (broker
+down, timeout), and the lane always stops and retries the same message next
+tick — order and delivery preserved, which is the point of an outbox. Without
+a handler a poison row stops the lane too. Shutdown cancellation is never
+routed to the handler: a canceled run context stops the lane instead of
+parking healthy messages.
 
 ## Ordering guarantee
 
@@ -289,15 +303,15 @@ wires the same `relay.Observer` shape used by `sequence.WithObserver` (e.g.
 Prometheus) for lag and throughput (`ObserveDrained` counts successfully sent
 messages only; parked messages surface via `ObserveError`);
 `stream.WithLogger` wires a `*log/slog.Logger`
-for stream-level errors; `stream.WithErrorHandler` switches send-failure
-handling from stop-the-lane (default, order-preserving — closes and reopens
-the cursor at the failed event) to park-and-continue (keeps the cursor open,
-hands the failure to the callback). The same policy covers poison events whose
-payload fails to decode (`stream.DecodeError`, which carries the event's resume
-position): with a handler the relay parks the event and resumes past it;
-without one the lane stops at it. Shutdown cancellation is never routed to the
-handler — a canceled run context stops the lane instead of parking healthy
-messages.
+for stream-level errors; `stream.WithErrorHandler` installs the poison-parking
+hook: an event whose payload fails to decode (`stream.DecodeError`, which
+carries the event's resume position) is handed to the callback and the relay
+resumes past it — retrying a poison event can never succeed. Send failures are
+NEVER parked, handler or not: the lane always stops (closes the cursor,
+persists the sent prefix, and reopens at the failed event after a backoff) —
+order and delivery preserved. Without a handler a poison event stops the lane
+too. Shutdown cancellation is never routed to the handler — a canceled run
+context stops the lane instead of parking healthy messages.
 
 ### Ordering, replay, and dedup
 
