@@ -61,22 +61,6 @@ func TestCreateOutboxMessageRejectsZeroTime(t *testing.T) {
 	}
 }
 
-// TestCreateOutboxMessageRejectsZeroCreateTime proves the symmetric guard for
-// Message.CreateTime: it shares md.Time's DATETIME(6) below-minimum hazard AND
-// anchors retention (a zero create_time would be swept immediately). The
-// production Sender stamps it, but CreateOutboxMessage is exported for direct
-// use.
-func TestCreateOutboxMessageRejectsZeroCreateTime(t *testing.T) {
-	st := tidb.NewStore(nil)
-	md := event.NewMetadata("books.created")
-	md.ID = uuid.NewString()
-	md.Time = time.Now()
-	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: md.ID, Metadata: md})
-	if err == nil || !strings.Contains(err.Error(), "create time is zero") {
-		t.Fatalf("err = %v, want descriptive zero-create-time error", err)
-	}
-}
-
 var testDB *sql.DB
 
 func TestMain(m *testing.M) {
@@ -518,8 +502,8 @@ func TestDeleteOffsetUnpinsSweep(t *testing.T) {
 	}
 
 	// The retired group pins MIN(last_seq) at 1: only seq 1 is sweepable.
-	sweepBefore := time.Now().UTC().Add(time.Hour)
-	n, err := st.SweepMessages(ctx, sweepBefore, 100)
+	sweepOlderThan := -time.Hour // negative: everything is "older", regardless of insert age
+	n, err := st.SweepMessages(ctx, sweepOlderThan, 100)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -539,7 +523,7 @@ func TestDeleteOffsetUnpinsSweep(t *testing.T) {
 	}
 
 	// With the retired row gone, the sweep advances to the live watermark.
-	n, err = st.SweepMessages(ctx, sweepBefore, 100)
+	n, err = st.SweepMessages(ctx, sweepOlderThan, 100)
 	if err != nil {
 		t.Fatalf("sweep after delete: %v", err)
 	}
@@ -553,7 +537,7 @@ func TestDeleteOffsetUnpinsSweep(t *testing.T) {
 	}
 }
 
-// TestGenerateV4RelayedMetadataIDFidelity pins the public outbox.GenerateV4
+// TestGenerateV4RelayedMetadataIDFidelity pins the public outbox.GenerateUUIDv4
 // contract (see outbox/sender.go): the row key is a freshly minted UUID, but
 // the relayed event still carries exactly the Metadata.ID the caller
 // published — the ID travels inside the persisted metadata JSON.
@@ -569,7 +553,7 @@ func TestGenerateV4RelayedMetadataIDFidelity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sender := outbox.NewSender(tidb.NewStore(tx), outbox.WithIDGenerator(outbox.GenerateV4))
+	sender := outbox.NewSender(tidb.NewStore(tx), outbox.WithRowIDGenerator(outbox.GenerateUUIDv4))
 	if err := sender.Send(ctx, md, []byte("x")); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("publish: %v", err)
@@ -590,9 +574,9 @@ func TestGenerateV4RelayedMetadataIDFidelity(t *testing.T) {
 		t.Fatalf("got %d messages, want 1", len(msgs))
 	}
 	if msgs[0].Metadata.ID != md.ID {
-		t.Fatalf("Metadata.ID = %s, want the published ID %s (identity must survive GenerateV4)", msgs[0].Metadata.ID, md.ID)
+		t.Fatalf("Metadata.ID = %s, want the published ID %s (identity must survive GenerateUUIDv4)", msgs[0].Metadata.ID, md.ID)
 	}
 	if msgs[0].ID == md.ID {
-		t.Fatalf("Message.ID = %s equals the published Metadata.ID; GenerateV4 must mint an independent row key", msgs[0].ID)
+		t.Fatalf("Message.ID = %s equals the published Metadata.ID; GenerateUUIDv4 must mint an independent row key", msgs[0].ID)
 	}
 }

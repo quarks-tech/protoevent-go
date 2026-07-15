@@ -21,12 +21,12 @@ import (
 // same type; OnSequenced simply never fires for the stream runtime.
 type Observer struct {
 	// OnDrained reports a drain/forward pass: count successfully sent
-	// (messages parked via an ErrorHandler are reported through OnError and
+	// (messages parked via a PoisonHandler are reported through OnError and
 	// not counted here), age of the oldest event handled (lag), and whether
 	// more work is immediately waiting.
 	// oldestAge is measured from the runtime's committed anchor: insert-time
 	// (Message.CreateTime) age of the oldest event in the page for the
-	// sequence runtime, and committed-token (clusterTime) age for the stream
+	// sequence runtime, and committed-token (commitTime) age for the stream
 	// runtime.
 	//
 	// more reports whether work is known to remain: a full page, or a
@@ -38,9 +38,23 @@ type Observer struct {
 	// OnSequenced reports how many rows a sequencer pass assigned. Fired by
 	// the sequence runtime only.
 	OnSequenced func(name string, count int)
+	// OnSwept reports how many fully-consumed rows a retention sweep pass
+	// deleted. Fired by the sequence runtime only (the MongoDB runtime prunes
+	// via a TTL index, not sweep passes). A sweep that repeatedly deletes
+	// full batches is the falling-behind signal: deletable rows are
+	// accumulating faster than the sweep cadence removes them.
+	OnSwept func(name string, count int)
+	// OnLeadership reports leadership transitions: fired once when this relay
+	// instance becomes leader and once when it stops being leader (standby
+	// takeover, lease loss mid-pass, graceful release). Without it a
+	// dual-leader episode — a wedged leader resuming after a standby took
+	// over — leaves no trace in either instance's telemetry; with it the
+	// handover timeline is reconstructable. Not fired for steady-state
+	// renewals.
+	OnLeadership func(name string, isLeader bool)
 }
 
-// ErrorHandler is the poison-parking hook shared by both runtimes: called for
+// PoisonHandler is the poison-parking hook shared by both runtimes: called for
 // a message whose PERSISTED PAYLOAD failed to decode (a typed DecodeError),
 // after which the relay advances past it — a poison row can never succeed on
 // retry, so parking it is the only way to keep the lane moving. Send failures
@@ -49,7 +63,14 @@ type Observer struct {
 // (order AND delivery preserved — the whole point of an outbox). Shutdown
 // cancellation is never routed here either — a canceled run context stops the
 // lane instead of parking healthy messages.
-type ErrorHandler func(ctx context.Context, msg *outbox.Message, err error)
+//
+// STUB CONTRACT: msg may be a partial envelope. The poison path fires
+// precisely because the persisted payload failed to decode, so the handler
+// receives only what survived — ID (and Seq for the sequence runtime), with
+// nil Metadata and Data. A handler that needs the raw poison bytes for
+// forensics must fetch the row by ID from the store; err (unwrappable to the
+// runtime's DecodeError) carries the position and decode failure.
+type PoisonHandler func(ctx context.Context, msg *outbox.Message, err error)
 
 // LeaderStore enables running multiple relay instances with automatic failover.
 // Only the lock holder processes; others idle. Shared by both runtimes.

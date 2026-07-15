@@ -14,7 +14,7 @@ import (
 // recordingSender records the CloudEvents id of every delivered event, in
 // delivery order. Because the relay is driven by a sequenced log drained in
 // Seq order, delivery order is the proof of ordering; because the default
-// outbox.IDGenerator is ReuseMetadataID (the outbox row's event_id equals the
+// outbox.RowIDGenerator is ReuseMetadataID (the outbox row's event_id equals the
 // publisher's Metadata.ID, preserved end to end), comparing the recorded IDs
 // against the published IDs also proves CloudEvents-id fidelity, not just
 // position/count.

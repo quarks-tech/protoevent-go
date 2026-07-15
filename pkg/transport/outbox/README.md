@@ -19,8 +19,8 @@ godoc.
 
 ```
 pkg/transport/outbox/            publish side (transport-agnostic): Message, Store, Sender, PublisherFactory
-pkg/transport/outbox/relay/      primitives shared by every relay runtime: Observer, ErrorHandler, LeaderStore
-pkg/transport/outbox/relay/sequence/   TiDB sequenced-log runtime: Store/SequencerStore/RetentionStore, Options, Relay
+pkg/transport/outbox/relay/      primitives shared by every relay runtime: Observer, PoisonHandler, LeaderStore
+pkg/transport/outbox/relay/sequence/   TiDB sequenced-log runtime: Store/Sequencer/Sweeper, Options, Relay
 pkg/transport/outbox/relay/stream/     MongoDB change-stream runtime: Store/Stream/Event, Options, Relay
 pkg/transport/outbox/tidb/       reference TiDB store implementation + schema migrations
 pkg/transport/outbox/mongodb/    reference MongoDB store implementation (publish + stream.Store + LeaderStore)
@@ -30,7 +30,7 @@ pkg/transport/outbox/mongodb/    reference MongoDB store implementation (publish
 reference storage implementations (each its own Go module, since they pull in a
 driver) and are templates for other backends. A store only needs to implement
 the interfaces it actually uses — e.g. a store that only ever runs behind
-`WithoutSequencer()` need not implement `sequence.SequencerStore`, and a store
+`WithoutSequencer()` need not implement `sequence.Sequencer`, and a store
 that only ever backs `relay/stream` need not implement `sequence.Store` at all.
 
 ## Publishing
@@ -80,7 +80,7 @@ publisher's CloudEvents `Metadata.ID`, so the event the relay eventually emits
 carries exactly the ID the publisher assigned, end to end. Because CloudEvents
 IDs are UUIDs, this also scatters inserts across TiDB regions — hotspot
 avoidance and identity preservation come for free together. Pass
-`outbox.WithSenderOptions(outbox.WithIDGenerator(outbox.GenerateV4))` via
+`outbox.WithSenderOptions(outbox.WithRowIDGenerator(outbox.GenerateUUIDv4))` via
 `FactoryOption` if you need the row's identity decoupled from the event's
 `Metadata.ID` instead — the relayed event still carries the published
 `Metadata.ID`, which travels in the persisted metadata document under either
@@ -90,26 +90,73 @@ strings).
 
 ## Schema (TiDB)
 
-The `tidb` module embeds its schema as golang-migrate-compatible migrations
-(`tidb.Migrations`, an `embed.FS` over `tidb/migrations/`). Apply them once
-before publishing or relaying — the migration creates the `outbox_messages`,
-`outbox_sequencers`, `outbox_offsets`, and `relay_locks` tables and seeds the
-sequencer counter row:
+Apply the schema once before publishing or relaying — it creates the
+`outbox_messages`, `outbox_sequencers`, `outbox_offsets`, and `relay_locks`
+tables and seeds the sequencer counter row. Use `tidbmigrate.Apply`, which
+wraps the golang-migrate wiring in one call:
 
 ```go
-src, err := iofs.New(tidb.Migrations, "migrations") // migrate/v4/source/iofs
-if err != nil {
+import "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb/tidbmigrate"
+
+if err := tidbmigrate.Apply(db); err != nil {
     log.Fatal(err)
 }
-drv, err := mysql.WithInstance(db, &mysql.Config{}) // migrate/v4/database/mysql
-if err != nil {
-    log.Fatal(err)
-}
-m, err := migrate.NewWithInstance("iofs", src, "mysql", drv)
-if err != nil {
-    log.Fatal(err)
-}
-if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+```
+
+DSN requirements for the migration connection: `multiStatements=true`, and
+`tidb_skip_isolation_level_check=1` (golang-migrate runs its transaction at
+SERIALIZABLE, which TiDB rejects without it), e.g.
+`user:pass@tcp(host:4000)/db?parseTime=true&multiStatements=true&tidb_skip_isolation_level_check=1`.
+
+`tidbmigrate` is its own package so publish-only builds importing `tidb`
+never pull `migrate/v4` into their binaries. If you need raw control (custom
+migrate tooling), the embedded FS is exported as `tidb.Migrations` /
+`tidb.PrefixedMigrations(prefix)`.
+
+### TiDB deployment checklist
+
+1. **Migrate** — `tidbmigrate.Apply(db)` (prefixed instances:
+   `tidbmigrate.WithTablePrefix`, which also gives each instance its own
+   migrations-versions table). Skipping this fails loudly on first publish.
+2. **DSN** — `parseTime=true` is REQUIRED for the relay (create_time scans
+   into time.Time; without it every relay page fails with a
+   `[]uint8 → time.Time` scan error while publishing keeps working) and
+   `interpolateParams=true` is recommended (3 wire round trips → 1 per
+   parameterized query).
+3. **Publish** — `tidb.NewStore(tx)` inside the business transaction
+   (autocommit fails loudly by design).
+4. **Relay** — `sequence.NewRelay(name, tidb.NewRelayStore(db), sender, …)`;
+   configure `WithRetention` — **without it the log grows forever** (there is
+   deliberately no default sweep). Extra replicas of the same group need no
+   extra config (leader election is automatic); extra consumer *groups* add
+   `WithoutSequencer()` and should first start only after the sequencing
+   relay is caught up (see its godoc's start-order caveat).
+5. **Downstream sender** — a RabbitMQ sender needs its topology declared
+   once: `rabbitmq.NewSender(client)` + `sender.Setup(ctx, &pb.EventbusServiceDesc)`
+   (see the root README) — skipping `Setup` fails every relay tick on a
+   fresh vhost.
+
+### Multiple outbox instances in one schema
+
+An outbox instance is the four-table set (`outbox_messages`, `outbox_offsets`,
+`outbox_sequencers`, `relay_locks`). To run several independent instances in
+one schema — each with its own total order, retention, and consumer groups
+(the same lever as separate Kafka topics; a separate database is not an
+alternative on TiDB, because the publish INSERT must share the business
+transaction's schema) — give each instance a table prefix, on BOTH the
+publish store and the relay store:
+
+```go
+st := tidb.NewStore(tx, tidb.WithTablePrefix("orders_"))
+rs := tidb.NewRelayStore(db, tidb.WithTablePrefix("orders_"))
+```
+
+Migrate each instance with `tidbmigrate.WithTablePrefix`, which rewrites the
+DDL AND gives each instance its own golang-migrate versions table (without a
+separate versions table, instances silently skip each other's DDL):
+
+```go
+if err := tidbmigrate.Apply(db, tidbmigrate.WithTablePrefix("orders_")); err != nil {
     log.Fatal(err)
 }
 ```
@@ -118,7 +165,7 @@ if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 
 `sequence.NewRelay` builds a relay for one named consumer group. `store` must
 satisfy `sequence.Store` (read + offset); if it also implements
-`sequence.SequencerStore`, the relay runs the post-commit sequencer pass itself
+`sequence.Sequencer`, the relay runs the post-commit sequencer pass itself
 unless `sequence.WithoutSequencer()` is set. When several consumer groups share
 one store, run the sequencer in exactly one relay and configure the others with
 `WithoutSequencer()` — extra passes are harmless for correctness (they
@@ -132,11 +179,13 @@ must be renewable at least twice per TTL); if `name` (or an overridden
 columns — a relaxed `sql_mode` would silently truncate a longer name into
 another group's offset row and leader lock); if `WithRetention` is given a
 nonzero window without a strictly positive `sweepInterval` and `sweepBatch`;
-if the store lacks `sequence.SequencerStore` without a `WithoutSequencer()`
+if the store lacks `sequence.Sequencer` without a `WithoutSequencer()`
 waiver (a missing sequencer is a permanent silent stall, not a mode); and if
-`WithRetention` is set on a store lacking `sequence.RetentionStore` (a
+`WithRetention` is set on a store lacking `sequence.Sweeper` (a
 configured sweep that silently never runs would grow the log unboundedly). A
 `Relay` is not safe for concurrent use: call `Run` from a single goroutine.
+(`Run` is the production loop; `RunOnce` is exposed for tests and custom
+drivers that want to own the tick.)
 
 ```go
 r, err := sequence.NewRelay("broker-publish", tidb.NewRelayStore(db), rabbitSender,
@@ -182,9 +231,9 @@ callbacks (`OnDrained`, `OnError`, `OnSequenced`; set only what you need, the
 zero value discards everything) — to your metrics system, e.g. Prometheus, for
 lag and throughput; `OnDrained`'s count is successfully sent messages only
 (parked messages surface via `OnError`). `sequence.WithLogger` wires a
-`*log/slog.Logger` for pass-level errors. `sequence.WithErrorHandler` installs
+`*log/slog.Logger` for pass-level errors. `sequence.WithPoisonHandler` installs
 the poison-parking hook: a row whose persisted metadata fails to decode
-(`sequence.DecodeError`) is handed to the `relay.ErrorHandler` and the relay
+(`sequence.DecodeError`) is handed to the `relay.PoisonHandler` and the relay
 advances past it — retrying a poison row can never succeed. Send failures are
 NEVER parked, handler or not: a send failure is downstream trouble (broker
 down, timeout), and the lane always stops and retries the same message next
@@ -201,6 +250,30 @@ another committed is never sequenced ahead of it), and **at-least-once** deliver
 Messages committed concurrently with no causal relationship may be sequenced and
 delivered in either relative order.
 
+### Transport order vs event time
+
+The relay delivers in **transport order** (`seq` — transaction-begin order),
+never in event-time (`occur_time` / `Metadata.Time`) order, and this is a
+design decision, not a gap. Event time is caller-controlled and backdatable
+(`WithEventTime`), so an event-time ordering key can be undercut by a FUTURE
+row: once anything stamped 12:00:05 is delivered, a late arrival stamped
+12:00:01 forces the transport to either break its promised order or hold every
+delivery back a grace window — and any finite window still loses to a
+sufficiently late straggler. Event time is also neither unique nor monotone,
+so it cannot serve as a dense, replayable committed offset. This is the same
+split Kafka makes: brokers deliver strictly in offset order, and event-time
+semantics (windowing, watermarks, lateness) live in the consumer, which is the
+only party that knows its own lateness budget.
+
+What the relay DOES promise about event time: `Metadata.Time` travels inside
+every relayed event verbatim, so consumers that need event-time ordering apply
+a windowed reorder with their own grace period. And in the default path (no
+`WithEventTime`), `Metadata.Time` is stamped at publish inside the same
+transaction whose `tx_start_ts` orders the log — so seq order and event-time
+order already agree to within transaction duration; they diverge only when a
+producer deliberately backdates, which is exactly the case no transport can
+reorder correctly.
+
 ## Consumer requirement: dedup on `event_id`
 
 The relay guarantees at-least-once, not exactly-once: a redelivery can happen
@@ -214,7 +287,7 @@ two coincide — to get effectively-once processing.
 
 `pkg/transport/outbox/relay/stream` is the second relay runtime, a sibling of
 `relay/sequence` that reuses the same shared `relay` primitives (`Observer`,
-`ErrorHandler`, `LeaderStore`). Instead of a leader-elected sequencer pass over a
+`PoisonHandler`, `LeaderStore`). Instead of a leader-elected sequencer pass over a
 polled table, it tails a MongoDB **change stream** on the insert-only `outbox_messages`
 collection: MongoDB's oplog already gives a total, gapless commit order, so no
 sequencer is needed. The lifecycle and resume-token cliff analysis are covered
@@ -300,7 +373,12 @@ if err := r.Run(ctx); err != nil {
 tunable via `mongodb.WithRetention(d)`; idempotent for an unchanged retention —
 safe to call on every startup). Changing retention on an existing collection
 requires a `collMod` on the index, not a restart with a new option value;
-`EnsureIndexes` surfaces that server error with a hint. There is no separate
+`EnsureIndexes` surfaces that server error with a hint. Several independent
+outbox instances can share one database via
+`mongodb.WithCollectionPrefix("orders_")` — all three collections
+(`outbox_messages`, `outbox_offsets`, `relay_locks`) get the prefix as a
+unit, on both the publish and relay sides; a separate `*mongo.Database` per
+instance works too (session transactions span databases within a cluster). There is no separate
 `maxAwaitTime` knob: the relay passes `WithDrainWindow` to `Store.Watch` as
 `maxAwait`, which becomes the change stream's `maxAwaitTimeMS` — one latency
 knob, nothing to keep in sync. `stream.WithObserver`
@@ -308,7 +386,7 @@ wires the same `relay.Observer` callback struct used by `sequence.WithObserver`
 (`OnSequenced` simply never fires here) for lag and throughput (`OnDrained`
 counts successfully sent messages only; parked messages surface via `OnError`);
 `stream.WithLogger` wires a `*log/slog.Logger`
-for stream-level errors; `stream.WithErrorHandler` installs the poison-parking
+for stream-level errors; `stream.WithPoisonHandler` installs the poison-parking
 hook: an event whose payload fails to decode (`stream.DecodeError`, which
 carries the event's resume position) is handed to the callback and the relay
 resumes past it — retrying a poison event can never succeed. Send failures are
@@ -329,16 +407,114 @@ context stops the lane instead of parking healthy messages.
   committed earlier), equivalent to one Kafka partition. As with the TiDB
   runtime, delivery is **at-least-once** — consumers **must** dedup on the
   event's CloudEvents `Metadata.ID` (always the ID the publisher assigned;
-  under the default `ReuseMetadataID` it also keys the outbox row).
+  under the default `ReuseMetadataID` it also keys the outbox row). Delivery
+  is transport order, never event-time order — the reasoning in
+  [Transport order vs event time](#transport-order-vs-event-time) applies to
+  this runtime verbatim (only the transport key differs: resume token /
+  commit order instead of `seq`).
 - **The resume-token cliff.** A relay that falls behind the oplog's retention
   window gets `ErrHistoryLost` (fatal — MongoDB's `ChangeStreamHistoryLost`)
-  instead of resuming. This is handled with lag alerting on the committed
-  token's age plus a break-glass runbook, not automatic replay.
+  instead of resuming — surfaced both when a live stream's resume fails AND
+  when a restarted relay's `Watch` re-open is rejected at aggregate time.
+  This is handled with lag alerting on the committed
+  token's age plus the break-glass runbook below, not automatic replay.
   Operators **must** size the deployment so that **outbox TTL (default 7
   days, `mongodb.WithRetention`) > oplog window > consumer-downtime SLO**
   and alert on
   committed-token age well before it approaches the oplog window, so the
   cliff should never fire in practice.
+
+### MongoDB deployment checklist
+
+1. **Topology** — both the publish path (multi-document transactions) and the
+   relay (change streams) require a **replica set** (a single-node replica
+   set is fine for dev; a standalone `mongod` fails both with raw server
+   errors).
+2. **`EnsureIndexes`** — call it on every startup (idempotent). Skipping it
+   means **no TTL index is ever created and the outbox collection grows
+   forever, silently** — `WithRetention` alone changes nothing.
+3. **Publish** — `outbox.NewSender(store).Send` inside
+   `mongo.Session.WithTransaction` (a transactionless ctx is rejected loudly).
+4. **Relay** — `stream.NewRelay(name, store, sender, …)`; replicas of one
+   group need no extra config (leader election is automatic). Size
+   `TokenBatchSize × worst-case Send latency < LeaseTTL` (see NewRelay's
+   godoc).
+5. **Alerting** — export `OnDrained`'s committed-token age and alert well
+   below the oplog window; ALSO alert on `OnDrained` going silent while
+   `OnError` fires (see Observability below).
+
+### Runbook: `ErrHistoryLost` (resume token off the oplog)
+
+The relay exits `Run` with `ErrHistoryLost`. **A restart will not fix it** —
+the stored token is permanently unusable, and each restart re-exits with the
+same fatal (expect a crash loop until you intervene). Events are NOT lost:
+they are still in the outbox collection (TTL permitting); what is lost is the
+stream position.
+
+1. **Stop the relay replicas** for the affected consumer group (halt the
+   crash loop).
+2. **Record the gap start**: the group's stored position timestamp —
+   `db.outbox_offsets.findOne({_id: "<group>"}).cluster_time` (prefixed
+   instances: `<prefix>outbox_offsets`).
+3. **Reset the stored token** so the next start opens at "now":
+   `store.DeleteToken(ctx, "<group>")` (or, in mongosh,
+   `db.outbox_offsets.deleteOne({_id: "<group>"})`).
+4. **Restart the relay.** It now behaves as a fresh group: delivers from
+   "now" onward.
+5. **Re-send the gap**: read the outbox collection for the missed window and
+   re-publish through the relay's own sender —
+
+   ```go
+   cur, _ := db.Collection("outbox_messages").Find(ctx,
+       bson.M{"create_time": bson.M{"$gte": gapStart.Add(-overlap)}}, // overlap ≥ 1 oplog-lag margin, e.g. 5m
+       options.Find().SetSort(bson.D{{Key: "create_time", Value: 1}}))
+   for cur.Next(ctx) {
+       var doc struct {
+           Metadata []byte    `bson:"metadata"`
+           Data     []byte    `bson:"data"`
+       }
+       _ = cur.Decode(&doc)
+       var md event.Metadata
+       _ = json.Unmarshal(doc.Metadata, &md)
+       _ = sender.Send(ctx, &md, doc.Data) // same Sender the relay uses
+   }
+   ```
+
+   Order within the window is `create_time` (approximate), not exact commit
+   order — and the overlap re-sends already-delivered events. Both are
+   absorbed by the consumer `Metadata.ID` dedup contract.
+6. **Post-mortem the sizing**: the cliff firing means downtime exceeded the
+   oplog window — grow the oplog, shorten downtime, or tighten the
+   token-age alert.
+
+### Runbook: `ErrInvalidated` (outbox collection dropped/renamed)
+
+Same shape: fatal, restart is a crash loop (the stored token references the
+dead collection's identity).
+
+1. Stop the relay replicas.
+2. Recreate the collection: `EnsureIndexes` (any store construction path).
+3. `store.DeleteToken(ctx, "<group>")` for EVERY consumer group of the
+   instance.
+4. Restart relays (each starts at "now").
+5. If the drop lost undelivered events, that data is gone — restore from
+   backup into the collection BEFORE step 4, or accept the gap. The
+   `ErrHistoryLost` re-send procedure (step 5 above) works against a
+   restored collection.
+
+### Observability
+
+`OnDrained` (and its `oldestAge`/committed-token age) fires only when a
+drain pass RUNS. During a store outage the pass fails before draining — the
+lag gauge **freezes at its last healthy value** while real lag grows. Alert
+on both: (a) token/oldest age above threshold, AND (b) `OnDrained` absent
+while `OnError` fires. To distinguish failure classes in `OnError`, classify
+the error: `errors.Is(err, stream.ErrHistoryLost)` / `stream.ErrInvalidated`
+(fatal — page someone), send failures carry your broker's error types
+(downstream outage — the lane is stopped and retrying), anything else is
+store trouble. `OnLeadership` marks takeovers, so handover timelines are
+reconstructable; `OnSwept` at a constant full batch means retention is
+falling behind (TiDB runtime).
 
 ## Benchmarks
 

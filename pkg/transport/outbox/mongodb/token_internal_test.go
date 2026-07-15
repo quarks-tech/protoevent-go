@@ -19,7 +19,7 @@ func rawToken(t *testing.T, hexData string) bson.Raw {
 	return raw
 }
 
-// TestClusterTimeFromToken pins the PBRT anchor's clock domain: the anchor is
+// TestClusterTimeFromToken pins the Checkpoint anchor's clock domain: the anchor is
 // decoded from the token's KeyString payload (0x82 marker + big-endian
 // bson.Timestamp), i.e. SERVER time — never the client clock, whose skew
 // would poison SaveToken's monotone guard.
@@ -40,7 +40,7 @@ func TestClusterTimeFromToken(t *testing.T) {
 }
 
 // TestClusterTimeFromTokenBestEffort proves decoding fails soft (ok=false, no
-// panic) on every malformed shape, so PBRT falls back instead of erroring.
+// panic) on every malformed shape, so Checkpoint falls back instead of erroring.
 func TestClusterTimeFromTokenBestEffort(t *testing.T) {
 	cases := map[string]bson.Raw{
 		"missing _data":  mustRaw(t, bson.D{{Key: "other", Value: "x"}}),

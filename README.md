@@ -310,7 +310,7 @@ err := txStore.WithTransaction(ctx, func(ctx context.Context, store MyStore) err
 By default the outbox row ID is `outbox.ReuseMetadataID`: the row's ID is the
 publisher's CloudEvents `Metadata.ID`, so the relayed event carries exactly
 the ID the publisher assigned. Pass
-`outbox.WithSenderOptions(outbox.WithIDGenerator(outbox.GenerateV4))` via
+`outbox.WithSenderOptions(outbox.WithRowIDGenerator(outbox.GenerateUUIDv4))` via
 `FactoryOption` to decouple the row's identity from the event's instead.
 
 #### Relay: TiDB (sequenced log)

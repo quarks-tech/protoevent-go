@@ -6,9 +6,9 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
-type Handler func(ctx context.Context, event interface{}) error
+type Handler func(ctx context.Context, e interface{}) error
 
-type SubscriberInterceptor func(ctx context.Context, md *event.Metadata, event interface{}, handler Handler) error
+type SubscriberInterceptor func(ctx context.Context, md *event.Metadata, e interface{}, handler Handler) error
 
 func WithSubscriberInterceptor(f SubscriberInterceptor) SubscriberOption {
 	return func(o *subscriberOptions) {
@@ -44,16 +44,16 @@ func chainSubscriberInterceptors(s *Subscriber) {
 }
 
 func chainInterceptors(interceptors []SubscriberInterceptor) SubscriberInterceptor {
-	return func(ctx context.Context, md *event.Metadata, event interface{}, handler Handler) error {
+	return func(ctx context.Context, md *event.Metadata, e interface{}, handler Handler) error {
 		var i int
 		var next Handler
-		next = func(ctx context.Context, event interface{}) error {
+		next = func(ctx context.Context, e interface{}) error {
 			if i == len(interceptors)-1 {
-				return interceptors[i](ctx, md, event, handler)
+				return interceptors[i](ctx, md, e, handler)
 			}
 			i++
-			return interceptors[i-1](ctx, md, event, next)
+			return interceptors[i-1](ctx, md, e, next)
 		}
-		return next(ctx, event)
+		return next(ctx, e)
 	}
 }

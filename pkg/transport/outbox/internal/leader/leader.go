@@ -1,9 +1,11 @@
-package relay
+package leader
 
 import (
 	"context"
 	"sync/atomic"
 	"time"
+
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
 // releaseTimeout bounds ReleaseLeaderLock on a fresh context.Background(),
@@ -11,7 +13,7 @@ import (
 // caller's ctx may already be canceled.
 const releaseTimeout = 5 * time.Second
 
-// LeaderElector wraps a store's optional LeaderStore capability with
+// Elector wraps a store's optional LeaderStore capability with
 // acquire/renew and graceful-release. A store that does not implement
 // LeaderStore is treated as always-leader (single-instance deployments).
 //
@@ -21,8 +23,8 @@ const releaseTimeout = 5 * time.Second
 // leaving a caller that believes it is leader without a lock. The relay
 // runtimes call both from the single Run goroutine; other callers must
 // provide the same serialization.
-type LeaderElector struct {
-	ls       LeaderStore
+type Elector struct {
+	ls       relay.LeaderStore
 	lockName string
 	holderID string
 	ttl      time.Duration
@@ -35,7 +37,7 @@ type LeaderElector struct {
 }
 
 // nopLeaderStore is the null LeaderStore: every acquire is granted and
-// release is a no-op. NewLeaderElector substitutes it for a nil ls — it is
+// release is a no-op. NewElector substitutes it for a nil ls — it is
 // the EXPLICIT single-instance mode, not an implementation of the LeaderStore
 // contract: it provides no mutual exclusion and consults no clock. Do not use
 // it as a reference implementation.
@@ -47,14 +49,14 @@ func (nopLeaderStore) TryAcquireLeaderLock(context.Context, string, string, time
 
 func (nopLeaderStore) ReleaseLeaderLock(context.Context, string, string) error { return nil }
 
-// NewLeaderElector builds a LeaderElector over ls. ls may be nil: a nil
+// NewElector builds a Elector over ls. ls may be nil: a nil
 // LeaderStore means no election — a nopLeaderStore is substituted and the
 // elector always reports leadership (single-instance deployments).
-func NewLeaderElector(ls LeaderStore, lockName, holderID string, ttl time.Duration) *LeaderElector {
+func NewElector(ls relay.LeaderStore, lockName, holderID string, ttl time.Duration) *Elector {
 	if ls == nil {
 		ls = nopLeaderStore{}
 	}
-	return &LeaderElector{ls: ls, lockName: lockName, holderID: holderID, ttl: ttl}
+	return &Elector{ls: ls, lockName: lockName, holderID: holderID, ttl: ttl}
 }
 
 // TryAcquire acquires or renews the lock. Returns true if this elector holds
@@ -65,7 +67,7 @@ func NewLeaderElector(ls LeaderStore, lockName, holderID string, ttl time.Durati
 // would silently stall the caller's single relay goroutine past its own
 // lease — the silent-stale-leader hazard both runtimes guard every store
 // operation against.
-func (e *LeaderElector) TryAcquire(ctx context.Context) (bool, error) {
+func (e *Elector) TryAcquire(ctx context.Context) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, e.ttl)
 	defer cancel()
 	held, err := e.ls.TryAcquireLeaderLock(ctx, e.lockName, e.holderID, e.ttl)
@@ -90,7 +92,7 @@ func (e *LeaderElector) TryAcquire(ctx context.Context) (bool, error) {
 // TTL expiry regardless, and a store outage also surfaces on the successor's
 // TryAcquire every tick. Callers on a shutdown path should log it and move on
 // (the relay runtimes do), not fail shutdown over it.
-func (e *LeaderElector) Release() error {
+func (e *Elector) Release() error {
 	if !e.isLeader.Swap(false) {
 		return nil
 	}

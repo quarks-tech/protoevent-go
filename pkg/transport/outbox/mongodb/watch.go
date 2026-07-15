@@ -34,7 +34,7 @@ const nonResumableChangeStreamErrorLabel = "NonResumableChangeStreamError"
 type changeEvent struct {
 	ID            bson.Raw       `bson:"_id"`           // resume token for THIS event
 	OperationType string         `bson:"operationType"` // insert | invalidate | ...
-	ClusterTime   bson.Timestamp `bson:"clusterTime"`
+	CommitTime    bson.Timestamp `bson:"clusterTime"`
 	FullDocument  outboxDoc      `bson:"fullDocument"` // present on insert
 }
 
@@ -47,7 +47,7 @@ func (s *Store) Watch(ctx context.Context, token string, maxAwait time.Duration)
 	// invalidate MUST pass the filter too: a $match on "insert" alone silently
 	// drops the collection-dropped/renamed invalidate event, leaving the
 	// stream reporting empty windows forever instead of surfacing the fatal
-	// ErrStreamInvalidated via Next below (verified live: see
+	// ErrInvalidated via Next below (verified live: see
 	// TestWatchSurfacesInvalidateOnDrop).
 	pipeline := mongo.Pipeline{
 		bson.D{{Key: "$match", Value: bson.D{
@@ -63,8 +63,19 @@ func (s *Store) Watch(ctx context.Context, token string, maxAwait time.Duration)
 	}
 	// else: no resumeAfter → the stream starts at "now" (v1 StartNow).
 
-	cs, err := s.db.Collection(outboxCollection).Watch(ctx, pipeline, opts)
+	cs, err := s.db.Collection(s.collMessages).Watch(ctx, pipeline, opts)
 	if err != nil {
+		// The server validates resumeAfter against the oplog AT AGGREGATE TIME,
+		// so the two most likely paths off the resume-token cliff — a relay
+		// restarted after downtime longer than the oplog window, and a broker
+		// outage whose stop-the-lane cycle reopens the stream every window —
+		// surface ChangeStreamHistoryLost HERE, not in Next. Without this
+		// classification the fatal is wrapped as a generic open error, Run's
+		// errors.Is misses, and the break-glass design silently degrades into
+		// an infinite transient-retry loop.
+		if isHistoryLost(err) {
+			return nil, fmt.Errorf("%w: %w", stream.ErrHistoryLost, err)
+		}
 		return nil, fmt.Errorf("outbox: open change stream: %w", err)
 	}
 	return &mongoStream{cs: cs}, nil
@@ -78,7 +89,7 @@ type mongoStream struct {
 // Next drains one event if buffered; on an empty batch it blocks up to
 // maxAwaitTime and returns (nil,false,nil). A stream error → (nil,false,err),
 // classified to stream.ErrHistoryLost when the resume token fell off the
-// oplog, stream.ErrStreamInvalidated on an invalidate event (collection
+// oplog, stream.ErrInvalidated on an invalidate event (collection
 // drop/rename), and *stream.DecodeError when THIS event's payload fails to
 // decode — the DecodeError carries the event's resume position so the relay
 // can park it and resume past it, instead of reopening onto the same poison
@@ -106,25 +117,25 @@ func (m *mongoStream) Next(ctx context.Context) (*stream.Event, bool, error) {
 		return nil, false, decodeErrorFromRaw(m.cs.Current, err)
 	}
 	if ce.OperationType == "invalidate" {
-		return nil, false, stream.ErrStreamInvalidated
+		return nil, false, stream.ErrInvalidated
 	}
 	msg, err := decodeMessage(ce.FullDocument)
 	if err != nil {
 		return nil, false, &stream.DecodeError{
 			ID:          ce.FullDocument.ID,
 			ResumeToken: string(ce.ID),
-			ClusterTime: time.Unix(int64(ce.ClusterTime.T), 0).UTC(),
+			CommitTime:  time.Unix(int64(ce.CommitTime.T), 0).UTC(),
 			Err:         err,
 		}
 	}
 	return &stream.Event{
 		Message:     msg,
 		ResumeToken: string(ce.ID),
-		ClusterTime: time.Unix(int64(ce.ClusterTime.T), 0).UTC(),
+		CommitTime:  time.Unix(int64(ce.CommitTime.T), 0).UTC(),
 	}, true, nil
 }
 
-// PBRT returns the postBatchResumeToken after an empty window. The driver
+// Checkpoint returns the postBatchResumeToken after an empty window. The driver
 // surfaces the batch-level token via ResumeToken(); the anchor clusterTime is
 // decoded from the token itself (clusterTimeFromToken), so it lives in the
 // SAME clock domain as event clusterTimes — the server's. Stamping client
@@ -137,7 +148,7 @@ func (m *mongoStream) Next(ctx context.Context) (*stream.Event, bool, error) {
 // truncated to whole seconds (bson.Timestamp granularity — millisecond
 // precision would compare NEWER than a same-second event and misclassify the
 // very next event-token save as stale).
-func (m *mongoStream) PBRT() (string, time.Time) {
+func (m *mongoStream) Checkpoint() (string, time.Time) {
 	tok := m.cs.ResumeToken()
 	if tok == nil {
 		return "", time.Time{}
@@ -193,7 +204,7 @@ func decodeErrorFromRaw(raw bson.Raw, err error) *stream.DecodeError {
 	}
 	if v, lerr := raw.LookupErr("clusterTime"); lerr == nil {
 		if t, _, ok := v.TimestampOK(); ok {
-			de.ClusterTime = time.Unix(int64(t), 0).UTC()
+			de.CommitTime = time.Unix(int64(t), 0).UTC()
 		}
 	}
 	if v, lerr := raw.LookupErr("fullDocument", "_id"); lerr == nil {

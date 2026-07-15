@@ -17,7 +17,7 @@ func TestFactoryForwardsSenderOptions(t *testing.T) {
 	identity := func(p eventbus.Publisher) eventbus.Publisher { return p }
 
 	factory := outbox.NewPublisherFactory(identity,
-		outbox.WithSenderOptions(outbox.WithIDGenerator(outbox.ReuseMetadataID)),
+		outbox.WithSenderOptions(outbox.WithRowIDGenerator(outbox.ReuseMetadataID)),
 		outbox.WithPublisherOptions(
 			eventbus.WithDefaultPublishOptions(eventbus.WithEventSource("books-service")),
 		),

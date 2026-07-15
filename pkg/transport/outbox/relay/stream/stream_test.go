@@ -127,7 +127,7 @@ func (s *fakeStream) Next(context.Context) (*stream.Event, bool, error) {
 	}
 	return nil, false, nil // window empty
 }
-func (s *fakeStream) PBRT() (string, time.Time) { return s.pbrt, s.pbrtCT }
+func (s *fakeStream) Checkpoint() (string, time.Time) { return s.pbrt, s.pbrtCT }
 func (s *fakeStream) Close(ctx context.Context) error {
 	s.closeCount++
 	_, s.closeHadDeadline = ctx.Deadline()
@@ -236,7 +236,7 @@ func ev(tok string) *stream.Event {
 	return &stream.Event{
 		Message:     &outbox.Message{ID: tok, Metadata: md, CreateTime: time.Now()},
 		ResumeToken: tok,
-		ClusterTime: time.Now(),
+		CommitTime:  time.Now(),
 	}
 }
 
@@ -297,12 +297,12 @@ func TestRunOncePersistsPBRTOnEmptyWindow(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if st.savedTok != "pbrt" {
-		t.Fatalf("saved token = %q, want pbrt (empty window persists PBRT)", st.savedTok)
+		t.Fatalf("saved token = %q, want pbrt (empty window persists Checkpoint)", st.savedTok)
 	}
 }
 
 // TestIdleWindowsSkipIdenticalTokenSaves proves an idle relay does not
-// re-persist an unchanged PBRT every window (~86k no-op writes/day/group on a
+// re-persist an unchanged Checkpoint every window (~86k no-op writes/day/group on a
 // quiet stream): consecutive empty windows with the same token save exactly
 // once, and a changed token saves again.
 func TestIdleWindowsSkipIdenticalTokenSaves(t *testing.T) {
@@ -317,7 +317,7 @@ func TestIdleWindowsSkipIdenticalTokenSaves(t *testing.T) {
 		}
 	}
 	if st.saveCount != 1 {
-		t.Fatalf("saveCount = %d after 3 idle windows with unchanged PBRT, want 1", st.saveCount)
+		t.Fatalf("saveCount = %d after 3 idle windows with unchanged Checkpoint, want 1", st.saveCount)
 	}
 	if st.savedTok != "p1" {
 		t.Fatalf("saved token = %q, want p1", st.savedTok)
@@ -328,7 +328,7 @@ func TestIdleWindowsSkipIdenticalTokenSaves(t *testing.T) {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	if st.saveCount != 2 || st.savedTok != "p2" {
-		t.Fatalf("saveCount = %d, savedTok = %q after PBRT advanced, want 2, p2", st.saveCount, st.savedTok)
+		t.Fatalf("saveCount = %d, savedTok = %q after Checkpoint advanced, want 2, p2", st.saveCount, st.savedTok)
 	}
 }
 
@@ -354,12 +354,12 @@ func TestRunOnceStopTheLane(t *testing.T) {
 }
 
 func TestRunOnceInvalidateIsFatal(t *testing.T) {
-	st := &fakeStore{stream: &fakeStream{nextErr: stream.ErrStreamInvalidated}}
+	st := &fakeStore{stream: &fakeStream{nextErr: stream.ErrInvalidated}}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	r := mustRelay(t, st, sender)
 	err := r.RunOnce(t.Context())
-	if !errors.Is(err, stream.ErrStreamInvalidated) {
-		t.Fatalf("err = %v, want ErrStreamInvalidated", err)
+	if !errors.Is(err, stream.ErrInvalidated) {
+		t.Fatalf("err = %v, want ErrInvalidated", err)
 	}
 }
 
@@ -408,14 +408,14 @@ func TestRunOnceStopClosesStreamForRedelivery(t *testing.T) {
 	}
 }
 
-// TestSendFailureStopsLaneEvenWithErrorHandler pins the ErrorHandler's scope:
+// TestSendFailureStopsLaneEvenWithPoisonHandler pins the PoisonHandler's scope:
 // it parks POISON events only, never send failures. A send failure is
 // downstream trouble (broker down), and parking healthy events during an
 // outage would bulk-divert the backlog to the DLQ while advancing the
 // persisted position past it — trading away the delivery guarantee that is
 // the outbox's whole point. The lane must stop at the failed event, persist
 // only the sent prefix, and redeliver the failure on reopen.
-func TestSendFailureStopsLaneEvenWithErrorHandler(t *testing.T) {
+func TestSendFailureStopsLaneEvenWithPoisonHandler(t *testing.T) {
 	fs := &fakeStream{events: []*stream.Event{ev("a"), ev("b"), ev("c")}}
 	st := &fakeStore{stream: fs}
 	var got []string
@@ -427,7 +427,7 @@ func TestSendFailureStopsLaneEvenWithErrorHandler(t *testing.T) {
 		got = append(got, md.ID)
 		return nil
 	})
-	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
 	_ = r.RunOnce(t.Context())
@@ -469,7 +469,7 @@ func (o *countingObserver) ObserveError(string, error) {
 // TestObserveDrainedCountsOnlySent proves the ObserveDrained count excludes
 // parked messages: a parked poison event is surfaced via ObserveError instead.
 func TestObserveDrainedCountsOnlySent(t *testing.T) {
-	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", ClusterTime: time.Now(), Err: errors.New("bad bson")}
+	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", CommitTime: time.Now(), Err: errors.New("bad bson")}
 	fs := &fakeStream{
 		events: []*stream.Event{ev("a"), nil, ev("c")},
 		errs:   map[int]error{1: de},
@@ -479,7 +479,7 @@ func TestObserveDrainedCountsOnlySent(t *testing.T) {
 	obs := &countingObserver{}
 	r := mustRelay(t, st, sender,
 		stream.WithObserver(relay.Observer{OnDrained: obs.ObserveDrained, OnError: obs.ObserveError}),
-		stream.WithErrorHandler(func(context.Context, *outbox.Message, error) {}))
+		stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) {}))
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -551,7 +551,7 @@ func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
 // without touching ctx, so after a cancel the drain loop would keep pulling
 // them, fail each Send with context.Canceled, and park healthy messages (up
 // to TokenBatchSize spurious DLQ entries per deploy, all redelivered anyway).
-// A canceled run ctx must instead stop the lane: no ErrorHandler calls, token
+// A canceled run ctx must instead stop the lane: no PoisonHandler calls, token
 // not advanced past the last success.
 func TestShutdownDoesNotParkBufferedEvents(t *testing.T) {
 	fs := &fakeStream{events: []*stream.Event{ev("a"), ev("b"), ev("c")}}
@@ -568,7 +568,7 @@ func TestShutdownDoesNotParkBufferedEvents(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
 	_ = r.RunOnce(ctx)
@@ -607,7 +607,7 @@ func TestCancelBetweenEventsStopsLane(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
 	_ = r.RunOnce(ctx)
@@ -633,11 +633,11 @@ func TestCancelBetweenEventsStopsLane(t *testing.T) {
 }
 
 // TestDecodeErrorParksAndContinues proves the poison-event path: with an
-// ErrorHandler, a *DecodeError from Next is parked exactly once, the window
+// PoisonHandler, a *DecodeError from Next is parked exactly once, the window
 // keeps draining, subsequent events are delivered, and the token advances
 // past the poison event.
 func TestDecodeErrorParksAndContinues(t *testing.T) {
-	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", ClusterTime: time.Now(), Err: errors.New("bad bson")}
+	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", CommitTime: time.Now(), Err: errors.New("bad bson")}
 	fs := &fakeStream{
 		events: []*stream.Event{ev("a"), nil, ev("c")},
 		errs:   map[int]error{1: de},
@@ -649,9 +649,9 @@ func TestDecodeErrorParksAndContinues(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, err error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, err error) {
 		if _, ok := errors.AsType[*stream.DecodeError](err); !ok {
-			t.Errorf("ErrorHandler err = %v, want a *DecodeError", err)
+			t.Errorf("PoisonHandler err = %v, want a *DecodeError", err)
 		}
 		parked = append(parked, msg.ID)
 	}))
@@ -673,13 +673,43 @@ func TestDecodeErrorParksAndContinues(t *testing.T) {
 	}
 }
 
-// TestDecodeErrorWithoutHandlerStopsLane proves that without an ErrorHandler
+// TestZeroClusterTimePoisonDoesNotRewindWindowCT is the regression test for
+// the lag-metric rewind: a poison event whose CommitTime extraction failed
+// (zero) must not drag the window's running commitTime below what an earlier
+// event in the SAME window already advanced it to — the final save would
+// otherwise persist a stale anchor (the $lte-equal path accepts it) and
+// inflate committedTokenAge during poison episodes.
+func TestZeroClusterTimePoisonDoesNotRewindWindowCT(t *testing.T) {
+	evCT := time.Now().UTC().Truncate(time.Second)
+	a := ev("a")
+	a.CommitTime = evCT
+	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", Err: errors.New("bad bson")} // CommitTime zero
+	fs := &fakeStream{
+		events: []*stream.Event{a, nil},
+		errs:   map[int]error{1: de},
+	}
+	st := &fakeStore{stream: fs, loadTok: "existing"}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) {}))
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if st.savedTok != "ptok" {
+		t.Fatalf("saved token = %q, want ptok (advanced past the parked poison)", st.savedTok)
+	}
+	if !st.savedCT.Equal(evCT) {
+		t.Fatalf("saved commitTime = %v, want %v (the in-window event's CT — a zero-CT poison must floor, not rewind)", st.savedCT, evCT)
+	}
+}
+
+// TestDecodeErrorWithoutHandlerStopsLane proves that without an PoisonHandler
 // a *DecodeError stops the lane: the sent prefix's token IS persisted (so the
 // reopen resumes at the poison instead of re-sending the prefix every
 // DrainWindow), but the token is NOT advanced past the poison event itself,
 // preserving order (at-least-once redelivery on reopen).
 func TestDecodeErrorWithoutHandlerStopsLane(t *testing.T) {
-	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", ClusterTime: time.Now(), Err: errors.New("bad bson")}
+	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", CommitTime: time.Now(), Err: errors.New("bad bson")}
 	fs := &fakeStream{
 		events: []*stream.Event{ev("a"), nil},
 		errs:   map[int]error{1: de},
@@ -705,13 +735,13 @@ func TestDecodeErrorWithoutHandlerStopsLane(t *testing.T) {
 }
 
 // TestDecodeErrorWithEmptyTokenIsNotParkable proves an empty ResumeToken makes
-// a poison event non-parkable even with an ErrorHandler configured: the
+// a poison event non-parkable even with an PoisonHandler configured: the
 // store's token extraction is best-effort, and parking would later persist ""
 // and erase the group's position (restart "at now", silently skipping
 // events). The lane stops instead — the prefix's token is saved, the poison
 // is not advanced past, and no save ever carries "".
 func TestDecodeErrorWithEmptyTokenIsNotParkable(t *testing.T) {
-	de := &stream.DecodeError{ID: "p", ResumeToken: "", ClusterTime: time.Now(), Err: errors.New("bad bson")}
+	de := &stream.DecodeError{ID: "p", ResumeToken: "", CommitTime: time.Now(), Err: errors.New("bad bson")}
 	fs := &fakeStream{
 		events: []*stream.Event{ev("a"), nil},
 		errs:   map[int]error{1: de},
@@ -723,7 +753,7 @@ func TestDecodeErrorWithEmptyTokenIsNotParkable(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r := mustRelay(t, st, sender, stream.WithErrorHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) {
 		parked = append(parked, msg.ID)
 	}))
 	runErr := r.RunOnce(t.Context())
@@ -796,7 +826,7 @@ func TestRunObservesOpLevelDeadlineExceededWhileCtxAlive(t *testing.T) {
 // stop-the-lane, drainWindow's non-advanced branch persists nothing. Without
 // a pre-drain baseline persist, the next RunOnce would reopen with LoadToken
 // still "" -> a fresh "now" -> silently skipping the failed event. RunOnce
-// must persist the stream's initial resume token (PBRT, available
+// must persist the stream's initial resume token (Checkpoint, available
 // immediately after Watch, before any Next) as a baseline BEFORE draining, so
 // reopening after the failure resumes from a point preceding the failed
 // event instead of from a fresh "now".
@@ -808,7 +838,7 @@ func TestRunOnceFreshGroupPersistsBaselineBeforeDrain(t *testing.T) {
 	}
 	st := &fakeStore{stream: fs} // loadTok == "" : fresh consumer group
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
-		return errors.New("boom") // first event fails; no ErrorHandler -> stop-the-lane
+		return errors.New("boom") // first event fails; no PoisonHandler -> stop-the-lane
 	})
 	r := mustRelay(t, st, sender)
 	_ = r.RunOnce(t.Context())
@@ -1028,7 +1058,7 @@ func TestCloseStreamErrorIsLoggedNotFatal(t *testing.T) {
 // contract: a save the store's monotone guard skipped must not advance the
 // relay's local committed-position trackers. Observable via the idle-window
 // no-op-save skip: with persistence denied, lastSavedTok never latches, so an
-// unchanged PBRT is re-saved every window instead of being skipped after the
+// unchanged Checkpoint is re-saved every window instead of being skipped after the
 // first.
 func TestUnpersistedSaveDoesNotAdvanceLocalTrackers(t *testing.T) {
 	fs := &fakeStream{pbrt: "p1", pbrtCT: time.Now()}
@@ -1047,10 +1077,10 @@ func TestUnpersistedSaveDoesNotAdvanceLocalTrackers(t *testing.T) {
 }
 
 // TestRunReturnsInvalidateAsFatal proves the invalidate flow end to end:
-// Stream.Next surfacing ErrStreamInvalidated is fatal (Run returns it), the
+// Stream.Next surfacing ErrInvalidated is fatal (Run returns it), the
 // error reaches ObserveError, and the stream is closed on the way out.
 func TestRunReturnsInvalidateAsFatal(t *testing.T) {
-	fs := &fakeStream{nextErr: stream.ErrStreamInvalidated}
+	fs := &fakeStream{nextErr: stream.ErrInvalidated}
 	st := &fakeStore{stream: fs}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &recordingObserver{}
@@ -1059,8 +1089,8 @@ func TestRunReturnsInvalidateAsFatal(t *testing.T) {
 		t.Fatalf("NewRelay: %v", err)
 	}
 	runErr := r.Run(t.Context())
-	if !errors.Is(runErr, stream.ErrStreamInvalidated) {
-		t.Fatalf("Run err = %v, want ErrStreamInvalidated", runErr)
+	if !errors.Is(runErr, stream.ErrInvalidated) {
+		t.Fatalf("Run err = %v, want ErrInvalidated", runErr)
 	}
 	obs.mu.Lock()
 	errObserved := obs.errObserved
@@ -1183,7 +1213,7 @@ func TestRunOnceWatchErrorPropagates(t *testing.T) {
 }
 
 // TestRunOnceBaselineSaveTokenErrorPropagates proves a fresh consumer group
-// (LoadToken == "") that fails to persist the pre-drain PBRT baseline
+// (LoadToken == "") that fails to persist the pre-drain Checkpoint baseline
 // surfaces that SaveToken error directly from RunOnce, before ever draining.
 func TestRunOnceBaselineSaveTokenErrorPropagates(t *testing.T) {
 	sentinel := errors.New("save boom")
@@ -1220,7 +1250,7 @@ func TestDrainWindowSaveTokenErrorOnDeliveryPropagates(t *testing.T) {
 }
 
 // TestDrainWindowSaveTokenErrorOnEmptyWindowPropagates proves a SaveToken
-// error on the empty-window PBRT persist path surfaces from
+// error on the empty-window Checkpoint persist path surfaces from
 // drainWindow/RunOnce. loadTok is pre-set so the pre-drain baseline persist
 // (which would otherwise also hit saveErr) is skipped.
 func TestDrainWindowSaveTokenErrorOnEmptyWindowPropagates(t *testing.T) {

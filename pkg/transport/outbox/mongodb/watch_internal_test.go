@@ -84,8 +84,8 @@ func TestDecodeErrorFromRawWellFormed(t *testing.T) {
 		t.Fatalf("ResumeToken = %q, want the marshaled _id document %q", de.ResumeToken, wantToken)
 	}
 	wantCT := time.Unix(int64(clusterSecs), 0).UTC()
-	if !de.ClusterTime.Equal(wantCT) {
-		t.Fatalf("ClusterTime = %v, want %v", de.ClusterTime, wantCT)
+	if !de.CommitTime.Equal(wantCT) {
+		t.Fatalf("CommitTime = %v, want %v", de.CommitTime, wantCT)
 	}
 	if de.ID != "row-42" {
 		t.Fatalf("ID = %q, want row-42", de.ID)
@@ -108,8 +108,8 @@ func TestDecodeErrorFromRawWrongTypedID(t *testing.T) {
 	if de.ResumeToken != "" {
 		t.Fatalf("ResumeToken = %q, want empty for a wrong-typed _id", de.ResumeToken)
 	}
-	if !de.ClusterTime.Equal(time.Unix(int64(clusterSecs), 0).UTC()) {
-		t.Fatalf("ClusterTime = %v, want extracted despite bad _id", de.ClusterTime)
+	if !de.CommitTime.Equal(time.Unix(int64(clusterSecs), 0).UTC()) {
+		t.Fatalf("CommitTime = %v, want extracted despite bad _id", de.CommitTime)
 	}
 	if de.ID != "row-1" {
 		t.Fatalf("ID = %q, want row-1 despite bad _id", de.ID)
@@ -132,8 +132,8 @@ func TestDecodeErrorFromRawMissingID(t *testing.T) {
 	if de.ID != "row-2" {
 		t.Fatalf("ID = %q, want row-2", de.ID)
 	}
-	if !de.ClusterTime.Equal(time.Unix(100, 0).UTC()) {
-		t.Fatalf("ClusterTime = %v, want %v", de.ClusterTime, time.Unix(100, 0).UTC())
+	if !de.CommitTime.Equal(time.Unix(100, 0).UTC()) {
+		t.Fatalf("CommitTime = %v, want %v", de.CommitTime, time.Unix(100, 0).UTC())
 	}
 }
 
@@ -169,8 +169,8 @@ func TestDecodeErrorFromRawNilAndGarbage(t *testing.T) {
 		if !errors.Is(de.Err, cause) {
 			t.Fatalf("%s: cause not carried: %v", name, de.Err)
 		}
-		if de.ResumeToken != "" || de.ID != "" || !de.ClusterTime.IsZero() {
-			t.Fatalf("%s: fields not empty: token=%q id=%q ct=%v", name, de.ResumeToken, de.ID, de.ClusterTime)
+		if de.ResumeToken != "" || de.ID != "" || !de.CommitTime.IsZero() {
+			t.Fatalf("%s: fields not empty: token=%q id=%q ct=%v", name, de.ResumeToken, de.ID, de.CommitTime)
 		}
 	}
 }

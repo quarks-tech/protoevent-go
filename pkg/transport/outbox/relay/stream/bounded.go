@@ -3,8 +3,6 @@ package stream
 import (
 	"context"
 	"time"
-
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/relayutil"
 )
 
 // boundedStore decorates the relay's Store with per-operation bounds: without
@@ -33,13 +31,21 @@ func (s boundedStore) LoadToken(ctx context.Context, name string) (string, time.
 
 // SaveToken is additionally shutdown-safe: once the run ctx is canceled (the
 // final save on a planned shutdown), the store call gets a values-preserving
-// detached context bounded by shutdownTimeout instead — a real store fails
-// writes on a dead context, and losing that save would redeliver up to
-// TokenBatchSize-1 acknowledged sends per deploy.
-func (s boundedStore) SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) (bool, error) {
-	ctx, cancel := relayutil.BoundContext(ctx, s.ttl, shutdownTimeout)
+// detached context (WithoutCancel keeps trace/log values) bounded by
+// shutdownTimeout instead — a real store fails writes on a dead context, and
+// losing that save would redeliver up to TokenBatchSize-1 acknowledged sends
+// per deploy. The dead-ctx check MUST come first; the consumer test suite
+// pins it (saveHadDeadline/saveCtxErr). Mirrors sequence/bounded.go
+// CommitOffset — keep the dead-ctx detachment in lockstep.
+func (s boundedStore) SaveToken(ctx context.Context, name string, token string, commitTime time.Time) (bool, error) {
+	var cancel context.CancelFunc
+	if ctx.Err() != nil {
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	} else {
+		ctx, cancel = context.WithTimeout(ctx, s.ttl)
+	}
 	defer cancel()
-	return s.inner.SaveToken(ctx, name, token, clusterTime)
+	return s.inner.SaveToken(ctx, name, token, commitTime)
 }
 
 // Watch's bound covers only opening the stream (the initial aggregate); the

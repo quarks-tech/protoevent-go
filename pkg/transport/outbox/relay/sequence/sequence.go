@@ -1,5 +1,11 @@
 // Package sequence is the TiDB sequenced-log outbox relay runtime: a leader runs
 // a post-commit sequencer pass then drains the log in seq order to a Sender.
+//
+// Two audiences use this package. END USERS construct a Relay (NewRelay +
+// With* options, typically over tidb.NewRelayStore) and call Run; RunOnce
+// exists for tests and custom drivers. STORE AUTHORS implement the Store /
+// Sequencer / Sweeper contracts (plus relay.LeaderStore) for a
+// new backend — the tidb module is the reference implementation.
 package sequence
 
 import (
@@ -13,12 +19,13 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/leader"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
 // DecodeError reports a row whose persisted metadata failed to decode. The
 // store returns it from ListMessages together with the successfully decoded
-// prefix of the page; a relay with an ErrorHandler parks the row and advances
+// prefix of the page; a relay with a PoisonHandler parks the row and advances
 // past Seq, otherwise the lane stops (at-least-once, order preserved).
 type DecodeError struct {
 	ID  string // event_id of the poison row
@@ -55,22 +62,31 @@ type Store interface {
 	// is empty) ONLY if no row exists, and return the effective committed
 	// offset. An existing row — even at 0 — is a committed position and MUST
 	// NOT be modified: forward-jumping it skips events.
+	//
+	// "Latest" means max ASSIGNED seq: committed-but-unsequenced rows are not
+	// counted, so a group primed before the sequencer catches up will receive
+	// that backlog once it is sequenced — see WithoutSequencer's start-order
+	// caveat.
 	InitOffsetLatest(ctx context.Context, name string) (int64, error)
 }
 
-// SequencerStore assigns dense Seq values to committed-but-unsequenced rows.
+// Sequencer assigns dense Seq values to committed-but-unsequenced rows.
 // Implementations MUST serialize passes (counter row FOR UPDATE) and order the
 // batch by (tx_start_ts, id). Returns the number of rows sequenced.
-type SequencerStore interface {
+type Sequencer interface {
 	SequenceMessages(ctx context.Context, limit int) (int, error)
 }
 
-// RetentionStore prunes fully-consumed rows below every consumer's offset.
-type RetentionStore interface {
+// Sweeper prunes fully-consumed rows below every consumer's offset.
+type Sweeper interface {
 	// SweepMessages deletes sequenced rows whose Seq is <= the minimum committed
-	// offset across all consumers AND whose insert time (CreateTime) is before
-	// `before`, bounded to `limit` rows. Returns the number deleted.
-	SweepMessages(ctx context.Context, before time.Time, limit int) (int, error)
+	// offset across all consumers AND whose insert time is older than
+	// `olderThan`, bounded to `limit` rows. Returns the number deleted.
+	//
+	// The cutoff MUST be evaluated against the STORE's clock (insert-time
+	// column vs the database's NOW), never the relay host's wall clock: a
+	// skewed relay host must not be able to sweep early or pin rows forever.
+	SweepMessages(ctx context.Context, olderThan time.Duration, limit int) (int, error)
 }
 
 // options contains configuration for a sequence relay instance. It is
@@ -97,9 +113,9 @@ type options struct {
 	RetentionSweepInterval time.Duration // minimum time between sweeps
 	RetentionSweepBatch    int
 
-	Logger       *slog.Logger // defaults to a discard logger
-	Observer     relay.Observer
-	ErrorHandler relay.ErrorHandler
+	Logger        *slog.Logger // defaults to a discard logger
+	Observer      relay.Observer
+	PoisonHandler relay.PoisonHandler
 }
 
 // defaultOptions returns the default relay configuration. The zero
@@ -137,6 +153,15 @@ func WithLeaderLockName(name string) Option { return func(o *options) { o.Leader
 // the others with WithoutSequencer(): each extra relay would otherwise run a
 // redundant sequencer pass every tick — correctness is unaffected (passes
 // serialize on the counter row), but the serialized DB work is wasted.
+//
+// START-ORDER CAVEAT: a NEW WithoutSequencer group's "latest" default is
+// computed from MAX(assigned seq) — committed-but-not-yet-sequenced rows are
+// invisible to it. If such a group primes its offset BEFORE the sequencing
+// relay has caught up, the backlog those rows form is later sequenced ABOVE
+// the primed offset and gets delivered — "latest" silently degrades into a
+// partial replay. Start (or restart) WithoutSequencer groups only once the
+// sequencing relay is running and caught up, or accept the replay (consumers
+// dedup on Metadata.ID regardless).
 func WithoutSequencer() Option { return func(o *options) { o.SequencerDisabled = true } }
 
 // WithLogger sets the error logger. A nil logger is ignored.
@@ -163,15 +188,15 @@ func WithObserver(obs relay.Observer) Option {
 	return func(o *options) { o.Observer = obs }
 }
 
-// WithErrorHandler installs the poison-parking hook: a row whose PERSISTED
+// WithPoisonHandler installs the poison-parking hook: a row whose PERSISTED
 // METADATA fails to decode (*DecodeError) is handed to h and the relay
 // advances past it — retrying a poison row can never succeed, so parking it is
 // the only way to keep the lane moving. Send failures are NOT parked
 // regardless of this option: a send failure is downstream trouble, and the
 // lane always stops and retries the same message next tick (order and
-// delivery preserved). Without an ErrorHandler a poison row stops the lane.
-func WithErrorHandler(h relay.ErrorHandler) Option {
-	return func(o *options) { o.ErrorHandler = h }
+// delivery preserved). Without a PoisonHandler a poison row stops the lane.
+func WithPoisonHandler(h relay.PoisonHandler) Option {
+	return func(o *options) { o.PoisonHandler = h }
 }
 
 // WithRetention enables the retention sweep on the leader: at most one sweep
@@ -196,12 +221,16 @@ type Relay struct {
 	store   Store
 	sender  eventbus.Sender
 	options options
-	leader  *relay.LeaderElector
+	leader  *leader.Elector
 
-	sequencer SequencerStore // nil if store lacks the capability or WithoutSequencer
-	retention RetentionStore // nil if store lacks the capability or retention not configured
+	sequencer Sequencer // nil if store lacks the capability or WithoutSequencer
+	retention Sweeper   // nil if store lacks the capability or retention not configured
 
 	lastSweep time.Time // for retention cadence (see maybeSweep)
+
+	// wasLeader tracks the last observed leadership state so transitions —
+	// and only transitions — reach OnLeadership/the log (see trackLeadership).
+	wasLeader bool
 
 	// offsetInitialized latches once InitOffsetLatest has run for this Relay
 	// instance. With insert-if-absent semantics a re-run is harmless (an
@@ -237,11 +266,11 @@ const maxNameLen = 64
 //     twice per TTL or it expires between renewals and leadership silently
 //     flaps every tick (mirrors the stream runtime's DrainWindow guard);
 //   - RetentionWindow is set without a positive sweep interval and batch;
-//   - store lacks SequencerStore and WithoutSequencer() was not given: without
+//   - store lacks Sequencer and WithoutSequencer() was not given: without
 //     a sequencer nothing ever gets a seq and the relay silently delivers
 //     nothing — the legitimate someone-else-sequences topology has an explicit
 //     spelling;
-//   - WithRetention is set but store lacks RetentionStore: a configured sweep
+//   - WithRetention is set but store lacks Sweeper: a configured sweep
 //     that silently never runs grows the log unboundedly.
 //
 // name identifies the consumer (its offset row) and is the default leader-lock
@@ -249,6 +278,13 @@ const maxNameLen = 64
 // transport (e.g. a RabbitMQ sender). When several consumer groups share one
 // store, run the sequencer in exactly one relay and configure the others with
 // WithoutSequencer() — see its doc.
+//
+// Sizing note (mirrors the stream runtime's TokenBatchSize rule): a drain
+// page is up to BatchSize synchronous Sender.Send calls, and the lease is
+// renewed only BETWEEN pages — so size BatchSize x worst-case Send latency
+// < LeaseTTL, or a slow downstream can let one page outlive the lease and a
+// transient second leader overlap it (at-least-once still holds; the
+// single-active-consumer property weakens).
 func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) (*Relay, error) {
 	if name == "" {
 		return nil, errors.New("sequence: name must not be empty (it is the offset-row key and the default leader-lock name)")
@@ -311,30 +347,30 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		store:   boundedStore{inner: store, ttl: options.LeaseTTL},
 		sender:  sender,
 		options: options,
-		leader:  relay.NewLeaderElector(ls, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
+		leader:  leader.NewElector(ls, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
 	}
 
 	// Capability implied by configuration must exist unless explicitly waived:
 	// a silently missing capability is an outage, not a mode. Without a
 	// sequencer (and no WithoutSequencer waiver) rows stay unsequenced and the
 	// relay delivers NOTHING while reporting no error — a permanent silent
-	// stall. A configured retention window without a RetentionStore never
+	// stall. A configured retention window without a Sweeper never
 	// sweeps — unbounded table growth surfacing as a disk incident long after
 	// the misconfiguration. (The LeaderStore assertion above stays soft:
 	// always-leader is a documented single-instance mode, not a configured
 	// capability.)
 	if !options.SequencerDisabled {
-		seq, ok := store.(SequencerStore)
+		seq, ok := store.(Sequencer)
 		if !ok {
-			return nil, errors.New("sequence: store does not implement sequence.SequencerStore; " +
+			return nil, errors.New("sequence: store does not implement sequence.Sequencer; " +
 				"pass WithoutSequencer() if another relay runs the sequencer for this store")
 		}
 		r.sequencer = boundedSequencer{inner: seq, ttl: options.LeaseTTL}
 	}
 	if options.RetentionWindow > 0 {
-		ret, ok := store.(RetentionStore)
+		ret, ok := store.(Sweeper)
 		if !ok {
-			return nil, errors.New("sequence: WithRetention is set but store does not implement sequence.RetentionStore")
+			return nil, errors.New("sequence: WithRetention is set but store does not implement sequence.Sweeper")
 		}
 		r.retention = boundedRetention{inner: ret, ttl: options.LeaseTTL}
 	}

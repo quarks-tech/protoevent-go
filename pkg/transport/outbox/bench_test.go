@@ -23,7 +23,7 @@ func BenchmarkSenderSend(b *testing.B) {
 	b.Run("ReuseMetadataID", func(b *testing.B) {
 		b.ReportAllocs()
 		store := &captureStore{}
-		sender := outbox.NewSender(store, outbox.WithIDGenerator(outbox.ReuseMetadataID))
+		sender := outbox.NewSender(store, outbox.WithRowIDGenerator(outbox.ReuseMetadataID))
 		for b.Loop() {
 			if err := sender.Send(context.Background(), md, nil); err != nil {
 				b.Fatalf("send: %v", err)
@@ -31,10 +31,10 @@ func BenchmarkSenderSend(b *testing.B) {
 		}
 	})
 
-	b.Run("GenerateV4", func(b *testing.B) {
+	b.Run("GenerateUUIDv4", func(b *testing.B) {
 		b.ReportAllocs()
 		store := &captureStore{}
-		sender := outbox.NewSender(store, outbox.WithIDGenerator(outbox.GenerateV4))
+		sender := outbox.NewSender(store, outbox.WithRowIDGenerator(outbox.GenerateUUIDv4))
 		for b.Loop() {
 			if err := sender.Send(context.Background(), md, nil); err != nil {
 				b.Fatalf("send: %v", err)

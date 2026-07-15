@@ -124,12 +124,12 @@ func TestPBRTNonEmptyImmediatelyAfterWatch(t *testing.T) {
 	}
 	defer func() { _ = s.Close(context.Background()) }()
 
-	tok, ct := s.PBRT()
+	tok, ct := s.Checkpoint()
 	if tok == "" {
-		t.Fatal("PBRT returned empty immediately after Watch (before any Next); the fresh-group baseline persist relies on this being non-empty")
+		t.Fatal("Checkpoint returned empty immediately after Watch (before any Next); the fresh-group baseline persist relies on this being non-empty")
 	}
 	if ct.IsZero() {
-		t.Fatal("PBRT returned a zero clusterTime immediately after Watch")
+		t.Fatal("Checkpoint returned a zero clusterTime immediately after Watch")
 	}
 }
 
@@ -211,7 +211,7 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 }
 
 // TestWatchSurfacesInvalidateOnDrop proves that dropping the outbox
-// collection surfaces stream.ErrStreamInvalidated through Next, instead of
+// collection surfaces stream.ErrInvalidated through Next, instead of
 // silently producing empty windows forever. Verified live (see the F7
 // report): with the pipeline matching ONLY "insert", the driver's invalidate
 // event was filtered out before it ever reached the caller — TryNext just
@@ -242,21 +242,21 @@ func TestWatchSurfacesInvalidateOnDrop(t *testing.T) {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		_, _, err := strm.Next(ctx)
-		if errors.Is(err, stream.ErrStreamInvalidated) {
+		if errors.Is(err, stream.ErrInvalidated) {
 			return // the claim: invalidate must surface as the sentinel
 		}
 		if err != nil {
-			t.Fatalf("next returned an unexpected error instead of ErrStreamInvalidated: %v", err)
+			t.Fatalf("next returned an unexpected error instead of ErrInvalidated: %v", err)
 		}
 	}
-	t.Fatal("drop of the outbox collection never surfaced ErrStreamInvalidated")
+	t.Fatal("drop of the outbox collection never surfaced ErrInvalidated")
 }
 
 // TestWatchPoisonEventReturnsDecodeError proves an undecodable outbox row
 // surfaces as *stream.DecodeError carrying the event's resume position —
 // NOT a bare error, which would wedge the lane forever (reopen from the last
 // saved token → same poison event → same error). With the position in hand,
-// the relay's ErrorHandler can park the event and a subsequent Watch from
+// the relay's PoisonHandler can park the event and a subsequent Watch from
 // DecodeError.ResumeToken resumes PAST it.
 func TestWatchPoisonEventReturnsDecodeError(t *testing.T) {
 	if testDB == nil {
@@ -308,8 +308,8 @@ func TestWatchPoisonEventReturnsDecodeError(t *testing.T) {
 	if de.ResumeToken == "" {
 		t.Fatal("DecodeError.ResumeToken is empty; the relay could not resume past the poison event")
 	}
-	if de.ClusterTime.IsZero() {
-		t.Fatal("DecodeError.ClusterTime is zero")
+	if de.CommitTime.IsZero() {
+		t.Fatal("DecodeError.CommitTime is zero")
 	}
 
 	// Resume from the poison event's token: it must be skipped, and the next
@@ -351,7 +351,7 @@ func TestPBRTAdvancesOnIdle(t *testing.T) {
 	}
 	defer func() { _ = s.Close(context.Background()) }()
 
-	// Idle: no matching inserts. An empty window must yield a non-nil PBRT.
+	// Idle: no matching inserts. An empty window must yield a non-nil Checkpoint.
 	_, ok, err := s.Next(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -359,8 +359,8 @@ func TestPBRTAdvancesOnIdle(t *testing.T) {
 	if ok {
 		t.Fatal("unexpected event on an idle stream")
 	}
-	tok, _ := s.PBRT()
+	tok, _ := s.Checkpoint()
 	if tok == "" {
-		t.Fatal("PBRT returned empty on an empty window; a caught-up consumer would fall off the oplog")
+		t.Fatal("Checkpoint returned empty on an empty window; a caught-up consumer would fall off the oplog")
 	}
 }

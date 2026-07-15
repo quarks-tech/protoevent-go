@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/relayutil"
 )
 
 // boundedStore decorates the relay's Store with a per-operation LeaseTTL
@@ -48,11 +47,19 @@ func (s boundedStore) InitOffsetLatest(ctx context.Context, name string) (int64,
 
 // CommitOffset is additionally shutdown-safe: once the run ctx is canceled
 // (the final commit on a planned shutdown), the store call gets a
-// values-preserving detached context bounded by commitTimeout instead — a
-// real store fails writes on a dead context, and losing that commit would
-// redeliver the page's acknowledged sends on restart.
+// values-preserving detached context (WithoutCancel keeps trace/log values)
+// bounded by commitTimeout instead — a real store fails writes on a dead
+// context, and losing that commit would redeliver the page's acknowledged
+// sends on restart. The dead-ctx check MUST come first; the consumer test
+// suite pins it (commitHadDeadline/commitCtxErr). Mirrors
+// stream/bounded.go SaveToken — keep the dead-ctx detachment in lockstep.
 func (s boundedStore) CommitOffset(ctx context.Context, name string, seq int64) error {
-	ctx, cancel := relayutil.BoundContext(ctx, s.ttl, commitTimeout)
+	var cancel context.CancelFunc
+	if ctx.Err() != nil {
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
+	} else {
+		ctx, cancel = context.WithTimeout(ctx, s.ttl)
+	}
 	defer cancel()
 	return s.inner.CommitOffset(ctx, name, seq)
 }
@@ -60,7 +67,7 @@ func (s boundedStore) CommitOffset(ctx context.Context, name string, seq int64) 
 // boundedSequencer and boundedRetention apply the same LeaseTTL bound to the
 // optional capabilities (see boundedStore).
 type boundedSequencer struct {
-	inner SequencerStore
+	inner Sequencer
 	ttl   time.Duration
 }
 
@@ -71,12 +78,12 @@ func (s boundedSequencer) SequenceMessages(ctx context.Context, limit int) (int,
 }
 
 type boundedRetention struct {
-	inner RetentionStore
+	inner Sweeper
 	ttl   time.Duration
 }
 
-func (s boundedRetention) SweepMessages(ctx context.Context, before time.Time, limit int) (int, error) {
+func (s boundedRetention) SweepMessages(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.ttl)
 	defer cancel()
-	return s.inner.SweepMessages(ctx, before, limit)
+	return s.inner.SweepMessages(ctx, olderThan, limit)
 }

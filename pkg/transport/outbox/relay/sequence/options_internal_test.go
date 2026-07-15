@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/relayutil"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/notify"
 )
 
 // Internal tests for the unexported options: the struct is deliberately not
@@ -31,9 +31,9 @@ func TestDefaultOptions(t *testing.T) {
 	}
 	// The zero relay.Observer is the default: its nil-safe dispatch methods
 	// discard every signal, so no non-nil default is needed.
-	relayutil.ObserveDrained(o.Observer, "c", 1, 0, false)
-	relayutil.ObserveError(o.Observer, "c", nil)
-	relayutil.ObserveSequenced(o.Observer, "c", 1)
+	notify.Drained(o.Observer, "c", 1, 0, false)
+	notify.Error(o.Observer, "c", nil)
+	notify.Sequenced(o.Observer, "c", 1)
 }
 
 func TestOptionsApply(t *testing.T) {

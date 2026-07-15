@@ -9,14 +9,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang-migrate/migrate/v4"
-	migratemysql "github.com/golang-migrate/migrate/v4/database/mysql"
-	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	tidb "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb/tidbmigrate"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -118,19 +115,7 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 		return nil, nil, fmt.Errorf("open tidb connection: %w", err)
 	}
 
-	src, err := iofs.New(tidb.Migrations, "migrations")
-	if err != nil {
-		return nil, nil, fmt.Errorf("open migrations source: %w", err)
-	}
-	drv, err := migratemysql.WithInstance(db, &migratemysql.Config{DatabaseName: dbName})
-	if err != nil {
-		return nil, nil, fmt.Errorf("create migrate driver: %w", err)
-	}
-	m, err := migrate.NewWithInstance("iofs", src, "mysql", drv)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create migrator: %w", err)
-	}
-	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+	if err := tidbmigrate.Apply(db); err != nil {
 		return nil, nil, fmt.Errorf("apply migrations: %w", err)
 	}
 

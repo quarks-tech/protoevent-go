@@ -22,7 +22,7 @@ type Sender interface {
 }
 
 type Publisher interface {
-	Publish(ctx context.Context, name string, event interface{}, opts ...PublishOption) error
+	Publish(ctx context.Context, name string, e interface{}, opts ...PublishOption) error
 }
 
 type PublishOption func(m *event.Metadata)
@@ -149,14 +149,14 @@ func NewPublisher(sender Sender, opts ...PublisherOption) *PublisherImpl {
 	return p
 }
 
-func (p *PublisherImpl) Publish(ctx context.Context, name string, event interface{}, opts ...PublishOption) error {
+func (p *PublisherImpl) Publish(ctx context.Context, name string, e interface{}, opts ...PublishOption) error {
 	opts = combine(p.options.publishOptions, opts)
 
 	if p.options.interceptor != nil {
-		return p.options.interceptor(ctx, name, event, p, publish, opts...)
+		return p.options.interceptor(ctx, name, e, p, publish, opts...)
 	}
 
-	return publish(ctx, name, event, p, opts...)
+	return publish(ctx, name, e, p, opts...)
 }
 
 func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, opts ...PublishOption) error {
@@ -169,7 +169,7 @@ func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, 
 	if md.ID == "" {
 		id, err := p.options.idGenerator()
 		if err != nil {
-			return fmt.Errorf("generate event id : %w", err)
+			return fmt.Errorf("generate event id: %w", err)
 		}
 
 		md.ID = id

@@ -23,7 +23,7 @@ func WithPublisherOptions(opts ...eventbus.PublisherOption) FactoryOption {
 
 // WithSenderOptions applies the given sender options to the outbox sender behind
 // every publisher the factory creates. Use this to reach, for example,
-// WithIDGenerator(ReuseMetadataID).
+// WithRowIDGenerator(ReuseMetadataID).
 func WithSenderOptions(opts ...SenderOption) FactoryOption {
 	return func(o *factoryOptions) {
 		o.senderOptions = append(o.senderOptions, opts...)
@@ -47,7 +47,7 @@ func WithSenderOptions(opts ...SenderOption) FactoryOption {
 //	        ),
 //	    ),
 //	    outbox.WithSenderOptions(
-//	        outbox.WithIDGenerator(outbox.ReuseMetadataID),
+//	        outbox.WithRowIDGenerator(outbox.ReuseMetadataID),
 //	    ),
 //	)
 //

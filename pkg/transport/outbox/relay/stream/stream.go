@@ -1,8 +1,15 @@
 // Package stream is the MongoDB change-stream outbox relay runtime: a leader
 // tails an insert-only outbox collection via a resumable change stream and
 // forwards events to a Sender in commit order. It reuses the shared relay
-// primitives (Observer, ErrorHandler, LeaderStore) and is dependency-free —
+// primitives (Observer, PoisonHandler, LeaderStore) and is dependency-free —
 // the resume token crosses the Store boundary as opaque string.
+//
+// Two audiences use this package. END USERS construct a Relay (NewRelay +
+// With* options, typically over mongodb.NewStore) and call Run; RunOnce
+// exists for tests and custom drivers (it returns ErrLaneStopped as the
+// back-off-and-retry signal). STORE AUTHORS implement the Store / Stream
+// contracts (plus relay.LeaderStore) for a new backend — the mongodb module
+// is the reference implementation.
 package stream
 
 import (
@@ -16,13 +23,14 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/leader"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
-// ErrStreamInvalidated is the sentinel store implementations return from
+// ErrInvalidated is the sentinel store implementations return from
 // Stream.Next when the change stream is invalidated (the outbox collection
 // was dropped or renamed). Callers treat it as fatal: the relay stops.
-var ErrStreamInvalidated = errors.New("stream: change stream invalidated")
+var ErrInvalidated = errors.New("stream: change stream invalidated")
 
 // ErrHistoryLost is the sentinel store implementations return from Stream.Next
 // when the resume token has fallen off the oplog (ChangeStreamHistoryLost).
@@ -31,7 +39,7 @@ var ErrHistoryLost = errors.New("stream: change stream history lost (resume toke
 
 // DecodeError reports a change-stream event whose payload failed to decode.
 // Store implementations return it from Next with the event's resume position,
-// so a relay with an ErrorHandler can park the event and keep the lane moving;
+// so a relay with a PoisonHandler can park the event and keep the lane moving;
 // without one the lane stops (at-least-once, order preserved).
 type DecodeError struct {
 	ID string // event_id if extractable, else ""
@@ -40,7 +48,7 @@ type DecodeError struct {
 	// stops instead; parking would later persist the empty token and erase
 	// the group's position).
 	ResumeToken string
-	ClusterTime time.Time
+	CommitTime  time.Time
 	Err         error
 }
 
@@ -58,18 +66,18 @@ func (e *DecodeError) Unwrap() error { return e.Err }
 // string gives immutability, comparability, and clean API values. "" == no token.
 type Store interface {
 	// LoadToken returns the consumer group's stored resume token ("" if none —
-	// a new group then starts at "now") and the anchor clusterTime.
-	LoadToken(ctx context.Context, name string) (token string, clusterTime time.Time, err error)
+	// a new group then starts at "now") and the anchor commit-time (the server-assigned position timestamp: MongoDB clusterTime, a Postgres-style backend's commit timestamp).
+	LoadToken(ctx context.Context, name string) (token string, commitTime time.Time, err error)
 
-	// SaveToken persists the resume token + its clusterTime for the consumer
-	// group. Implementations MUST be monotone in clusterTime: a save carrying
-	// an older clusterTime than the stored row must not rewind it (a stale
+	// SaveToken persists the resume token + its commitTime for the consumer
+	// group. Implementations MUST be monotone in commitTime: a save carrying
+	// an older commitTime than the stored row must not rewind it (a stale
 	// leader finishing a slow window could otherwise overwrite a newer
 	// position). persisted reports whether the row now holds THIS token: false
 	// means the save was classified stale and skipped — the caller must not
 	// advance its local committed-position trackers on a false return, or its
 	// lag/cliff reporting diverges from what is actually stored.
-	SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) (persisted bool, err error)
+	SaveToken(ctx context.Context, name string, token string, commitTime time.Time) (persisted bool, err error)
 
 	// Watch opens a change stream on the outbox collection, filtered to inserts,
 	// resumed from token (or from "now" when token is ""). maxAwait is the longest
@@ -82,26 +90,28 @@ type Store interface {
 type Stream interface {
 	// Next returns the next insert event. It blocks up to maxAwait (as passed
 	// to Watch) and returns (nil, false, nil) when the window elapses with no
-	// event (the caught-up case) — the caller then persists PBRT(). On error it
+	// event (the caught-up case) — the caller then persists Checkpoint(). On error it
 	// returns (nil, false, err):
-	//   - ErrStreamInvalidated: the change stream was invalidated (collection
+	//   - ErrInvalidated: the change stream was invalidated (collection
 	//     drop/rename) → fatal, the caller stops;
 	//   - ErrHistoryLost: the resume token fell off the oplog → fatal;
 	//   - *DecodeError: this event's payload failed to decode; carries the
-	//     event's resume position so a relay with an ErrorHandler can park it
+	//     event's resume position so a relay with a PoisonHandler can park it
 	//     and resume past it;
 	//   - anything else is transient → the caller reopens the stream.
 	Next(ctx context.Context) (*Event, bool, error)
-	// PBRT returns the postBatchResumeToken. It serves two purposes: (a) on an
-	// empty window, the caller persists it so a caught-up-and-connected
-	// consumer's persisted position keeps tracking the oplog head instead of
-	// falling behind; and (b) immediately after a fresh Watch (token == ""),
-	// before any Next call, the caller persists it as the initial resume
-	// baseline — so a first-window send failure under stop-the-lane (which
-	// persists nothing itself) still has a prior position to reopen from,
-	// instead of restarting at a fresh "now" and silently skipping the failed
-	// event.
-	PBRT() (token string, clusterTime time.Time)
+	// Checkpoint returns a resumable position at the stream's current head
+	// even when no event was delivered (MongoDB: the postBatchResumeToken;
+	// a Postgres-style backend: the server's reported WAL end). It serves
+	// two purposes: (a) on an empty window, the caller persists it so a
+	// caught-up-and-connected consumer's persisted position keeps tracking
+	// the head instead of falling behind; and (b) immediately after a fresh
+	// Watch (token == ""), before any Next call, the caller persists it as
+	// the initial resume baseline — so a first-window send failure under
+	// stop-the-lane (which persists nothing itself) still has a prior
+	// position to reopen from, instead of restarting at a fresh "now" and
+	// silently skipping the failed event.
+	Checkpoint() (token string, commitTime time.Time)
 	Close(ctx context.Context) error
 }
 
@@ -109,7 +119,7 @@ type Stream interface {
 type Event struct {
 	Message     *outbox.Message
 	ResumeToken string
-	ClusterTime time.Time
+	CommitTime  time.Time
 }
 
 // options configures a stream relay. It is unexported on purpose: the only
@@ -127,9 +137,9 @@ type options struct {
 	LeaderLockName string // defaults to the relay name
 	TokenBatchSize int    // max events processed before a forced token persist
 
-	Logger       *slog.Logger // defaults to a discard logger
-	Observer     relay.Observer
-	ErrorHandler relay.ErrorHandler
+	Logger        *slog.Logger // defaults to a discard logger
+	Observer      relay.Observer
+	PoisonHandler relay.PoisonHandler
 }
 
 // defaultOptions returns the default stream relay configuration. The zero
@@ -175,16 +185,16 @@ func WithObserver(obs relay.Observer) Option {
 	return func(o *options) { o.Observer = obs }
 }
 
-// WithErrorHandler installs the poison-parking hook: an event whose payload
+// WithPoisonHandler installs the poison-parking hook: an event whose payload
 // fails to decode (*DecodeError with a usable resume token) is handed to h
 // and the relay advances past it — retrying a poison event can never succeed,
 // so parking it is the only way to keep the lane moving. Send failures are
 // NOT parked regardless of this option: a send failure is downstream trouble,
 // and the lane always stops and redelivers the same event on reopen (order
-// and delivery preserved). Without an ErrorHandler a poison event stops the
+// and delivery preserved). Without a PoisonHandler a poison event stops the
 // lane.
-func WithErrorHandler(h relay.ErrorHandler) Option {
-	return func(o *options) { o.ErrorHandler = h }
+func WithPoisonHandler(h relay.PoisonHandler) Option {
+	return func(o *options) { o.PoisonHandler = h }
 }
 
 // Relay tails the outbox change stream for one consumer group and forwards to
@@ -195,12 +205,16 @@ type Relay struct {
 	store   Store
 	sender  eventbus.Sender
 	options options
-	leader  *relay.LeaderElector
+	leader  *leader.Elector
 
 	// Runtime state, populated by Run/RunOnce (pkg/.../stream/run.go).
 	stream       Stream
 	committedCT  time.Time
 	lastSavedTok string // last token successfully persisted (skip no-op saves on idle windows)
+
+	// wasLeader tracks the last observed leadership state so transitions —
+	// and only transitions — reach OnLeadership/the log (see trackLeadership).
+	wasLeader bool
 }
 
 // NewRelay creates a stream relay for the named consumer group. It validates
@@ -272,6 +286,6 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		store:   boundedStore{inner: store, ttl: options.LeaseTTL},
 		sender:  sender,
 		options: options,
-		leader:  relay.NewLeaderElector(ls, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
+		leader:  leader.NewElector(ls, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
 	}, nil
 }

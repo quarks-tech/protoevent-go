@@ -18,12 +18,12 @@ func WithChainPublisherInterceptor(interceptors ...PublisherInterceptor) Publish
 	}
 }
 
-func chainPublisherInterceptors(cc *PublisherImpl) {
-	interceptors := cc.options.chainInterceptors
+func chainPublisherInterceptors(p *PublisherImpl) {
+	interceptors := p.options.chainInterceptors
 	// Prepend opts.interceptor to the chaining interceptors if it exists, since interceptor will
 	// be executed before any other chained interceptors.
-	if cc.options.interceptor != nil {
-		interceptors = append([]PublisherInterceptor{cc.options.interceptor}, interceptors...)
+	if p.options.interceptor != nil {
+		interceptors = append([]PublisherInterceptor{p.options.interceptor}, interceptors...)
 	}
 	var chainedInt PublisherInterceptor
 	switch len(interceptors) {
@@ -32,18 +32,18 @@ func chainPublisherInterceptors(cc *PublisherImpl) {
 	case 1:
 		chainedInt = interceptors[0]
 	default:
-		chainedInt = func(ctx context.Context, name string, event interface{}, cc *PublisherImpl, invoker PublishFn, opts ...PublishOption) error {
-			return interceptors[0](ctx, name, event, cc, getChainUnaryInvoker(interceptors, 0, invoker), opts...)
+		chainedInt = func(ctx context.Context, name string, e interface{}, p *PublisherImpl, invoker PublishFn, opts ...PublishOption) error {
+			return interceptors[0](ctx, name, e, p, chainInvoker(interceptors, 0, invoker), opts...)
 		}
 	}
-	cc.options.interceptor = chainedInt
+	p.options.interceptor = chainedInt
 }
 
-func getChainUnaryInvoker(interceptors []PublisherInterceptor, curr int, finalInvoker PublishFn) PublishFn {
+func chainInvoker(interceptors []PublisherInterceptor, curr int, finalInvoker PublishFn) PublishFn {
 	if curr == len(interceptors)-1 {
 		return finalInvoker
 	}
-	return func(ctx context.Context, name string, event interface{}, cc *PublisherImpl, opts ...PublishOption) error {
-		return interceptors[curr+1](ctx, name, event, cc, getChainUnaryInvoker(interceptors, curr+1, finalInvoker), opts...)
+	return func(ctx context.Context, name string, e interface{}, p *PublisherImpl, opts ...PublishOption) error {
+		return interceptors[curr+1](ctx, name, e, p, chainInvoker(interceptors, curr+1, finalInvoker), opts...)
 	}
 }

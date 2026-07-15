@@ -391,6 +391,36 @@ func TestSaveTokenMonotoneClusterTime(t *testing.T) {
 	}
 }
 
+// TestDeleteTokenResetsGroup pins the break-glass reset step: DeleteToken
+// erases the stored position so the next LoadToken reports "no token" (the
+// relay then starts at "now"), and deleting a missing token is a no-op.
+func TestDeleteTokenResetsGroup(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	ctx := context.Background()
+
+	if persisted, err := st.SaveToken(ctx, "c", "tok1", time.Now().UTC()); err != nil || !persisted {
+		t.Fatalf("SaveToken: persisted=%v err=%v", persisted, err)
+	}
+	if err := st.DeleteToken(ctx, "c"); err != nil {
+		t.Fatalf("DeleteToken: %v", err)
+	}
+	tok, _, err := st.LoadToken(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != "" {
+		t.Fatalf("LoadToken after DeleteToken = %q, want \"\" (position erased)", tok)
+	}
+	// Deleting a missing token is a no-op, not an error.
+	if err := st.DeleteToken(ctx, "c"); err != nil {
+		t.Fatalf("DeleteToken on missing row: %v", err)
+	}
+}
+
 // TestSaveTokenRejectsEmptyToken proves the store defends its own invariant:
 // an empty token is never a valid position (LoadToken maps "" to "no stored
 // position"), so saving one would erase the group's persisted offset and make

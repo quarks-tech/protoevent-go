@@ -46,7 +46,7 @@ func TestSenderDefaultReusesMetadataID(t *testing.T) {
 
 func TestSenderGenerateV4Option(t *testing.T) {
 	store := &captureStore{}
-	sender := outbox.NewSender(store, outbox.WithIDGenerator(outbox.GenerateV4))
+	sender := outbox.NewSender(store, outbox.WithRowIDGenerator(outbox.GenerateUUIDv4))
 
 	if err := sender.Send(context.Background(), newMetadata("event-id"), nil); err != nil {
 		t.Fatalf("send: %v", err)
@@ -54,19 +54,19 @@ func TestSenderGenerateV4Option(t *testing.T) {
 
 	id, err := uuid.Parse(store.msg.ID)
 	if err != nil {
-		t.Fatalf("GenerateV4 message ID is not a valid UUID: %v", err)
+		t.Fatalf("GenerateUUIDv4 message ID is not a valid UUID: %v", err)
 	}
 	if id.Version() != 4 {
-		t.Fatalf("GenerateV4 message ID version = %d, want 4", id.Version())
+		t.Fatalf("GenerateUUIDv4 message ID version = %d, want 4", id.Version())
 	}
 	if store.msg.ID == "event-id" {
-		t.Fatal("GenerateV4 reused metadata ID, want freshly minted")
+		t.Fatal("GenerateUUIDv4 reused metadata ID, want freshly minted")
 	}
 }
 
 func TestSenderReuseMetadataID(t *testing.T) {
 	store := &captureStore{}
-	sender := outbox.NewSender(store, outbox.WithIDGenerator(outbox.ReuseMetadataID))
+	sender := outbox.NewSender(store, outbox.WithRowIDGenerator(outbox.ReuseMetadataID))
 
 	if err := sender.Send(context.Background(), newMetadata("event-id"), nil); err != nil {
 		t.Fatalf("send: %v", err)
@@ -79,7 +79,7 @@ func TestSenderReuseMetadataID(t *testing.T) {
 
 func TestSenderCustomGenerator(t *testing.T) {
 	store := &captureStore{}
-	sender := outbox.NewSender(store, outbox.WithIDGenerator(func(_ *event.Metadata) (string, error) {
+	sender := outbox.NewSender(store, outbox.WithRowIDGenerator(func(_ *event.Metadata) (string, error) {
 		return "custom-id", nil
 	}))
 
@@ -95,7 +95,7 @@ func TestSenderCustomGenerator(t *testing.T) {
 func TestSenderGeneratorErrorPropagates(t *testing.T) {
 	sentinel := errors.New("boom")
 	store := &captureStore{}
-	sender := outbox.NewSender(store, outbox.WithIDGenerator(func(_ *event.Metadata) (string, error) {
+	sender := outbox.NewSender(store, outbox.WithRowIDGenerator(func(_ *event.Metadata) (string, error) {
 		return "", sentinel
 	}))
 

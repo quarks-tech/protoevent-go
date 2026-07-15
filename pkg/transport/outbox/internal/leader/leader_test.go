@@ -1,4 +1,4 @@
-package relay_test
+package leader_test
 
 import (
 	"context"
@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/leader"
 )
 
 // releaseCall records one ReleaseLeaderLock invocation, including whether the
@@ -59,7 +59,7 @@ func (s *fakeLeaderStore) snapshotReleaseCalls() []releaseCall {
 
 func TestTryAcquireGrantsLeadership(t *testing.T) {
 	store := &fakeLeaderStore{acquireGrant: true}
-	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
+	e := leader.NewElector(store, "lock", "holder-1", time.Second)
 
 	leader, err := e.TryAcquire(t.Context())
 	if err != nil {
@@ -72,7 +72,7 @@ func TestTryAcquireGrantsLeadership(t *testing.T) {
 
 func TestTryAcquireRenewsWhileAlreadyLeader(t *testing.T) {
 	store := &fakeLeaderStore{acquireGrant: true}
-	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
+	e := leader.NewElector(store, "lock", "holder-1", time.Second)
 
 	for i := range 3 {
 		leader, err := e.TryAcquire(t.Context())
@@ -90,7 +90,7 @@ func TestTryAcquireRenewsWhileAlreadyLeader(t *testing.T) {
 
 func TestTryAcquireDeniedByAnotherHolder(t *testing.T) {
 	store := &fakeLeaderStore{acquireGrant: false}
-	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
+	e := leader.NewElector(store, "lock", "holder-1", time.Second)
 
 	leader, err := e.TryAcquire(t.Context())
 	if err != nil {
@@ -104,7 +104,7 @@ func TestTryAcquireDeniedByAnotherHolder(t *testing.T) {
 func TestTryAcquireErrorPropagates(t *testing.T) {
 	sentinel := errors.New("store unavailable")
 	store := &fakeLeaderStore{acquireErr: sentinel}
-	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
+	e := leader.NewElector(store, "lock", "holder-1", time.Second)
 
 	leader, err := e.TryAcquire(t.Context())
 	if !errors.Is(err, sentinel) {
@@ -117,7 +117,7 @@ func TestTryAcquireErrorPropagates(t *testing.T) {
 
 func TestReleaseNoOpWhenNotLeader(t *testing.T) {
 	store := &fakeLeaderStore{acquireGrant: false}
-	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
+	e := leader.NewElector(store, "lock", "holder-1", time.Second)
 
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
@@ -133,7 +133,7 @@ func TestReleaseNoOpWhenNotLeader(t *testing.T) {
 
 func TestReleaseNoOpBeforeFirstAcquire(t *testing.T) {
 	store := &fakeLeaderStore{acquireGrant: true}
-	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
+	e := leader.NewElector(store, "lock", "holder-1", time.Second)
 
 	// Release before ever calling TryAcquire: must be a no-op (nil error).
 	if err := e.Release(); err != nil {
@@ -147,7 +147,7 @@ func TestReleaseNoOpBeforeFirstAcquire(t *testing.T) {
 
 func TestReleaseCallsStoreForCurrentHolderWhenLeader(t *testing.T) {
 	store := &fakeLeaderStore{acquireGrant: true}
-	e := relay.NewLeaderElector(store, "my-lock", "holder-42", time.Second)
+	e := leader.NewElector(store, "my-lock", "holder-42", time.Second)
 
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
@@ -174,7 +174,7 @@ func TestReleaseCallsStoreForCurrentHolderWhenLeader(t *testing.T) {
 
 func TestReleaseIsIdempotentAfterFirstCall(t *testing.T) {
 	store := &fakeLeaderStore{acquireGrant: true}
-	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
+	e := leader.NewElector(store, "lock", "holder-1", time.Second)
 
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
@@ -199,7 +199,7 @@ func TestReleaseIsIdempotentAfterFirstCall(t *testing.T) {
 func TestReleaseReturnsStoreErrorForInformation(t *testing.T) {
 	sentinel := errors.New("release boom")
 	store := &fakeLeaderStore{acquireGrant: true, releaseErr: sentinel}
-	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
+	e := leader.NewElector(store, "lock", "holder-1", time.Second)
 
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
@@ -217,7 +217,7 @@ func TestReleaseReturnsStoreErrorForInformation(t *testing.T) {
 }
 
 func TestNilLeaderStoreAlwaysLeader(t *testing.T) {
-	e := relay.NewLeaderElector(nil, "lock", "holder-1", time.Second)
+	e := leader.NewElector(nil, "lock", "holder-1", time.Second)
 
 	leader, err := e.TryAcquire(t.Context())
 	if err != nil {
@@ -229,7 +229,7 @@ func TestNilLeaderStoreAlwaysLeader(t *testing.T) {
 }
 
 func TestNilLeaderStoreReleaseIsNoop(t *testing.T) {
-	e := relay.NewLeaderElector(nil, "lock", "holder-1", time.Second)
+	e := leader.NewElector(nil, "lock", "holder-1", time.Second)
 
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)

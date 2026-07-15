@@ -51,7 +51,7 @@ type ServiceDesc struct {
 	Metadata    string
 }
 
-func (sd ServiceDesc) getEventDesc(name string) (EventDesc, bool) {
+func (sd ServiceDesc) eventDesc(name string) (EventDesc, bool) {
 	for _, ed := range sd.Events {
 		if ed.Name == name {
 			return ed, true
@@ -82,7 +82,7 @@ func defaultSubscriberOptions() subscriberOptions {
 type SubscriberOption func(opts *subscriberOptions)
 
 type Subscriber struct {
-	mux      sync.Mutex
+	mu       sync.Mutex
 	name     string
 	opts     subscriberOptions
 	services map[string]*serviceInfo
@@ -117,7 +117,7 @@ func NewSubscriber(name string, opts ...SubscriberOption) *Subscriber {
 // The generated function creates a closure that captures the typed handler,
 // eliminating the need for runtime type checking.
 func (s *Subscriber) RegisterHandler(sd *ServiceDesc, eventName string, h EventHandler) {
-	ed, ok := sd.getEventDesc(eventName)
+	ed, ok := sd.eventDesc(eventName)
 	if !ok {
 		panicf("event not found: %s", eventName)
 	}
@@ -126,8 +126,8 @@ func (s *Subscriber) RegisterHandler(sd *ServiceDesc, eventName string, h EventH
 }
 
 func (s *Subscriber) register(sd *ServiceDesc, ed EventDesc, h EventHandler) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.serve {
 		panicf("Subscriber.RegisterHandler after Subscriber.Subscribe for %q", ed.Name)
@@ -174,9 +174,9 @@ func (s *Subscriber) GetServiceInfo() []ServiceInfo {
 }
 
 func (s *Subscriber) Subscribe(ctx context.Context, r Receiver) error {
-	s.mux.Lock()
+	s.mu.Lock()
 	s.serve = true
-	s.mux.Unlock()
+	s.mu.Unlock()
 
 	if setuper, ok := r.(Setuper); ok {
 		if err := setuper.Setup(ctx, s.name, s.GetServiceInfo()...); err != nil {
