@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/relayutil"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
@@ -37,18 +38,24 @@ var errLostLeadership = errors.New("sequence: leadership lost mid-pass")
 func (r *Relay) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.options.PollInterval)
 	defer ticker.Stop()
-	defer r.leader.Release()
+	defer func() {
+		// Informational only: failover falls back to TTL expiry, and a store
+		// outage also surfaces on the successor's TryAcquire (see Release doc).
+		if err := r.leader.Release(); err != nil {
+			r.options.Logger.Warn("sequence relay: release leader lock", "relay", r.name, "err", err)
+		}
+	}()
 
 	// Do one pass immediately instead of waiting a full PollInterval for the
 	// first tick, so a freshly started relay starts delivering right away.
-	if err := ctx.Err(); err != nil {
-		return err
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
 	}
 	if err := r.RunOnce(ctx); err != nil {
 		if ctx.Err() == nil {
 			// Only observe if this isn't a planned shutdown (see the
 			// same-shaped handling in the loop below for the rationale).
-			r.options.Observer.ObserveError(r.name, err)
+			relayutil.ObserveError(r.options.Observer, r.name, err)
 			r.options.Logger.Error("sequence relay: pass failed", "relay", r.name, "err", err)
 		}
 	}
@@ -56,7 +63,9 @@ func (r *Relay) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// context.Cause degrades to ctx.Err() under a plain WithCancel and
+			// surfaces the richer cancel reason under WithCancelCause/errgroup.
+			return context.Cause(ctx)
 		case <-ticker.C:
 			if err := r.RunOnce(ctx); err != nil {
 				if ctx.Err() != nil {
@@ -68,7 +77,7 @@ func (r *Relay) Run(ctx context.Context) error {
 					// must be observed below.
 					continue
 				}
-				r.options.Observer.ObserveError(r.name, err)
+				relayutil.ObserveError(r.options.Observer, r.name, err)
 				r.options.Logger.Error("sequence relay: pass failed", "relay", r.name, "err", err)
 			}
 		}
@@ -123,7 +132,7 @@ func (r *Relay) sequence(ctx context.Context) error {
 		if n > 0 {
 			// Match drain's idle behavior: don't report a signal for an idle
 			// pass that sequenced nothing.
-			r.options.Observer.ObserveSequenced(r.name, n)
+			relayutil.ObserveSequenced(r.options.Observer, r.name, n)
 		}
 		if n < r.options.SequenceBatchSize {
 			return nil
@@ -228,7 +237,9 @@ func (r *Relay) drain(ctx context.Context) error {
 		}
 
 		if maxSeq > offset {
-			if err := r.commitOffset(ctx, maxSeq); err != nil {
+			// On a planned shutdown this commit still lands: boundedStore's
+			// CommitOffset detaches from the dead run ctx (see bounded.go).
+			if err := r.store.CommitOffset(ctx, r.name, maxSeq); err != nil {
 				return err
 			}
 			// A single leader owns the watermark, so the value we just
@@ -250,7 +261,7 @@ func (r *Relay) drain(ctx context.Context) error {
 			if len(msgs) > 0 {
 				oldestAge = time.Since(msgs[0].CreateTime)
 			}
-			r.options.Observer.ObserveDrained(r.name, sent, oldestAge, more)
+			relayutil.ObserveDrained(r.options.Observer, r.name, sent, oldestAge, more)
 		}
 
 		switch {
@@ -259,7 +270,7 @@ func (r *Relay) drain(ctx context.Context) error {
 			// commit goes through commitOffset's fresh bounded context — the
 			// run ctx is already dead here); Run's pass-level quieting keeps
 			// this silent.
-			return ctx.Err()
+			return context.Cause(ctx)
 		case stopped:
 			return nil
 		case poison != nil && !parkedPoison:
@@ -289,17 +300,6 @@ func (r *Relay) drain(ctx context.Context) error {
 	return nil // maxPagesPerTick full pages: yield to the sweep; the next tick continues
 }
 
-// commitOffset persists the watermark. When the run ctx is already canceled
-// (the final commit on a planned shutdown), the store call gets a fresh
-// bounded context instead (relay.BoundContext): a real store fails writes on
-// a dead context, and losing that commit would redeliver the page's
-// acknowledged sends on restart. Behavior on a live ctx is unchanged.
-func (r *Relay) commitOffset(ctx context.Context, seq int64) error {
-	ctx, cancel := relay.BoundContext(ctx, 0, commitTimeout)
-	defer cancel()
-	return r.store.CommitOffset(ctx, r.name, seq)
-}
-
 // maybeSweep runs the retention sweep at most once per RetentionSweepInterval
 // of wall-clock time — decoupled from PollInterval, so retuning the tick does
 // not silently change sweep cadence. The first leader tick sweeps immediately
@@ -324,5 +324,5 @@ func (r *Relay) maybeSweep(ctx context.Context) error {
 // retried, not parked). Never called for shutdown cancellation: a canceled
 // run context stops the lane instead.
 func (r *Relay) handleError(ctx context.Context, h relay.ErrorHandler, msg *outbox.Message, err error) {
-	relay.HandleMessageError(ctx, h, r.options.Observer, r.options.Logger, "sequence", r.name, msg, err)
+	relayutil.HandleMessageError(ctx, h, r.options.Observer, r.options.Logger, "sequence", r.name, msg, err)
 }

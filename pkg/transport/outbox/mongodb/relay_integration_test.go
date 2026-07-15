@@ -48,7 +48,7 @@ func TestStreamRelayEndToEnd(t *testing.T) {
 		t.Fatalf("prime: %v", err)
 	}
 
-	var ids []string
+	ids := make([]string, 0, 20)
 	for range 20 {
 		ids = append(ids, publish(t, "s"))
 	}

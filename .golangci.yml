@@ -1,28 +1,101 @@
 version: "2"
 run:
   concurrency: 2
-  go: '1.25'
+  go: '1.26'
   timeout: 1m
 
+# Curated set (v2 spelling — the previous config used v1 keys that
+# golangci-lint v2 silently ignored, so only the 5 standard linters actually
+# ran). Rolled out curated rather than `default: all`: enabling everything
+# repo-wide in the same change would drown the signal. Extend deliberately.
 linters:
-  enable-all: true
-  disable:
-    - depguard
+  default: standard
+  enable:
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - durationcheck
+    - errname
+    - errorlint
+    - exptostd
+    - fatcontext
+    - gocritic
+    - gosec
+    - intrange
+    - mirror
+    - misspell
+    - musttag
+    - nilnesserr
+    - noctx
+    - nolintlint
+    - perfsprint
+    - prealloc
+    - protogetter
+    - recvcheck
+    - rowserrcheck
+    - sloglint
+    - sqlclosecheck
+    - testpackage
+    - thelper
+    - unconvert
+    - unparam
+    - usetesting
     - wrapcheck
-    - mnd
-    - varnamelen
+  settings:
+    errcheck:
+      check-type-assertions: true
+    misspell:
+      locale: US
+    musttag:
+      functions:
+        # mongo-driver v2 import path; musttag's built-ins only cover v1
+        - name: go.mongodb.org/mongo-driver/v2/bson.Marshal
+          tag: bson
+          arg-pos: 0
+        - name: go.mongodb.org/mongo-driver/v2/bson.Unmarshal
+          tag: bson
+          arg-pos: 1
+    usetesting:
+      context-background: false # container/TestMain bootstrap legitimately uses context.Background
+      context-todo: true
+  exclusions:
+    rules:
+      # Transports are the pass-through/driver-plumbing layer: the outbox
+      # store contracts return descriptive `outbox:`-prefixed errors by
+      # convention, the relay runtimes preserve error identity across
+      # delegators (Run returns the unwrapped cancellation cause on planned
+      # shutdown), and wrapping at every hop would double-prefix everything.
+      # wrapcheck stays strict for eventbus/encoding/event, where wrapping
+      # discipline earns its keep.
+      - path: pkg/transport/
+        linters:
+          - wrapcheck
+      # Shutdown-path helpers (LeaderElector.Release, closeStream) run where
+      # the caller's ctx is already dead and use fresh bounded contexts BY
+      # DESIGN (documented on each); contextcheck cannot express that.
+      - path: pkg/transport/outbox/relay/
+        linters:
+          - contextcheck
+      # Testcontainer cleanup runs after the test ctx is dead; fresh bounded
+      # contexts there are the same deliberate pattern.
+      - path: (tidbtest|mongodbtest)/
+        linters:
+          - contextcheck
+      # Test helpers return raw errors straight into t.Fatal — wrapping them
+      # adds ceremony, not context.
+      - path: _test\.go
+        linters:
+          - wrapcheck
 
-linters-settings:
-  gci:
-    sections:
-      - standard
-      - default
-      - prefix(github.com/quarks-tech)
-      - prefix(github.com/quarks-tech/protoevent-go)
-      - blank
-  misspell:
-    locale: US
-  goimports:
-    local-prefixes: github.com/quarks-tech/protoevent-go
-  lll:
-    line-length: 180
+formatters:
+  enable:
+    - gci
+    - gofmt
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/quarks-tech)
+        - prefix(github.com/quarks-tech/protoevent-go)
+        - blank

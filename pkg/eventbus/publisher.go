@@ -14,6 +14,9 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
+// Sender is the transport seam on the publish side: one encoded event out.
+// Implementations include the RabbitMQ sender, the in-memory gochan
+// transport, and the transactional outbox Sender.
 type Sender interface {
 	Send(ctx context.Context, metadata *event.Metadata, data []byte) error
 }
@@ -35,7 +38,7 @@ type IDGenerator func() (string, error)
 func generateUUIDv4() (string, error) {
 	id, err := uuid.NewRandom()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("eventbus: generate uuid v4 event id: %w", err)
 	}
 
 	return id.String(), nil
@@ -107,10 +110,14 @@ func WithPublisherContentType(t string) PublisherOption {
 }
 
 // WithIDGenerator sets the generator used to produce event IDs when the caller
-// does not supply one via WithEventID. Defaults to UUID v4.
+// does not supply one via WithEventID. Defaults to UUID v4. A nil gen is
+// ignored, keeping the default (installing nil would only mint a panic at the
+// first Publish).
 func WithIDGenerator(gen IDGenerator) PublisherOption {
 	return func(opts *publisherOptions) {
-		opts.idGenerator = gen
+		if gen != nil {
+			opts.idGenerator = gen
+		}
 	}
 }
 
@@ -177,7 +184,7 @@ func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, 
 
 	codec, err := encoding.GetCodec(contentSubtype)
 	if err != nil {
-		return err
+		return fmt.Errorf("eventbus: publish: %w", err)
 	}
 
 	data, err := codec.Marshal(e)

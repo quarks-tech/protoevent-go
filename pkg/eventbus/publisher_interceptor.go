@@ -26,11 +26,12 @@ func chainPublisherInterceptors(cc *PublisherImpl) {
 		interceptors = append([]PublisherInterceptor{cc.options.interceptor}, interceptors...)
 	}
 	var chainedInt PublisherInterceptor
-	if len(interceptors) == 0 {
+	switch len(interceptors) {
+	case 0:
 		chainedInt = nil
-	} else if len(interceptors) == 1 {
+	case 1:
 		chainedInt = interceptors[0]
-	} else {
+	default:
 		chainedInt = func(ctx context.Context, name string, event interface{}, cc *PublisherImpl, invoker PublishFn, opts ...PublishOption) error {
 			return interceptors[0](ctx, name, event, cc, getChainUnaryInvoker(interceptors, 0, invoker), opts...)
 		}

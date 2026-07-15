@@ -76,7 +76,7 @@ func TestDecodeErrorFromRawWellFormed(t *testing.T) {
 
 	de := decodeErrorFromRaw(raw, cause)
 
-	if !errors.Is(de, cause) && de.Err != cause {
+	if !errors.Is(de, cause) {
 		t.Fatalf("cause not carried: %v", de.Err)
 	}
 	wantToken := string(mustMarshalRaw(t, resumeDoc))
@@ -166,7 +166,7 @@ func TestDecodeErrorFromRawNilAndGarbage(t *testing.T) {
 		if de == nil {
 			t.Fatalf("%s: decodeErrorFromRaw returned nil", name)
 		}
-		if de.Err != cause {
+		if !errors.Is(de.Err, cause) {
 			t.Fatalf("%s: cause not carried: %v", name, de.Err)
 		}
 		if de.ResumeToken != "" || de.ID != "" || !de.ClusterTime.IsZero() {

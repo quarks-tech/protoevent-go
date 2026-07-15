@@ -130,8 +130,12 @@ positive; if `PollInterval` is not strictly less than `LeaseTTL/2` (the lease
 must be renewable at least twice per TTL); if `name` (or an overridden
 `LeaderLockName`) exceeds 64 bytes (the reference schema's `VARCHAR(64)` key
 columns — a relaxed `sql_mode` would silently truncate a longer name into
-another group's offset row and leader lock); and if `WithRetention` is given a
-nonzero window without a strictly positive `sweepInterval` and `sweepBatch`. A
+another group's offset row and leader lock); if `WithRetention` is given a
+nonzero window without a strictly positive `sweepInterval` and `sweepBatch`;
+if the store lacks `sequence.SequencerStore` without a `WithoutSequencer()`
+waiver (a missing sequencer is a permanent silent stall, not a mode); and if
+`WithRetention` is set on a store lacking `sequence.RetentionStore` (a
+configured sweep that silently never runs would grow the log unboundedly). A
 `Relay` is not safe for concurrent use: call `Run` from a single goroutine.
 
 ```go
@@ -173,10 +177,11 @@ modified. Pass `sequence.WithStartFromBeginning()` to make a new group replay
 the retained log instead; the option has no effect once the group has committed
 an offset.
 
-`sequence.WithObserver` wires an `Observer` (embeds `relay.Observer` plus
-`ObserveSequenced`) to your metrics system — e.g. Prometheus — for lag and
-throughput; `ObserveDrained`'s count is successfully sent messages only (parked
-messages surface via `ObserveError`). `sequence.WithLogger` wires a
+`sequence.WithObserver` wires a `relay.Observer` — a struct of nil-able
+callbacks (`OnDrained`, `OnError`, `OnSequenced`; set only what you need, the
+zero value discards everything) — to your metrics system, e.g. Prometheus, for
+lag and throughput; `OnDrained`'s count is successfully sent messages only
+(parked messages surface via `OnError`). `sequence.WithLogger` wires a
 `*log/slog.Logger` for pass-level errors. `sequence.WithErrorHandler` installs
 the poison-parking hook: a row whose persisted metadata fails to decode
 (`sequence.DecodeError`) is handed to the `relay.ErrorHandler` and the relay
@@ -299,9 +304,9 @@ requires a `collMod` on the index, not a restart with a new option value;
 `maxAwaitTime` knob: the relay passes `WithDrainWindow` to `Store.Watch` as
 `maxAwait`, which becomes the change stream's `maxAwaitTimeMS` — one latency
 knob, nothing to keep in sync. `stream.WithObserver`
-wires the same `relay.Observer` shape used by `sequence.WithObserver` (e.g.
-Prometheus) for lag and throughput (`ObserveDrained` counts successfully sent
-messages only; parked messages surface via `ObserveError`);
+wires the same `relay.Observer` callback struct used by `sequence.WithObserver`
+(`OnSequenced` simply never fires here) for lag and throughput (`OnDrained`
+counts successfully sent messages only; parked messages surface via `OnError`);
 `stream.WithLogger` wires a `*log/slog.Logger`
 for stream-level errors; `stream.WithErrorHandler` installs the poison-parking
 hook: an event whose payload fails to decode (`stream.DecodeError`, which

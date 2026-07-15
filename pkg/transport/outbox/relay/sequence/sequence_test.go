@@ -15,6 +15,7 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/sequence"
 )
 
@@ -294,17 +295,18 @@ func (s *fakeStore) leaderHolder() string {
 	return s.leader
 }
 
-func msg(seq int64) *outbox.Message {
-	return &outbox.Message{ID: "id", Seq: seq, Metadata: event.NewMetadata("t"), CreateTime: time.Now()}
+// msg builds an unsequenced pending row (Seq 0 until the fake sequencer runs).
+func msg() *outbox.Message {
+	return &outbox.Message{ID: "id", Metadata: event.NewMetadata("t"), CreateTime: time.Now()}
 }
 
 // --- runtime tests ----------------------------------------------------------
 
 func TestRunOnceSequencesThenDrainsSameTick(t *testing.T) {
 	st := newFakeStore()
-	st.append(msg(0))
-	st.append(msg(0))
-	st.append(msg(0))
+	st.append(msg())
+	st.append(msg())
+	st.append(msg())
 
 	var got []int64
 	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
@@ -330,7 +332,7 @@ func TestRunOnceSequencesThenDrainsSameTick(t *testing.T) {
 func TestDrainLoopsUntilShortPage(t *testing.T) {
 	st := newFakeStore()
 	for range 250 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	var count int
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { count++; return nil })
@@ -350,7 +352,7 @@ func TestDrainLoopsUntilShortPage(t *testing.T) {
 func TestStopTheLaneOnSendError(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	var got []int64
 	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
@@ -379,7 +381,7 @@ func TestStopTheLaneOnSendError(t *testing.T) {
 func TestNonLeaderDoesNothing(t *testing.T) {
 	st := newFakeStore()
 	st.leader = "someone-else"
-	st.append(msg(0))
+	st.append(msg())
 	sent := 0
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
 
@@ -404,7 +406,7 @@ func TestNonLeaderDoesNothing(t *testing.T) {
 func TestSendFailureStopsLaneEvenWithErrorHandler(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	var got []int64
 	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
@@ -447,14 +449,12 @@ func TestSendFailureStopsLaneEvenWithErrorHandler(t *testing.T) {
 	}
 }
 
-// recordingObserver tracks whether ObserveError was ever called.
+// recordingObserver tracks whether OnError was ever called.
 type recordingObserver struct {
 	mu          sync.Mutex
 	errObserved bool
 }
 
-func (o *recordingObserver) ObserveDrained(string, int, time.Duration, bool) {}
-func (o *recordingObserver) ObserveSequenced(string, int)                    {}
 func (o *recordingObserver) ObserveError(string, error) {
 	o.mu.Lock()
 	o.errObserved = true
@@ -485,7 +485,8 @@ func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
 	st := ctxCancelingLeaderStore{fakeStore: newFakeStore(), cancel: cancel}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &recordingObserver{}
-	r, err := sequence.NewRelay("c", st, sender, sequence.WithObserver(obs), sequence.WithPollInterval(time.Millisecond))
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithObserver(relay.Observer{OnError: obs.ObserveError}), sequence.WithPollInterval(time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -507,8 +508,6 @@ type signalingObserver struct {
 	ch chan struct{}
 }
 
-func (o *signalingObserver) ObserveDrained(string, int, time.Duration, bool) {}
-func (o *signalingObserver) ObserveSequenced(string, int)                    {}
 func (o *signalingObserver) ObserveError(string, error) {
 	select {
 	case o.ch <- struct{}{}:
@@ -527,7 +526,8 @@ func TestRunObservesOpLevelDeadlineExceededWhileCtxAlive(t *testing.T) {
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &signalingObserver{ch: make(chan struct{}, 1)}
 
-	r, err := sequence.NewRelay("c", st, sender, sequence.WithObserver(obs), sequence.WithPollInterval(5*time.Millisecond))
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithObserver(relay.Observer{OnError: obs.ObserveError}), sequence.WithPollInterval(5*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -557,7 +557,7 @@ func TestRunObservesOpLevelDeadlineExceededWhileCtxAlive(t *testing.T) {
 func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 	st := newFakeStore()
 	for range 3 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
 		t.Fatalf("seed sequence: %v", err)
@@ -583,8 +583,8 @@ func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 		t.Fatalf("offset = %d, want 3 (initialized to current max seq)", off)
 	}
 
-	st.append(msg(0))
-	st.append(msg(0))
+	st.append(msg())
+	st.append(msg())
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -601,7 +601,7 @@ func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 func TestRunTicksThenReleasesOnCancel(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		st := newFakeStore()
-		st.append(msg(0))
+		st.append(msg())
 
 		var delivered atomic.Int64
 		sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
@@ -738,23 +738,57 @@ func TestMaybeSweepRunsOnInterval(t *testing.T) {
 	})
 }
 
-// TestMaybeSweepNoopWithoutRetentionStore proves a store lacking
-// sequence.RetentionStore never gets a SweepMessages call and RunOnce does
-// not panic, even with RetentionWindow configured via a capable neighbor.
-func TestMaybeSweepNoopWithoutRetentionStore(t *testing.T) {
-	inner := newFakeStore()
-	st := noRetentionStore{inner: inner}
-	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, time.Minute, 100))
-	if err != nil {
-		t.Fatalf("NewRelay: %v", err)
+// TestNewRelayRejectsRetentionWithoutRetentionStore pins the capability
+// validation: WithRetention on a store lacking sequence.RetentionStore is a
+// construction error, not a silently dead sweep (which would grow the log
+// unboundedly and surface as a disk incident long after the misconfiguration).
+func TestNewRelayRejectsRetentionWithoutRetentionStore(t *testing.T) {
+	st := noRetentionStore{inner: newFakeStore()}
+	_, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, time.Minute, 100))
+	if err == nil || !strings.Contains(err.Error(), "RetentionStore") {
+		t.Fatalf("err = %v, want the RetentionStore capability error", err)
 	}
-	for i := range 3 {
-		if err := r.RunOnce(t.Context()); err != nil {
-			t.Fatalf("RunOnce[%d]: %v", i, err)
-		}
+	// Without WithRetention the same store is fine: retention is simply off.
+	if _, err := sequence.NewRelay("c", noRetentionStore{inner: newFakeStore()}, noopSender); err != nil {
+		t.Fatalf("NewRelay without retention: %v", err)
 	}
-	if calls, _ := inner.snapshotSweep(); calls != 0 {
-		t.Fatalf("sweepCalls = %d, want 0 (store lacks RetentionStore)", calls)
+}
+
+// noSequencerStore exposes the read/offset contract but deliberately not
+// SequenceMessages, for the SequencerStore capability-validation tests.
+type noSequencerStore struct{ inner *fakeStore }
+
+func (s noSequencerStore) ListMessages(ctx context.Context, afterSeq int64, limit int) ([]*outbox.Message, error) {
+	return s.inner.ListMessages(ctx, afterSeq, limit)
+}
+
+func (s noSequencerStore) Offset(ctx context.Context, name string) (int64, error) {
+	return s.inner.Offset(ctx, name)
+}
+
+func (s noSequencerStore) CommitOffset(ctx context.Context, name string, seq int64) error {
+	return s.inner.CommitOffset(ctx, name, seq)
+}
+
+func (s noSequencerStore) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
+	return s.inner.InitOffsetLatest(ctx, name)
+}
+
+// TestNewRelayRejectsMissingSequencerWithoutWaiver pins the other half of the
+// capability policy: a store lacking sequence.SequencerStore is a
+// construction error UNLESS the caller explicitly waives the sequencer with
+// WithoutSequencer() (the someone-else-sequences topology). The implicit
+// silent path would otherwise be a permanent, unobservable stall: nothing
+// ever gets a seq, drain sees nothing, no error is reported.
+func TestNewRelayRejectsMissingSequencerWithoutWaiver(t *testing.T) {
+	st := noSequencerStore{inner: newFakeStore()}
+	_, err := sequence.NewRelay("c", st, noopSender)
+	if err == nil || !strings.Contains(err.Error(), "WithoutSequencer") {
+		t.Fatalf("err = %v, want the SequencerStore capability error naming the waiver", err)
+	}
+	// The explicit waiver accepts the same store.
+	if _, err := sequence.NewRelay("c", st, noopSender, sequence.WithoutSequencer()); err != nil {
+		t.Fatalf("NewRelay with WithoutSequencer: %v", err)
 	}
 }
 
@@ -781,7 +815,7 @@ func TestMaybeSweepErrorPropagates(t *testing.T) {
 func TestSequenceLoopsWhileFull(t *testing.T) {
 	st := newFakeStore()
 	for range 25 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	r, err := sequence.NewRelay("c", st, noopSender,
 		sequence.WithSequenceBatchSize(10), sequence.WithBatchSize(1000))
@@ -806,7 +840,7 @@ func TestSequenceLoopsWhileFull(t *testing.T) {
 func TestSequenceStopsOnCtxCancellationMidLoop(t *testing.T) {
 	st := newFakeStore()
 	for range 4 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithSequenceBatchSize(2))
 	if err != nil {
@@ -846,7 +880,7 @@ func TestSequenceSequencerErrorPropagates(t *testing.T) {
 // store implements SequencerStore.
 func TestWithoutSequencerSkipsSequencing(t *testing.T) {
 	st := newFakeStore()
-	st.append(msg(0))
+	st.append(msg())
 	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithoutSequencer(), sequence.WithStartFromBeginning())
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -916,7 +950,7 @@ func TestRunOnceListMessagesErrorPropagates(t *testing.T) {
 func TestRunOnceCommitOffsetErrorPropagates(t *testing.T) {
 	sentinel := errors.New("commit boom")
 	st := newFakeStore()
-	st.append(msg(0))
+	st.append(msg())
 	st.commitErr = sentinel
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
@@ -935,7 +969,7 @@ func TestRunOnceCommitOffsetErrorPropagates(t *testing.T) {
 func TestDrainStopsImmediatelyOnPreCanceledCtx(t *testing.T) {
 	st := newFakeStore()
 	for range 4 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
 		t.Fatalf("seed sequence: %v", err)
@@ -968,7 +1002,7 @@ func TestDrainStopsImmediatelyOnPreCanceledCtx(t *testing.T) {
 func TestWithLoggerReceivesTransientError(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	h := &recordingHandler{}
 	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
@@ -1050,7 +1084,7 @@ func TestDrainStopsWhenLeadershipLostBetweenPages(t *testing.T) {
 	st := &revokingLeaderStore{fakeStore: newFakeStore()}
 	st.allowed.Store(1) // RunOnce's opening acquire succeeds; the renewal fails
 	for range 6 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	var sent int
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
@@ -1080,7 +1114,7 @@ func TestLeadershipLostDuringSequenceSkipsDrainAndSweep(t *testing.T) {
 	st := &revokingLeaderStore{fakeStore: newFakeStore()}
 	st.allowed.Store(1) // RunOnce's opening acquire succeeds; the sequencer's renewal fails
 	for range 4 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	var sent int
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
@@ -1131,7 +1165,7 @@ func TestRenewalErrorMidDrainEndsPassCleanly(t *testing.T) {
 	sentinel := errors.New("lock store boom")
 	st := &erroringLeaderStore{fakeStore: newFakeStore(), failFrom: 2, err: sentinel}
 	for range 6 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	var sent int
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
@@ -1165,7 +1199,7 @@ func TestRenewalErrorMidDrainEndsPassCleanly(t *testing.T) {
 func TestCancelDuringSendDoesNotPark(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	var sent []int64
@@ -1207,7 +1241,7 @@ func TestCancelDuringSendDoesNotPark(t *testing.T) {
 func TestCancelBetweenSendsStopsLane(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	var sent []int64
@@ -1257,7 +1291,7 @@ func TestCancelBetweenSendsStopsLane(t *testing.T) {
 func TestPoisonRowParkedWithErrorHandler(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	st.poisonSeq = 3
 
@@ -1301,7 +1335,7 @@ func TestPoisonRowParkedWithErrorHandler(t *testing.T) {
 func TestPoisonRowStopsLaneWithoutErrorHandler(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	st.poisonSeq = 3
 
@@ -1339,8 +1373,6 @@ func (o *drainCountObserver) ObserveDrained(_ string, count int, _ time.Duration
 	o.counts = append(o.counts, count)
 	o.mu.Unlock()
 }
-func (o *drainCountObserver) ObserveSequenced(string, int) {}
-func (o *drainCountObserver) ObserveError(string, error)   {}
 
 // TestObserveDrainedExcludesParkedMessages pins the relay.Observer contract:
 // ObserveDrained's count is successful sends only — a parked poison row is
@@ -1348,12 +1380,12 @@ func (o *drainCountObserver) ObserveError(string, error)   {}
 func TestObserveDrainedExcludesParkedMessages(t *testing.T) {
 	st := newFakeStore()
 	for range 5 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	st.poisonSeq = 3
 	obs := &drainCountObserver{}
 	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning(),
-		sequence.WithObserver(obs),
+		sequence.WithObserver(relay.Observer{OnDrained: obs.ObserveDrained}),
 		sequence.WithErrorHandler(func(context.Context, *outbox.Message, error) {}))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -1380,7 +1412,7 @@ func TestObserveDrainedExcludesParkedMessages(t *testing.T) {
 func TestSequenceLoopBoundedPerTick(t *testing.T) {
 	st := newFakeStore()
 	for range 70 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	r, err := sequence.NewRelay("c", st, noopSender,
 		sequence.WithSequenceBatchSize(1), sequence.WithStartFromBeginning())
@@ -1406,7 +1438,7 @@ func TestSequenceLoopBoundedPerTick(t *testing.T) {
 func TestDrainLoopBoundedPerTick(t *testing.T) {
 	st := newFakeStore()
 	for range 70 {
-		st.append(msg(0))
+		st.append(msg())
 	}
 	var sent int
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { sent++; return nil })
@@ -1447,8 +1479,6 @@ func (o *fullDrainObserver) ObserveDrained(_ string, count int, age time.Duratio
 	o.mores = append(o.mores, more)
 	o.mu.Unlock()
 }
-func (o *fullDrainObserver) ObserveSequenced(string, int) {}
-func (o *fullDrainObserver) ObserveError(string, error)   {}
 
 // TestPoisonOnlyPageObservesDrained proves a page whose decoded prefix is
 // empty but whose poison row is parked still reports ObserveDrained: the pass
@@ -1457,12 +1487,12 @@ func (o *fullDrainObserver) ObserveError(string, error)   {}
 // is true (rows may follow the parked poison).
 func TestPoisonOnlyPageObservesDrained(t *testing.T) {
 	st := newFakeStore()
-	st.append(msg(0))
+	st.append(msg())
 	st.poisonSeq = 1
 
 	obs := &fullDrainObserver{}
 	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning(),
-		sequence.WithObserver(obs),
+		sequence.WithObserver(relay.Observer{OnDrained: obs.ObserveDrained}),
 		sequence.WithErrorHandler(func(context.Context, *outbox.Message, error) {}))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)

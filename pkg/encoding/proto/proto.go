@@ -25,7 +25,11 @@ func (codec) Marshal(v interface{}) ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("failed to marshal, message is %T, want proto.Message", v)
 	}
-	return proto.Marshal(vv)
+	b, err := proto.Marshal(vv)
+	if err != nil {
+		return nil, fmt.Errorf("proto codec: marshal: %w", err)
+	}
+	return b, nil
 }
 
 func (codec) Unmarshal(data []byte, v interface{}) error {
@@ -33,5 +37,8 @@ func (codec) Unmarshal(data []byte, v interface{}) error {
 	if !ok {
 		return fmt.Errorf("failed to unmarshal, message is %T, want proto.Message", v)
 	}
-	return proto.Unmarshal(data, vv)
+	if err := proto.Unmarshal(data, vv); err != nil {
+		return fmt.Errorf("proto codec: unmarshal: %w", err)
+	}
+	return nil
 }

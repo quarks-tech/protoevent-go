@@ -13,6 +13,7 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/stream"
 )
 
@@ -105,6 +106,8 @@ type fakeStream struct {
 	// bounded one (deadline set, not already canceled) even on shutdown paths.
 	closeHadDeadline bool
 	closeCtxErr      error
+
+	closeErr error // when set, Close returns it (informational-error contract)
 }
 
 func (s *fakeStream) Next(context.Context) (*stream.Event, bool, error) {
@@ -129,7 +132,7 @@ func (s *fakeStream) Close(ctx context.Context) error {
 	s.closeCount++
 	_, s.closeHadDeadline = ctx.Deadline()
 	s.closeCtxErr = ctx.Err()
-	return nil
+	return s.closeErr
 }
 
 // fakeStore hands out one fakeStream and records saved tokens.
@@ -390,9 +393,9 @@ func TestRunOnceStopClosesStreamForRedelivery(t *testing.T) {
 		return nil
 	})
 	r := mustRelay(t, st, sender)
-	// RunOnce returns errLaneStopped, which is unexported and unreferenceable
-	// here; assert the observable effects instead.
-	_ = r.RunOnce(t.Context())
+	if err := r.RunOnce(t.Context()); !errors.Is(err, stream.ErrLaneStopped) {
+		t.Fatalf("RunOnce err = %v, want ErrLaneStopped (the documented back-off-and-retry signal)", err)
+	}
 
 	if len(got) != 1 || got[0] != "a" {
 		t.Fatalf("delivered %v, want [a] (stop before b)", got)
@@ -475,7 +478,7 @@ func TestObserveDrainedCountsOnlySent(t *testing.T) {
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &countingObserver{}
 	r := mustRelay(t, st, sender,
-		stream.WithObserver(obs),
+		stream.WithObserver(relay.Observer{OnDrained: obs.ObserveDrained, OnError: obs.ObserveError}),
 		stream.WithErrorHandler(func(context.Context, *outbox.Message, error) {}))
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -491,13 +494,12 @@ func TestObserveDrainedCountsOnlySent(t *testing.T) {
 	}
 }
 
-// recordingObserver tracks whether ObserveError was ever called.
+// recordingObserver tracks whether OnError was ever called.
 type recordingObserver struct {
 	mu          sync.Mutex
 	errObserved bool
 }
 
-func (o *recordingObserver) ObserveDrained(string, int, time.Duration, bool) {}
 func (o *recordingObserver) ObserveError(string, error) {
 	o.mu.Lock()
 	o.errObserved = true
@@ -528,7 +530,7 @@ func TestRunDoesNotReportErrorOnShutdown(t *testing.T) {
 	st := ctxCancelingLeaderStore{fakeStore: &fakeStore{stream: &fakeStream{}}, cancel: cancel}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &recordingObserver{}
-	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(obs))
+	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(relay.Observer{OnError: obs.ObserveError}))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -746,7 +748,6 @@ type signalingObserver struct {
 	ch chan struct{}
 }
 
-func (o *signalingObserver) ObserveDrained(string, int, time.Duration, bool) {}
 func (o *signalingObserver) ObserveError(string, error) {
 	select {
 	case o.ch <- struct{}{}:
@@ -765,7 +766,7 @@ func TestRunObservesOpLevelDeadlineExceededWhileCtxAlive(t *testing.T) {
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &signalingObserver{ch: make(chan struct{}, 1)}
 
-	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(obs),
+	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(relay.Observer{OnError: obs.ObserveError}),
 		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -982,6 +983,47 @@ func TestLeaderDemotionClosesStreamAndReloadsToken(t *testing.T) {
 	}
 }
 
+// TestCloseStreamErrorIsLoggedNotFatal pins closeStream's informational-error
+// contract (mirroring LeaderElector.Release): a failed cursor close is logged
+// (Warn) and the pass continues unaffected — the local cursor is dropped
+// regardless, and the server reaps the leaked cursor on its own timeout.
+func TestCloseStreamErrorIsLoggedNotFatal(t *testing.T) {
+	fs := &fakeStream{closeErr: errors.New("killCursors boom")}
+	st := &fakeStore{stream: fs, loadTok: "existing"}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	handler := &countingHandler{}
+	r := mustRelay(t, st, sender, stream.WithLogger(slog.New(handler)),
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second))
+
+	// Open the stream as leader, then get demoted: the demotion path closes
+	// the cursor, whose Close fails.
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[leader]: %v", err)
+	}
+	st.mu.Lock()
+	st.leader = "other"
+	st.mu.Unlock()
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[demoted] = %v, want nil (a failed close is informational, not a pass error)", err)
+	}
+	if fs.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1", fs.closeCount)
+	}
+	if handler.snapshot() == 0 {
+		t.Fatal("failed Close was not logged; the informational error must not be silently discarded")
+	}
+	// The reopen path is unaffected: re-promotion opens a fresh cursor.
+	st.mu.Lock()
+	st.leader = ""
+	st.mu.Unlock()
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[re-promoted]: %v", err)
+	}
+	if st.watchCountSnapshot() != 2 {
+		t.Fatalf("watchCount = %d, want 2 (fresh cursor after the failed close)", st.watchCountSnapshot())
+	}
+}
+
 // TestUnpersistedSaveDoesNotAdvanceLocalTrackers pins the persisted=false
 // contract: a save the store's monotone guard skipped must not advance the
 // relay's local committed-position trackers. Observable via the idle-window
@@ -1012,7 +1054,7 @@ func TestRunReturnsInvalidateAsFatal(t *testing.T) {
 	st := &fakeStore{stream: fs}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	obs := &recordingObserver{}
-	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(obs))
+	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(relay.Observer{OnError: obs.ObserveError}))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -1080,7 +1122,8 @@ func TestWithLoggerReceivesTransientError(t *testing.T) {
 	obs := &signalingObserver{ch: make(chan struct{}, 1)}
 	handler := &countingHandler{}
 
-	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(obs), stream.WithLogger(slog.New(handler)),
+	r, err := stream.NewRelay("c", st, sender,
+		stream.WithObserver(relay.Observer{OnError: obs.ObserveError}), stream.WithLogger(slog.New(handler)),
 		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(50*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)

@@ -3,6 +3,7 @@ package outbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,7 +33,7 @@ type IDGenerator func(md *event.Metadata) (string, error)
 func GenerateV4(_ *event.Metadata) (string, error) {
 	id, err := uuid.NewRandom()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("outbox: generate uuid v4 row id: %w", err)
 	}
 
 	return id.String(), nil
@@ -73,13 +74,17 @@ type SenderOption func(opts *senderOptions)
 
 // WithIDGenerator sets the generator used to produce the outbox row ID.
 // Defaults to ReuseMetadataID. Use GenerateV4 to key rows on a freshly minted
-// UUID independent of the event's Metadata.ID.
+// UUID independent of the event's Metadata.ID. A nil gen is ignored, keeping
+// the default (the With* nil-guard convention — installing nil would only
+// mint a panic at the first Send, inside the caller's business transaction).
 //
 // Note: the TiDB store requires UUID IDs; the MongoDB store accepts any
 // string. A custom IDGenerator used with the TiDB backend must emit UUIDs.
 func WithIDGenerator(gen IDGenerator) SenderOption {
 	return func(opts *senderOptions) {
-		opts.idGenerator = gen
+		if gen != nil {
+			opts.idGenerator = gen
+		}
 	}
 }
 

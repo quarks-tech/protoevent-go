@@ -132,13 +132,13 @@ type options struct {
 	ErrorHandler relay.ErrorHandler
 }
 
-// defaultOptions returns the default stream relay configuration.
+// defaultOptions returns the default stream relay configuration. The zero
+// relay.Observer discards all signals.
 func defaultOptions() options {
 	return options{
 		DrainWindow:    time.Second,
 		LeaseTTL:       15 * time.Second,
 		TokenBatchSize: 100,
-		Observer:       relay.NopObserver(),
 		Logger:         slog.New(slog.DiscardHandler),
 	}
 }
@@ -168,13 +168,11 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// WithObserver sets the observability sink. A nil observer is ignored.
+// WithObserver sets the observability sink (a relay.Observer struct of
+// nil-able callbacks; the same type both runtimes accept — OnSequenced never
+// fires here). The zero value discards all signals.
 func WithObserver(obs relay.Observer) Option {
-	return func(o *options) {
-		if obs != nil {
-			o.Observer = obs
-		}
-	}
+	return func(o *options) { o.Observer = obs }
 }
 
 // WithErrorHandler installs the poison-parking hook: an event whose payload
@@ -256,11 +254,22 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		return nil, fmt.Errorf("stream: DrainWindow (%v) must be < LeaseTTL/2 (%v)", options.DrainWindow, options.LeaseTTL/2)
 	}
 
-	ls, _ := store.(relay.LeaderStore)
+	ls, hasLeaderStore := store.(relay.LeaderStore)
+	if !hasLeaderStore {
+		// Always-leader is a documented single-instance mode, not an error —
+		// but it must not be a silent one: a custom store that MEANT to
+		// implement relay.LeaderStore would otherwise run dual leaders in a
+		// multi-replica deployment with no signal until duplicate delivery
+		// is noticed.
+		options.Logger.Info("stream relay: store has no relay.LeaderStore capability; running always-leader (single-instance mode)",
+			"relay", name)
+	}
 
 	return &Relay{
-		name:    name,
-		store:   store,
+		name: name,
+		// Every store operation is decorated with its bound at construction —
+		// see boundedStore (bounded.go).
+		store:   boundedStore{inner: store, ttl: options.LeaseTTL},
 		sender:  sender,
 		options: options,
 		leader:  relay.NewLeaderElector(ls, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),

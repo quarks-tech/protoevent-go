@@ -4,20 +4,26 @@ package relay
 
 import (
 	"context"
-	"log/slog"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 )
 
-// Observer receives lag/throughput signals common to every relay runtime. It is
-// the dependency-free observability seam: callers wire it to Prometheus etc.
-// Values are derived from data the relay's passes already hold — no extra queries.
-type Observer interface {
-	// ObserveDrained reports a drain/forward pass: count successfully sent
-	// (messages parked via an ErrorHandler are reported through ObserveError
-	// and not counted here), age of the oldest event handled (lag), and
-	// whether more work is immediately waiting.
+// Observer receives lag/throughput signals common to every relay runtime. It
+// is the dependency-free observability seam: callers wire it to Prometheus
+// etc. Values are derived from data the relay's passes already hold — no
+// extra queries.
+//
+// Observer is a struct of nil-able callbacks (httptrace.ClientTrace style),
+// not an interface: set only the signals you care about — a nil callback is
+// simply never invoked — and future signals are additive rather than
+// breaking. The zero value discards everything. Both runtimes accept the
+// same type; OnSequenced simply never fires for the stream runtime.
+type Observer struct {
+	// OnDrained reports a drain/forward pass: count successfully sent
+	// (messages parked via an ErrorHandler are reported through OnError and
+	// not counted here), age of the oldest event handled (lag), and whether
+	// more work is immediately waiting.
 	// oldestAge is measured from the runtime's committed anchor: insert-time
 	// (Message.CreateTime) age of the oldest event in the page for the
 	// sequence runtime, and committed-token (clusterTime) age for the stream
@@ -25,9 +31,13 @@ type Observer interface {
 	//
 	// more reports whether work is known to remain: a full page, or a
 	// stop-the-lane failure (the failed event is still pending).
-	ObserveDrained(name string, count int, oldestAge time.Duration, more bool)
-	// ObserveError reports a pass-level error (leadership, read, forward, sweep).
-	ObserveError(name string, err error)
+	OnDrained func(name string, count int, oldestAge time.Duration, more bool)
+	// OnError reports a pass-level error (leadership, read, forward, sweep)
+	// or a per-message failure (send failure, parked poison row).
+	OnError func(name string, err error)
+	// OnSequenced reports how many rows a sequencer pass assigned. Fired by
+	// the sequence runtime only.
+	OnSequenced func(name string, count int)
 }
 
 // ErrorHandler is the poison-parking hook shared by both runtimes: called for
@@ -40,15 +50,6 @@ type Observer interface {
 // cancellation is never routed here either — a canceled run context stops the
 // lane instead of parking healthy messages.
 type ErrorHandler func(ctx context.Context, msg *outbox.Message, err error)
-
-// NopObserver returns an Observer that discards all signals — the default
-// when no observer is wired.
-func NopObserver() Observer { return nopObserver{} }
-
-type nopObserver struct{}
-
-func (nopObserver) ObserveDrained(string, int, time.Duration, bool) {}
-func (nopObserver) ObserveError(string, error)                      {}
 
 // LeaderStore enables running multiple relay instances with automatic failover.
 // Only the lock holder processes; others idle. Shared by both runtimes.
@@ -64,33 +65,4 @@ type LeaderStore interface {
 	TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error)
 	// ReleaseLeaderLock releases the lock if held by holderID (graceful shutdown).
 	ReleaseLeaderLock(ctx context.Context, name, holderID string) error
-}
-
-// BoundContext returns the context for one relay store operation. While ctx is
-// alive it is bounded by liveTimeout (0 = no bound, ctx returned as-is); once
-// ctx is canceled — the final offset commit / token save / stream close on a
-// planned shutdown — a fresh Background context bounded by deadTimeout
-// replaces it, so those writes are still deliverable and bounded (a real store
-// fails writes on a dead context, and losing the final commit redelivers
-// acknowledged sends on restart). Always call the returned cancel.
-func BoundContext(ctx context.Context, liveTimeout, deadTimeout time.Duration) (context.Context, context.CancelFunc) {
-	if ctx.Err() != nil {
-		return context.WithTimeout(context.Background(), deadTimeout)
-	}
-	if liveTimeout <= 0 {
-		return ctx, func() {}
-	}
-	return context.WithTimeout(ctx, liveTimeout)
-}
-
-// HandleMessageError routes one failed message through the shared error
-// policy: the ErrorHandler (nil for stop-the-lane failures — only poison
-// DecodeErrors are ever parked), the Observer, and the Logger. Shared so the
-// two runtimes cannot drift on park/observe/log semantics.
-func HandleMessageError(ctx context.Context, h ErrorHandler, obs Observer, log *slog.Logger, runtime, name string, msg *outbox.Message, err error) {
-	if h != nil {
-		h(ctx, msg, err)
-	}
-	obs.ObserveError(name, err)
-	log.Error(runtime+" relay: message failed", "relay", name, "event_id", msg.ID, "err", err)
 }

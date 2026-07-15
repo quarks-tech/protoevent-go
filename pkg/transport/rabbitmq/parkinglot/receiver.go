@@ -170,34 +170,34 @@ func (r *Receiver) setupTopology(conn *connpool.Conn) error {
 
 	err := conn.Channel().ExchangeDeclare(r.options.dlxExchange, amqp.ExchangeTopic, true, false, false, false, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("declare exchange %q: %w", r.options.dlxExchange, err)
 	}
 
 	_, err = conn.Channel().QueueDeclare(r.options.waitQueue, true, false, false, false, waitQueueArgs)
 	if err != nil {
-		return err
+		return fmt.Errorf("declare queue %q: %w", r.options.waitQueue, err)
 	}
 
 	_, err = conn.Channel().QueueDeclare(r.options.parkingLotQueue, true, false, false, false, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("declare queue %q: %w", r.options.parkingLotQueue, err)
 	}
 
 	_, err = conn.Channel().QueueDeclare(r.options.incomingQueue, true, false, false, false, incomingQueueArgs)
 	if err != nil {
-		return err
+		return fmt.Errorf("declare queue %q: %w", r.options.incomingQueue, err)
 	}
 
 	if err = conn.Channel().QueueBind(r.options.waitQueue, wait, r.options.dlxExchange, false, nil); err != nil {
-		return err
+		return fmt.Errorf("bind queue %q: %w", r.options.waitQueue, err)
 	}
 
 	if err = conn.Channel().QueueBind(r.options.incomingQueue, retry, r.options.dlxExchange, false, nil); err != nil {
-		return err
+		return fmt.Errorf("bind queue %q: %w", r.options.incomingQueue, err)
 	}
 
 	if err = conn.Channel().QueueBind(r.options.parkingLotQueue, parkingLot, r.options.dlxExchange, false, nil); err != nil {
-		return err
+		return fmt.Errorf("bind queue %q: %w", r.options.parkingLotQueue, err)
 	}
 
 	return nil
@@ -207,7 +207,7 @@ func (r *Receiver) setupBindings(conn *connpool.Conn, infos []eventbus.ServiceIn
 	for _, info := range infos {
 		for _, eventName := range info.Events {
 			if err := conn.Channel().QueueBind(r.options.incomingQueue, eventName, info.ServiceName, false, nil); err != nil {
-				return err
+				return fmt.Errorf("bind queue %q to %q: %w", r.options.incomingQueue, info.ServiceName, err)
 			}
 		}
 	}
@@ -221,14 +221,19 @@ func (r *Receiver) Receive(ctx context.Context, processor eventbus.Processor) er
 	})
 }
 
+// The consume errgroup is deliberately detached from ctx: cancellation must
+// stop the consumer and let in-flight deliveries drain instead of aborting
+// the group, so ctx is watched explicitly in the control goroutine.
+//
+//nolint:contextcheck
 func (r *Receiver) receive(ctx context.Context, conn *connpool.Conn, processor eventbus.Processor) error {
 	if err := conn.Channel().Qos(r.options.prefetchCount, 0, false); err != nil {
-		return err
+		return fmt.Errorf("set channel qos: %w", err)
 	}
 
 	deliveries, err := conn.Channel().Consume(r.options.incomingQueue, r.options.consumerTag, false, false, false, false, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("consume queue %q: %w", r.options.incomingQueue, err)
 	}
 
 	eg, egCtx := errgroup.WithContext(context.Background())
@@ -236,9 +241,17 @@ func (r *Receiver) receive(ctx context.Context, conn *connpool.Conn, processor e
 	eg.Go(func() error {
 		select {
 		case <-ctx.Done():
-			return conn.Channel().Cancel(r.options.consumerTag, false)
+			if cErr := conn.Channel().Cancel(r.options.consumerTag, false); cErr != nil {
+				return fmt.Errorf("cancel consumer %q: %w", r.options.consumerTag, cErr)
+			}
+
+			return nil
 		case <-egCtx.Done():
-			return conn.Close()
+			if cErr := conn.Close(); cErr != nil {
+				return fmt.Errorf("close connection: %w", cErr)
+			}
+
+			return nil
 		case connErr := <-conn.NotifyClose(make(chan *amqp.Error)):
 			return connErr
 		}
@@ -280,12 +293,18 @@ func (r *Receiver) processDelivery(delivery *amqp.Delivery, processor eventbus.P
 func (r *Receiver) doAcknowledge(conn *connpool.Conn, d *amqp.Delivery, err error) error {
 	switch {
 	case err == nil:
-		return d.Ack(false)
+		if aErr := d.Ack(false); aErr != nil {
+			return fmt.Errorf("ack delivery: %w", aErr)
+		}
 	case eventbus.IsUnprocessableEventError(err), hasExceededRetryCount(d, r.options.maxRetries):
 		return r.putIntoParkingLot(conn, d)
 	default:
-		return d.Reject(false)
+		if rErr := d.Reject(false); rErr != nil {
+			return fmt.Errorf("reject delivery: %w", rErr)
+		}
 	}
+
+	return nil
 }
 
 func (r *Receiver) putIntoParkingLot(conn *connpool.Conn, d *amqp.Delivery) error {
@@ -303,7 +322,11 @@ func (r *Receiver) putIntoParkingLot(conn *connpool.Conn, d *amqp.Delivery) erro
 		return fmt.Errorf("put into parking lot: %w", err)
 	}
 
-	return d.Ack(false)
+	if err = d.Ack(false); err != nil {
+		return fmt.Errorf("ack delivery: %w", err)
+	}
+
+	return nil
 }
 
 func hasExceededRetryCount(d *amqp.Delivery, max int64) bool {
@@ -313,10 +336,15 @@ func hasExceededRetryCount(d *amqp.Delivery, max int64) bool {
 	}
 
 	for _, i := range death {
-		t := i.(amqp.Table)
+		t, ok := i.(amqp.Table)
+		if !ok {
+			continue
+		}
 
 		if t["queue"] == d.Headers["x-first-death-queue"] {
-			return t["count"].(int64) >= max
+			count, ok := t["count"].(int64)
+
+			return ok && count >= max
 		}
 	}
 

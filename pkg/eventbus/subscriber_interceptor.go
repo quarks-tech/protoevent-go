@@ -31,11 +31,12 @@ func chainSubscriberInterceptors(s *Subscriber) {
 	}
 
 	var chainedInt SubscriberInterceptor
-	if len(interceptors) == 0 {
+	switch len(interceptors) {
+	case 0:
 		chainedInt = nil
-	} else if len(interceptors) == 1 {
+	case 1:
 		chainedInt = interceptors[0]
-	} else {
+	default:
 		chainedInt = chainInterceptors(interceptors)
 	}
 

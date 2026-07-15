@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/golang-migrate/migrate/v4"
 	migratemysql "github.com/golang-migrate/migrate/v4/database/mysql"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -18,6 +17,8 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	tidb "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -129,7 +130,7 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("create migrator: %w", err)
 	}
-	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return nil, nil, fmt.Errorf("apply migrations: %w", err)
 	}
 

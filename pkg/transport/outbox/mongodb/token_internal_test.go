@@ -49,7 +49,7 @@ func TestClusterTimeFromTokenBestEffort(t *testing.T) {
 		"too short":      rawToken(t, "8201"),
 		"wrong marker":   rawToken(t, "7f0000000100000001"),
 		"empty payload":  rawToken(t, ""),
-		"malformed bson": bson.Raw{0x01, 0x02},
+		"malformed bson": {0x01, 0x02},
 	}
 	for name, tok := range cases {
 		if _, ok := clusterTimeFromToken(tok); ok {

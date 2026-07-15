@@ -122,7 +122,9 @@ func TestReleaseNoOpWhenNotLeader(t *testing.T) {
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
-	e.Release()
+	if err := e.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
 
 	if calls := store.snapshotReleaseCalls(); len(calls) != 0 {
 		t.Fatalf("ReleaseLeaderLock called %d times, want 0 (never acquired leadership)", len(calls))
@@ -133,8 +135,10 @@ func TestReleaseNoOpBeforeFirstAcquire(t *testing.T) {
 	store := &fakeLeaderStore{acquireGrant: true}
 	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
 
-	// Release before ever calling TryAcquire: must be a no-op.
-	e.Release()
+	// Release before ever calling TryAcquire: must be a no-op (nil error).
+	if err := e.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
 
 	if calls := store.snapshotReleaseCalls(); len(calls) != 0 {
 		t.Fatalf("ReleaseLeaderLock called %d times, want 0 (TryAcquire never called)", len(calls))
@@ -148,7 +152,9 @@ func TestReleaseCallsStoreForCurrentHolderWhenLeader(t *testing.T) {
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
-	e.Release()
+	if err := e.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
 
 	calls := store.snapshotReleaseCalls()
 	if len(calls) != 1 {
@@ -173,24 +179,38 @@ func TestReleaseIsIdempotentAfterFirstCall(t *testing.T) {
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
-	e.Release()
-	e.Release() // second call: isLeader is now false, must not call the store again
+	if err := e.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	// Second call: isLeader is now false, must not call the store again.
+	if err := e.Release(); err != nil {
+		t.Fatalf("second Release: %v", err)
+	}
 
 	if calls := store.snapshotReleaseCalls(); len(calls) != 1 {
 		t.Fatalf("ReleaseLeaderLock called %d times, want 1 (second Release is a no-op)", len(calls))
 	}
 }
 
-func TestReleasePropagatesNoPanicOnStoreError(t *testing.T) {
-	store := &fakeLeaderStore{acquireGrant: true, releaseErr: errors.New("release boom")}
+// TestReleaseReturnsStoreErrorForInformation pins Release's error contract:
+// the store error is returned (for the caller to log — it is informational,
+// failover falls back to TTL expiry), and the leadership latch still flips,
+// so a retry is NOT issued by a second Release.
+func TestReleaseReturnsStoreErrorForInformation(t *testing.T) {
+	sentinel := errors.New("release boom")
+	store := &fakeLeaderStore{acquireGrant: true, releaseErr: sentinel}
 	e := relay.NewLeaderElector(store, "lock", "holder-1", time.Second)
 
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
-	// Release has no return value: a store error must be swallowed, not panic.
-	e.Release()
-
+	if err := e.Release(); !errors.Is(err, sentinel) {
+		t.Fatalf("Release err = %v, want %v (returned for information, not swallowed)", err, sentinel)
+	}
+	// The latch flipped before the failed store call: no second delete.
+	if err := e.Release(); err != nil {
+		t.Fatalf("second Release err = %v, want nil (latch already down)", err)
+	}
 	if calls := store.snapshotReleaseCalls(); len(calls) != 1 {
 		t.Fatalf("ReleaseLeaderLock called %d times, want 1", len(calls))
 	}
@@ -214,6 +234,8 @@ func TestNilLeaderStoreReleaseIsNoop(t *testing.T) {
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
-	// Must not panic despite isLeader==true: nil store short-circuits first.
-	e.Release()
+	// Must not panic despite isLeader==true: the nop store's release is nil.
+	if err := e.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
 }

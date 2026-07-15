@@ -129,28 +129,28 @@ func (r *Receiver) setupTopology(conn *connpool.Conn, infos []eventbus.ServiceIn
 
 		err := conn.Channel().ExchangeDeclare(dlxExchange, amqp.ExchangeFanout, true, false, false, false, nil)
 		if err != nil {
-			return err
+			return fmt.Errorf("declare exchange %q: %w", dlxExchange, err)
 		}
 
 		_, err = conn.Channel().QueueDeclare(dlxQueue, true, false, false, false, nil)
 		if err != nil {
-			return err
+			return fmt.Errorf("declare queue %q: %w", dlxQueue, err)
 		}
 
 		if err = conn.Channel().QueueBind(dlxQueue, "", dlxExchange, false, nil); err != nil {
-			return err
+			return fmt.Errorf("bind queue %q: %w", dlxQueue, err)
 		}
 	}
 
 	_, err := conn.Channel().QueueDeclare(r.options.incomingQueue, true, false, false, false, queueDeclareArgs)
 	if err != nil {
-		return err
+		return fmt.Errorf("declare queue %q: %w", r.options.incomingQueue, err)
 	}
 
 	for _, info := range infos {
 		for _, eventName := range info.Events {
 			if err = conn.Channel().QueueBind(r.options.incomingQueue, eventName, info.ServiceName, false, nil); err != nil {
-				return err
+				return fmt.Errorf("bind queue %q to %q: %w", r.options.incomingQueue, info.ServiceName, err)
 			}
 		}
 	}
@@ -164,14 +164,19 @@ func (r *Receiver) Receive(ctx context.Context, processor eventbus.Processor) er
 	})
 }
 
+// The consume errgroup is deliberately detached from ctx: cancellation must
+// stop the consumer and let in-flight deliveries drain instead of aborting
+// the group, so ctx is watched explicitly in the control goroutine.
+//
+//nolint:contextcheck
 func (r *Receiver) receive(ctx context.Context, conn *connpool.Conn, processor eventbus.Processor) error {
 	if err := conn.Channel().Qos(r.options.prefetchCount, 0, false); err != nil {
-		return err
+		return fmt.Errorf("set channel qos: %w", err)
 	}
 
 	deliveries, err := conn.Channel().Consume(r.options.incomingQueue, r.options.consumerTag, false, false, false, false, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("consume queue %q: %w", r.options.incomingQueue, err)
 	}
 
 	eg, egCtx := errgroup.WithContext(context.Background())
@@ -179,9 +184,17 @@ func (r *Receiver) receive(ctx context.Context, conn *connpool.Conn, processor e
 	eg.Go(func() error {
 		select {
 		case <-ctx.Done():
-			return conn.Channel().Cancel(r.options.consumerTag, false)
+			if cErr := conn.Channel().Cancel(r.options.consumerTag, false); cErr != nil {
+				return fmt.Errorf("cancel consumer %q: %w", r.options.consumerTag, cErr)
+			}
+
+			return nil
 		case <-egCtx.Done():
-			return conn.Close()
+			if cErr := conn.Close(); cErr != nil {
+				return fmt.Errorf("close connection: %w", cErr)
+			}
+
+			return nil
 		case connErr := <-conn.NotifyClose(make(chan *amqp.Error)):
 			return connErr
 		}
@@ -223,10 +236,18 @@ func (r *Receiver) processDelivery(delivery *amqp.Delivery, processor eventbus.P
 func doAcknowledge(m *amqp.Delivery, err error, requeueOnError bool) error {
 	switch {
 	case err == nil:
-		return m.Ack(false)
+		if aErr := m.Ack(false); aErr != nil {
+			return fmt.Errorf("ack delivery: %w", aErr)
+		}
 	case eventbus.IsUnprocessableEventError(err):
-		return m.Reject(false)
+		if rErr := m.Reject(false); rErr != nil {
+			return fmt.Errorf("reject delivery: %w", rErr)
+		}
 	default:
-		return m.Reject(requeueOnError)
+		if rErr := m.Reject(requeueOnError); rErr != nil {
+			return fmt.Errorf("reject delivery: %w", rErr)
+		}
 	}
+
+	return nil
 }

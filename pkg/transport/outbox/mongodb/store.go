@@ -64,20 +64,19 @@ type Store struct {
 type Option func(*Store)
 
 // WithRetention sets the outbox TTL applied by EnsureIndexes. Default 7 days;
-// it MUST exceed the oplog window (see the README's resume-token-cliff sizing rule). A non-positive d is ignored
-// (mirrors WithLogger/WithObserver's nil-guard style elsewhere in this
-// codebase), leaving the default (or a prior option's value) intact.
+// it MUST exceed the oplog window (see the README's resume-token-cliff sizing
+// rule). The value is stored as given — a non-positive or fractional-second d
+// is rejected loudly by EnsureIndexes rather than silently ignored here: a
+// zero from a miscomputed config field is a caller bug, not a request for the
+// default (unlike a nil Logger/Observer, which has exactly one sensible
+// meaning).
 //
 // Operational caveat: MongoDB refuses to re-create an existing TTL index with
 // a different expireAfterSeconds (IndexOptionsConflict) — changing retention
 // on an existing collection requires a collMod on the index, not a restart
 // with a new option value. EnsureIndexes surfaces that error with a hint.
 func WithRetention(d time.Duration) Option {
-	return func(s *Store) {
-		if d > 0 {
-			s.retention = d
-		}
-	}
+	return func(s *Store) { s.retention = d }
 }
 
 // NewStore creates a Store realizing the outbox publish + relay-read contracts
@@ -142,19 +141,19 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 // non-empty string: MongoDB's _id has no format requirement.
 func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) error {
 	if msg.ID == "" {
-		return fmt.Errorf("outbox: message ID is empty")
+		return errors.New("outbox: message ID is empty")
 	}
 	if msg.Metadata == nil {
-		return fmt.Errorf("outbox: message metadata is nil")
+		return errors.New("outbox: message metadata is nil")
 	}
 	if msg.CreateTime.IsZero() {
 		// create_time is the TTL anchor: a zero value (0001-01-01) is already
 		// past every retention window, so the TTL monitor would silently reap
 		// the row on its next pass — an event lost before the relay drains it.
-		return fmt.Errorf("outbox: message create time is zero; set Message.CreateTime before publishing")
+		return errors.New("outbox: message create time is zero; set Message.CreateTime before publishing")
 	}
 	if sess := mongo.SessionFromContext(ctx); sess == nil || !sess.TransactionRunning() {
-		return fmt.Errorf("outbox: create message: ctx has no running transaction; " +
+		return errors.New("outbox: create message: ctx has no running transaction; " +
 			"publish must share the business write's session (see the README's publishing example)")
 	}
 	meta, err := json.Marshal(msg.Metadata)

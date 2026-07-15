@@ -4,6 +4,8 @@ import (
 	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/relayutil"
 )
 
 // Internal tests for the unexported options: the struct is deliberately not
@@ -24,9 +26,14 @@ func TestDefaultOptions(t *testing.T) {
 	if o.LeaseTTL != 15*time.Second {
 		t.Fatalf("LeaseTTL = %v, want 15s", o.LeaseTTL)
 	}
-	if o.Observer == nil || o.Logger == nil {
-		t.Fatal("default Observer/Logger must be non-nil (the runtime never nil-checks them)")
+	if o.Logger == nil {
+		t.Fatal("default Logger must be non-nil (the runtime never nil-checks it)")
 	}
+	// The zero relay.Observer is the default: its nil-safe dispatch methods
+	// discard every signal, so no non-nil default is needed.
+	relayutil.ObserveDrained(o.Observer, "c", 1, 0, false)
+	relayutil.ObserveError(o.Observer, "c", nil)
+	relayutil.ObserveSequenced(o.Observer, "c", 1)
 }
 
 func TestOptionsApply(t *testing.T) {
@@ -57,14 +64,5 @@ func TestWithLoggerNilIsNoop(t *testing.T) {
 	WithLogger(nil)(&o)
 	if o.Logger != real {
 		t.Fatal("WithLogger(nil) replaced a previously set logger")
-	}
-}
-
-func TestWithObserverNilIsNoop(t *testing.T) {
-	o := defaultOptions()
-	def := o.Observer
-	WithObserver(nil)(&o)
-	if o.Observer != def {
-		t.Fatal("WithObserver(nil) replaced the default observer")
 	}
 }

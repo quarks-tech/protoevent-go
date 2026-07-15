@@ -102,14 +102,14 @@ func TestMain(m *testing.M) {
 
 // truncate and publish/publishMetadata below take testing.TB (rather than
 // *testing.T) so both tests and benchmarks in this package can share them.
-func truncate(t testing.TB) {
-	t.Helper()
+func truncate(tb testing.TB) {
+	tb.Helper()
 	for _, q := range []string{
 		"DELETE FROM outbox_messages", "DELETE FROM outbox_offsets", "DELETE FROM relay_locks",
 		"UPDATE outbox_sequencers SET next_seq = 1 WHERE name = 'default'",
 	} {
-		if _, err := testDB.Exec(q); err != nil {
-			t.Fatalf("reset (%s): %v", q, err)
+		if _, err := testDB.ExecContext(context.Background(), q); err != nil {
+			tb.Fatalf("reset (%s): %v", q, err)
 		}
 	}
 }
@@ -125,18 +125,18 @@ func newTestMetadata(subject string) *event.Metadata {
 	return md
 }
 
-func publish(t testing.TB, subject string) string {
-	t.Helper()
-	return publishMetadata(t, newTestMetadata(subject), []byte("x"))
+func publish(tb testing.TB, subject string) string {
+	tb.Helper()
+	return publishMetadata(tb, newTestMetadata(subject), []byte("x"))
 }
 
 // publishMetadata publishes a caller-prepared *event.Metadata through the
 // production Sender (so CreateTime is stamped like a real publish), within a
 // transaction-scoped Runner. Returns the outbox row/event ID.
-func publishMetadata(t testing.TB, md *event.Metadata, data []byte) string {
-	t.Helper()
+func publishMetadata(tb testing.TB, md *event.Metadata, data []byte) string {
+	tb.Helper()
 	if err := publishMetadataErr(md, data); err != nil {
-		t.Fatalf("publish: %v", err)
+		tb.Fatalf("publish: %v", err)
 	}
 	return md.ID
 }
@@ -145,7 +145,7 @@ func publishMetadata(t testing.TB, md *event.Metadata, data []byte) string {
 // safe to call from b.RunParallel goroutines, where testing.TB's Fatal/FailNow
 // must not be used (FailNow must run on the test's own goroutine).
 func publishMetadataErr(md *event.Metadata, data []byte) error {
-	tx, err := testDB.Begin()
+	tx, err := testDB.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
@@ -165,7 +165,7 @@ func TestPublishInsertsUnsequencedRow(t *testing.T) {
 	publish(t, "s1")
 
 	var nullCount int
-	if err := testDB.QueryRow("SELECT COUNT(*) FROM outbox_messages WHERE seq IS NULL AND tx_start_ts > 0").Scan(&nullCount); err != nil {
+	if err := testDB.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM outbox_messages WHERE seq IS NULL AND tx_start_ts > 0").Scan(&nullCount); err != nil {
 		t.Fatal(err)
 	}
 	if nullCount != 1 {
@@ -189,7 +189,7 @@ func TestSequenceAssignsDenseContiguousSeq(t *testing.T) {
 	if n != 5 {
 		t.Fatalf("sequenced %d, want 5", n)
 	}
-	rows, err := testDB.Query("SELECT seq FROM outbox_messages ORDER BY seq")
+	rows, err := testDB.QueryContext(context.Background(), "SELECT seq FROM outbox_messages ORDER BY seq")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +242,7 @@ func TestConcurrentSequencersNoDuplicateNoGap(t *testing.T) {
 
 	// Assert seq is exactly 1..200 with no dup and no gap.
 	var count, minSeq, maxSeq, distinct int64
-	if err := testDB.QueryRow("SELECT COUNT(*), MIN(seq), MAX(seq), COUNT(DISTINCT seq) FROM outbox_messages").
+	if err := testDB.QueryRowContext(context.Background(), "SELECT COUNT(*), MIN(seq), MAX(seq), COUNT(DISTINCT seq) FROM outbox_messages").
 		Scan(&count, &minSeq, &maxSeq, &distinct); err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +439,7 @@ func TestCreateOutboxMessageRejectsAutocommit(t *testing.T) {
 	}
 
 	var count int
-	if err := testDB.QueryRow("SELECT COUNT(*) FROM outbox_messages").Scan(&count); err != nil {
+	if err := testDB.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM outbox_messages").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 0 {
@@ -473,7 +473,7 @@ func TestListMessagesPoisonRowReturnsPrefixAndDecodeError(t *testing.T) {
 
 	// Corrupt the middle row: '[]' passes the JSON column's validity check but
 	// cannot decode into event.Metadata.
-	if _, err := testDB.Exec("UPDATE outbox_messages SET metadata = '[]' WHERE seq = 2"); err != nil {
+	if _, err := testDB.ExecContext(context.Background(), "UPDATE outbox_messages SET metadata = '[]' WHERE seq = 2"); err != nil {
 		t.Fatalf("corrupt row: %v", err)
 	}
 
@@ -565,7 +565,7 @@ func TestGenerateV4RelayedMetadataIDFidelity(t *testing.T) {
 
 	md := newTestMetadata("v4")
 	ctx := context.Background()
-	tx, err := testDB.Begin()
+	tx, err := testDB.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

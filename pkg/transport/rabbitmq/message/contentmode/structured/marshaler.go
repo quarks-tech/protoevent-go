@@ -1,6 +1,7 @@
 package structured
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -47,7 +48,7 @@ func (m Marshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, er
 
 	body, err := json.Marshal(&dto)
 	if err != nil {
-		return amqp.Publishing{}, err
+		return amqp.Publishing{}, fmt.Errorf("marshal cloudevents envelope: %w", err)
 	}
 
 	return amqp.Publishing{
@@ -61,7 +62,7 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 	dto := make(map[string]json.RawMessage)
 
 	if err := json.Unmarshal(d.Body, &dto); err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("unmarshal cloudevents envelope: %w", err)
 	}
 
 	md := new(event.Metadata)
@@ -71,7 +72,7 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 
 		delete(dto, "specversion")
 	} else {
-		return nil, nil, fmt.Errorf("required attribute 'specversion' is missing")
+		return nil, nil, errors.New("required attribute 'specversion' is missing")
 	}
 
 	if raw, ok := dto["type"]; ok {
@@ -79,7 +80,7 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 
 		delete(dto, "type")
 	} else {
-		return nil, nil, fmt.Errorf("required attribute 'type' is missing")
+		return nil, nil, errors.New("required attribute 'type' is missing")
 	}
 
 	if raw, ok := dto["id"]; ok {
@@ -87,7 +88,7 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 
 		delete(dto, "id")
 	} else {
-		return nil, nil, fmt.Errorf("required attribute 'id' is missing")
+		return nil, nil, errors.New("required attribute 'id' is missing")
 	}
 
 	if raw, ok := dto["source"]; ok {
@@ -95,7 +96,7 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 
 		delete(dto, "source")
 	} else {
-		return nil, nil, fmt.Errorf("required attribute 'source' is missing")
+		return nil, nil, errors.New("required attribute 'source' is missing")
 	}
 
 	if raw, ok := dto["subject"]; ok {
@@ -139,7 +140,7 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 
 		delete(dto, "data")
 	} else {
-		return nil, nil, fmt.Errorf("required attribute 'data' is missing")
+		return nil, nil, errors.New("required attribute 'data' is missing")
 	}
 
 	for k, raw := range dto {
@@ -150,7 +151,7 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 		var v interface{}
 
 		if err := json.Unmarshal(raw, &v); err != nil {
-			return nil, nil, err
+			return nil, nil, fmt.Errorf("unmarshal extension attribute %q: %w", k, err)
 		}
 
 		md.Extensions[k] = v

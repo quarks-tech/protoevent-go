@@ -16,23 +16,6 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
-// Observer extends the shared relay.Observer with the sequence-specific
-// sequencer-pass signal.
-type Observer interface {
-	relay.Observer
-	// ObserveSequenced reports how many rows a sequencer pass assigned.
-	ObserveSequenced(name string, count int)
-}
-
-// nopObserver extends relay.NopObserver with a no-op ObserveSequenced, so the
-// default observer satisfies this package's extended Observer without
-// reimplementing the shared signals.
-type nopObserver struct{ relay.Observer }
-
-func (nopObserver) ObserveSequenced(string, int) {}
-
-func newNopObserver() Observer { return nopObserver{relay.NopObserver()} }
-
 // DecodeError reports a row whose persisted metadata failed to decode. The
 // store returns it from ListMessages together with the successfully decoded
 // prefix of the page; a relay with an ErrorHandler parks the row and advances
@@ -115,18 +98,18 @@ type options struct {
 	RetentionSweepBatch    int
 
 	Logger       *slog.Logger // defaults to a discard logger
-	Observer     Observer
+	Observer     relay.Observer
 	ErrorHandler relay.ErrorHandler
 }
 
-// defaultOptions returns the default relay configuration.
+// defaultOptions returns the default relay configuration. The zero
+// relay.Observer discards all signals.
 func defaultOptions() options {
 	return options{
 		BatchSize:         100,
 		SequenceBatchSize: 1000,
 		PollInterval:      time.Second,
 		LeaseTTL:          15 * time.Second,
-		Observer:          newNopObserver(),
 		Logger:            slog.New(slog.DiscardHandler),
 	}
 }
@@ -173,13 +156,11 @@ func WithStartFromBeginning() Option {
 	return func(o *options) { o.StartFromBeginning = true }
 }
 
-// WithObserver sets the observability sink. A nil observer is ignored.
-func WithObserver(obs Observer) Option {
-	return func(o *options) {
-		if obs != nil {
-			o.Observer = obs
-		}
-	}
+// WithObserver sets the observability sink (a relay.Observer struct of
+// nil-able callbacks; both runtimes accept the same type — OnSequenced fires
+// only here). The zero value discards all signals.
+func WithObserver(obs relay.Observer) Option {
+	return func(o *options) { o.Observer = obs }
 }
 
 // WithErrorHandler installs the poison-parking hook: a row whose PERSISTED
@@ -255,14 +236,19 @@ const maxNameLen = 64
 //     once per tick (and between pages), so it must be renewable at least
 //     twice per TTL or it expires between renewals and leadership silently
 //     flaps every tick (mirrors the stream runtime's DrainWindow guard);
-//   - RetentionWindow is set without a positive sweep interval and batch.
+//   - RetentionWindow is set without a positive sweep interval and batch;
+//   - store lacks SequencerStore and WithoutSequencer() was not given: without
+//     a sequencer nothing ever gets a seq and the relay silently delivers
+//     nothing — the legitimate someone-else-sequences topology has an explicit
+//     spelling;
+//   - WithRetention is set but store lacks RetentionStore: a configured sweep
+//     that silently never runs grows the log unboundedly.
 //
 // name identifies the consumer (its offset row) and is the default leader-lock
 // name. store reads the log and holds offsets; sender is the downstream
-// transport (e.g. a RabbitMQ sender). If store also implements SequencerStore,
-// this relay runs the sequencer pass unless WithoutSequencer() is given. When
-// several consumer groups share one store, run the sequencer in exactly one
-// relay and configure the others with WithoutSequencer() — see its doc.
+// transport (e.g. a RabbitMQ sender). When several consumer groups share one
+// store, run the sequencer in exactly one relay and configure the others with
+// WithoutSequencer() — see its doc.
 func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) (*Relay, error) {
 	if name == "" {
 		return nil, errors.New("sequence: name must not be empty (it is the offset-row key and the default leader-lock name)")
@@ -307,21 +293,50 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 			options.RetentionWindow, options.RetentionSweepInterval, options.RetentionSweepBatch)
 	}
 
-	ls, _ := store.(relay.LeaderStore)
+	ls, hasLeaderStore := store.(relay.LeaderStore)
+	if !hasLeaderStore {
+		// Always-leader is a documented single-instance mode, not an error —
+		// but it must not be a silent one: a custom store that MEANT to
+		// implement relay.LeaderStore (wrong signature, broken refactor)
+		// would otherwise run dual leaders in a multi-replica deployment
+		// with no signal until duplicate delivery is noticed.
+		options.Logger.Info("sequence relay: store has no relay.LeaderStore capability; running always-leader (single-instance mode)",
+			"relay", name)
+	}
 
 	r := &Relay{
-		name:    name,
-		store:   store,
+		name: name,
+		// Every store capability is decorated with the LeaseTTL operation
+		// bound at construction — see boundedStore (bounded.go).
+		store:   boundedStore{inner: store, ttl: options.LeaseTTL},
 		sender:  sender,
 		options: options,
 		leader:  relay.NewLeaderElector(ls, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
 	}
 
+	// Capability implied by configuration must exist unless explicitly waived:
+	// a silently missing capability is an outage, not a mode. Without a
+	// sequencer (and no WithoutSequencer waiver) rows stay unsequenced and the
+	// relay delivers NOTHING while reporting no error — a permanent silent
+	// stall. A configured retention window without a RetentionStore never
+	// sweeps — unbounded table growth surfacing as a disk incident long after
+	// the misconfiguration. (The LeaderStore assertion above stays soft:
+	// always-leader is a documented single-instance mode, not a configured
+	// capability.)
 	if !options.SequencerDisabled {
-		r.sequencer, _ = store.(SequencerStore)
+		seq, ok := store.(SequencerStore)
+		if !ok {
+			return nil, errors.New("sequence: store does not implement sequence.SequencerStore; " +
+				"pass WithoutSequencer() if another relay runs the sequencer for this store")
+		}
+		r.sequencer = boundedSequencer{inner: seq, ttl: options.LeaseTTL}
 	}
 	if options.RetentionWindow > 0 {
-		r.retention, _ = store.(RetentionStore)
+		ret, ok := store.(RetentionStore)
+		if !ok {
+			return nil, errors.New("sequence: WithRetention is set but store does not implement sequence.RetentionStore")
+		}
+		r.retention = boundedRetention{inner: ret, ttl: options.LeaseTTL}
 	}
 
 	return r, nil

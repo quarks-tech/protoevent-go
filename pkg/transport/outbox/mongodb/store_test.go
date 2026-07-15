@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -93,6 +94,18 @@ func TestEnsureIndexesRejectsSubSecondRetention(t *testing.T) {
 	}
 }
 
+// TestEnsureIndexesRejectsNonPositiveRetention pins the WithRetention
+// store-as-given decision: a zero (e.g. an unset config field) is a caller
+// bug, not a request for the default, and must fail loudly at EnsureIndexes
+// instead of being silently swallowed by the option.
+func TestEnsureIndexesRejectsNonPositiveRetention(t *testing.T) {
+	st := mongodbstore.NewStore(nil, mongodbstore.WithRetention(0))
+	err := st.EnsureIndexes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "retention") {
+		t.Fatalf("expected retention rejection for 0, got %v", err)
+	}
+}
+
 // TestEnsureIndexesRejectsFractionalRetention proves a retention that is not
 // a whole number of seconds is rejected rather than silently truncated:
 // 1500ms would otherwise become a 1s TTL, expiring rows earlier than the
@@ -142,36 +155,36 @@ func TestMain(m *testing.M) {
 
 // reset and publish/publishMetadata below take testing.TB (rather than
 // *testing.T) so both tests and benchmarks in this package can share them.
-func reset(t testing.TB) {
-	t.Helper()
+func reset(tb testing.TB) {
+	tb.Helper()
 	for _, c := range []string{"outbox_messages", "outbox_offsets", "relay_locks"} {
 		if err := testDB.Collection(c).Drop(context.Background()); err != nil {
-			t.Fatalf("drop %s: %v", c, err)
+			tb.Fatalf("drop %s: %v", c, err)
 		}
 	}
 }
 
-func publish(t testing.TB, subject string) string {
-	t.Helper()
+func publish(tb testing.TB, subject string) string {
+	tb.Helper()
 	md := event.NewMetadata("books.created")
 	md.ID = uuid.NewString()
 	md.Source = "books-service"
 	md.Subject = subject
 	md.DataContentType = "application/proto"
 	md.Time = time.Now().UTC()
-	return publishMetadata(t, md, []byte("x"))
+	return publishMetadata(tb, md, []byte("x"))
 }
 
 // publishMetadata publishes a caller-prepared *event.Metadata through the
 // production Sender (mirrors production: same session-txn helper as publish).
 // Returns the outbox row/event ID.
-func publishMetadata(t testing.TB, md *event.Metadata, data []byte) string {
-	t.Helper()
+func publishMetadata(tb testing.TB, md *event.Metadata, data []byte) string {
+	tb.Helper()
 	st := mongodbstore.NewStore(testDB)
 	// Publish in a transaction (mirrors production; requires the replica set).
 	sess, err := testDB.Client().StartSession()
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	defer sess.EndSession(context.Background())
 	_, err = sess.WithTransaction(context.Background(), func(sc context.Context) (any, error) {
@@ -180,7 +193,7 @@ func publishMetadata(t testing.TB, md *event.Metadata, data []byte) string {
 		return nil, outbox.NewSender(st).Send(sc, md, data)
 	})
 	if err != nil {
-		t.Fatalf("publish: %v", err)
+		tb.Fatalf("publish: %v", err)
 	}
 	return md.ID
 }
@@ -245,8 +258,15 @@ func TestEnsureIndexesCreatesTTL(t *testing.T) {
 		case int32:
 			ttlSeconds = v
 		case int64:
-			ttlSeconds = int32(v)
+			if v >= math.MinInt32 && v <= math.MaxInt32 {
+				ttlSeconds = int32(v)
+			} else {
+				t.Fatalf("expireAfterSeconds %d overflows int32", v)
+			}
 		case float64:
+			if v > math.MaxInt32 || v < math.MinInt32 {
+				t.Fatalf("expireAfterSeconds %v overflows int32", v)
+			}
 			ttlSeconds = int32(v)
 		default:
 			t.Fatalf("expireAfterSeconds has unexpected type %T: %v", ttl, ttl)

@@ -10,14 +10,22 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
+// Receiver is the transport seam on the subscribe side: it blocks delivering
+// incoming events to p until ctx is canceled or the transport fails.
 type Receiver interface {
 	Receive(ctx context.Context, p Processor) error
 }
 
+// Setuper is the optional transport capability for declaring topology
+// (exchanges, queues, bindings) before receiving; transports without setup
+// needs simply don't implement it.
 type Setuper interface {
 	Setup(ctx context.Context, serviceName string, info ...ServiceInfo) error
 }
 
+// Processor consumes one raw incoming event (CloudEvents metadata + encoded
+// payload). A non-nil error tells the transport the event was not handled,
+// and transport-specific redelivery/parking semantics apply.
 type Processor func(md *event.Metadata, data []byte) error
 
 // EventHandler handles a single event. The handler implementation is captured
@@ -172,11 +180,15 @@ func (s *Subscriber) Subscribe(ctx context.Context, r Receiver) error {
 
 	if setuper, ok := r.(Setuper); ok {
 		if err := setuper.Setup(ctx, s.name, s.GetServiceInfo()...); err != nil {
-			return err
+			return fmt.Errorf("eventbus: subscribe: setup topology: %w", err)
 		}
 	}
 
-	return r.Receive(ctx, s.process)
+	if err := r.Receive(ctx, s.process); err != nil {
+		return fmt.Errorf("eventbus: subscribe: %w", err)
+	}
+
+	return nil
 }
 
 func (s *Subscriber) process(md *event.Metadata, data []byte) error {

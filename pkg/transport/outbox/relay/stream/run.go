@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/relayutil"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
@@ -16,34 +17,46 @@ import (
 // releaseTimeout pattern.
 const shutdownTimeout = 5 * time.Second
 
-// errLaneStopped signals that drainWindow stopped the lane (send failure or
-// planned shutdown) and closed the stream so the next RunOnce reopens and
-// redelivers.
-var errLaneStopped = errors.New("stream: lane stopped; will reopen and redeliver")
+// ErrLaneStopped is returned by RunOnce when drainWindow stopped the lane (a
+// send failure, or a poison event without a parking path) and closed the
+// stream. It is not a failure of the pass: the caller should back off and
+// call RunOnce again — the reopen resumes from the last persisted token and
+// redelivers the stopped event. Run handles this itself; the sentinel is
+// exported for callers driving RunOnce directly, who otherwise could not
+// distinguish "back off and retry" from a transient store error.
+var ErrLaneStopped = errors.New("stream: lane stopped; will reopen and redeliver")
 
 // Run drives the relay until ctx is canceled (returns ctx.Err()) or a fatal
 // stream condition occurs (returns ErrStreamInvalidated / ErrHistoryLost).
 // Releases leadership on exit so a planned shutdown fails over quickly.
 func (r *Relay) Run(ctx context.Context) error {
 	defer r.closeStream()
-	defer r.leader.Release()
+	defer func() {
+		// Informational only: failover falls back to TTL expiry, and a store
+		// outage also surfaces on the successor's TryAcquire (see Release doc).
+		if err := r.leader.Release(); err != nil {
+			r.options.Logger.Warn("stream relay: release leader lock", "relay", r.name, "err", err)
+		}
+	}()
 
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
+		if ctx.Err() != nil {
+			// context.Cause degrades to ctx.Err() under a plain WithCancel and
+			// surfaces the richer cancel reason under WithCancelCause/errgroup.
+			return context.Cause(ctx)
 		}
 		err := r.RunOnce(ctx)
 		switch {
 		case err == nil:
 			// keep looping; RunOnce already blocked ~one drain window
-		case errors.Is(err, errLaneStopped):
+		case errors.Is(err, ErrLaneStopped):
 			// Stream already closed by drainWindow; back off, then reopen and
 			// redeliver next iteration. A send failure was already observed
 			// via handleError, so don't re-observe here.
 			r.sleep(ctx)
 		case errors.Is(err, ErrStreamInvalidated), errors.Is(err, ErrHistoryLost):
 			// Fatal: report and stop. The deferred closeStream releases the cursor.
-			r.options.Observer.ObserveError(r.name, err)
+			relayutil.ObserveError(r.options.Observer, r.name, err)
 			r.options.Logger.Error("stream relay: fatal stream error", "relay", r.name, "err", err)
 			return err
 		case ctx.Err() != nil:
@@ -57,7 +70,7 @@ func (r *Relay) Run(ctx context.Context) error {
 			r.sleep(ctx)
 		default:
 			// transient (leadership, reopen, send/save): report, drop the stream, retry
-			r.options.Observer.ObserveError(r.name, err)
+			relayutil.ObserveError(r.options.Observer, r.name, err)
 			r.options.Logger.Error("stream relay: pass failed", "relay", r.name, "err", err)
 			r.closeStream()
 			r.sleep(ctx)
@@ -68,15 +81,11 @@ func (r *Relay) Run(ctx context.Context) error {
 // RunOnce performs one leader-gated drain window. Non-leaders return nil without
 // touching the stream. Exposed for tests; Run calls it in a loop.
 //
-// The setup store calls here (TryAcquire, LoadToken, Watch) are bounded by
-// LeaseTTL via opCtx: without a deadline, a Mongo call that wedges at the
-// network layer would block this single Run goroutine forever — the lease
-// silently expires, a standby takes over, and this instance neither errors
-// nor logs (a silent permanent stall), then resumes as a stale leader when
-// the call finally unblocks. Beyond LeaseTTL the call's success is moot
-// anyway: the lease is already lost.
+// Every store call here is bounded (boundedStore, bounded.go; TryAcquire
+// self-bounds): a wedged network call must surface as an error instead of
+// silently stalling the relay past its own lease.
 func (r *Relay) RunOnce(ctx context.Context) error {
-	leader, err := r.tryAcquireBounded(ctx)
+	leader, err := r.leader.TryAcquire(ctx)
 	if err != nil {
 		return err
 	}
@@ -86,11 +95,11 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 		return nil
 	}
 	if r.stream == nil {
-		token, ct, err := r.loadTokenBounded(ctx)
+		token, ct, err := r.store.LoadToken(ctx, r.name)
 		if err != nil {
 			return err
 		}
-		s, err := r.watchBounded(ctx, token)
+		s, err := r.store.Watch(ctx, token, r.options.DrainWindow)
 		if err != nil {
 			return err
 		}
@@ -231,7 +240,7 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 	}
 
 	more := stopped || handled == r.options.TokenBatchSize
-	r.options.Observer.ObserveDrained(r.name, sent, r.committedTokenAge(), more)
+	relayutil.ObserveDrained(r.options.Observer, r.name, sent, r.committedTokenAge(), more)
 
 	if stopped {
 		// A change-stream cursor cannot rewind, so to actually redeliver the
@@ -243,7 +252,7 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		// failed event; a non-advanced one saved nothing (reopen resumes from
 		// the prior token).
 		r.closeStream()
-		return errLaneStopped
+		return ErrLaneStopped
 	}
 	return nil
 }
@@ -254,16 +263,9 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 // e.g. a stale leader finishing a slow window) must not advance
 // lastSavedTok/committedCT, or committedTokenAge() — the resume-token-cliff
 // early warning — would report freshness the stored row doesn't have.
-//
-// The store call is bounded via relay.BoundContext: by LeaseTTL while the run
-// ctx is alive (a wedged network call must not silently stall the relay past
-// its own lease), and by shutdownTimeout on a fresh context once the run ctx
-// is canceled (the final save on a planned shutdown — a real store fails
-// writes on a dead context, and losing that save would redeliver up to
-// TokenBatchSize-1 acknowledged sends per deploy).
+// Context bounds (incl. the detached-context final save on shutdown) are
+// boundedStore's job — see bounded.go.
 func (r *Relay) saveToken(ctx context.Context, tok string, ct time.Time) error {
-	ctx, cancel := relay.BoundContext(ctx, r.options.LeaseTTL, shutdownTimeout)
-	defer cancel()
 	persisted, err := r.store.SaveToken(ctx, r.name, tok, ct)
 	if err != nil {
 		return err
@@ -273,27 +275,6 @@ func (r *Relay) saveToken(ctx context.Context, tok string, ct time.Time) error {
 		r.committedCT = ct
 	}
 	return nil
-}
-
-// tryAcquireBounded, loadTokenBounded, and watchBounded bound the setup store
-// calls by LeaseTTL (see RunOnce's doc). The Watch bound covers only opening
-// the stream (the initial aggregate); the returned cursor is not tied to it.
-func (r *Relay) tryAcquireBounded(ctx context.Context) (bool, error) {
-	ctx, cancel := relay.BoundContext(ctx, r.options.LeaseTTL, shutdownTimeout)
-	defer cancel()
-	return r.leader.TryAcquire(ctx)
-}
-
-func (r *Relay) loadTokenBounded(ctx context.Context) (string, time.Time, error) {
-	ctx, cancel := relay.BoundContext(ctx, r.options.LeaseTTL, shutdownTimeout)
-	defer cancel()
-	return r.store.LoadToken(ctx, r.name)
-}
-
-func (r *Relay) watchBounded(ctx context.Context, token string) (Stream, error) {
-	ctx, cancel := relay.BoundContext(ctx, r.options.LeaseTTL, shutdownTimeout)
-	defer cancel()
-	return r.store.Watch(ctx, token, r.options.DrainWindow)
 }
 
 // committedTokenAge is the cliff proxy: how far the committed token trails the
@@ -309,13 +290,22 @@ func (r *Relay) committedTokenAge() time.Duration {
 // fresh bounded context: closeStream runs on shutdown paths where the run ctx
 // may already be canceled, and a killCursors on a dead context would never be
 // delivered, leaking the server-side cursor until timeout.
+//
+// A failed close is informational, not actionable (the same contract as
+// LeaderElector.Release): the local cursor is dropped regardless, and a lost
+// killCursors leaks the server-side cursor only until the server's own
+// cursor/session timeout reaps it. It is consumed here — logged at Warn —
+// rather than returned: every caller would do exactly this and nothing else,
+// so returning it would only relocate the same log line to five call sites.
 func (r *Relay) closeStream() {
 	if r.stream == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	_ = r.stream.Close(ctx)
+	if err := r.stream.Close(ctx); err != nil {
+		r.options.Logger.Warn("stream relay: close stream", "relay", r.name, "err", err)
+	}
 	r.stream = nil
 }
 
@@ -333,5 +323,5 @@ func (r *Relay) sleep(ctx context.Context) {
 // for stop-the-lane send failures (observe+log only — the event will be
 // redelivered, not parked).
 func (r *Relay) handleError(ctx context.Context, h relay.ErrorHandler, msg *outbox.Message, err error) {
-	relay.HandleMessageError(ctx, h, r.options.Observer, r.options.Logger, "stream", r.name, msg, err)
+	relayutil.HandleMessageError(ctx, h, r.options.Observer, r.options.Logger, "stream", r.name, msg, err)
 }

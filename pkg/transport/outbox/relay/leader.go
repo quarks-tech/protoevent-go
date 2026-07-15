@@ -2,7 +2,7 @@ package relay
 
 import (
 	"context"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,53 +27,74 @@ type LeaderElector struct {
 	holderID string
 	ttl      time.Duration
 
-	mu       sync.Mutex // guards isLeader (crash-safe visibility for the deferred Release path)
-	isLeader bool
+	// isLeader is atomic for visibility only (the deferred Release path may
+	// run on a different goroutine than the last TryAcquire): check-then-act
+	// atomicity is deliberately NOT provided here — see the serialization
+	// contract above.
+	isLeader atomic.Bool
 }
 
+// nopLeaderStore is the null LeaderStore: every acquire is granted and
+// release is a no-op. NewLeaderElector substitutes it for a nil ls — it is
+// the EXPLICIT single-instance mode, not an implementation of the LeaderStore
+// contract: it provides no mutual exclusion and consults no clock. Do not use
+// it as a reference implementation.
+type nopLeaderStore struct{}
+
+func (nopLeaderStore) TryAcquireLeaderLock(context.Context, string, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (nopLeaderStore) ReleaseLeaderLock(context.Context, string, string) error { return nil }
+
 // NewLeaderElector builds a LeaderElector over ls. ls may be nil: a nil
-// LeaderStore means no election — the elector always reports leadership
-// (single-instance deployments).
+// LeaderStore means no election — a nopLeaderStore is substituted and the
+// elector always reports leadership (single-instance deployments).
 func NewLeaderElector(ls LeaderStore, lockName, holderID string, ttl time.Duration) *LeaderElector {
+	if ls == nil {
+		ls = nopLeaderStore{}
+	}
 	return &LeaderElector{ls: ls, lockName: lockName, holderID: holderID, ttl: ttl}
 }
 
 // TryAcquire acquires or renews the lock. Returns true if this elector holds
 // it after the call.
+//
+// The store call is bounded by the lease TTL: an acquire that outlasts the
+// lease it would grant is moot, and an unbounded call on a wedged connection
+// would silently stall the caller's single relay goroutine past its own
+// lease — the silent-stale-leader hazard both runtimes guard every store
+// operation against.
 func (e *LeaderElector) TryAcquire(ctx context.Context) (bool, error) {
-	if e.ls == nil {
-		e.mu.Lock()
-		e.isLeader = true
-		e.mu.Unlock()
-		return true, nil
-	}
+	ctx, cancel := context.WithTimeout(ctx, e.ttl)
+	defer cancel()
 	held, err := e.ls.TryAcquireLeaderLock(ctx, e.lockName, e.holderID, e.ttl)
 	if err != nil {
 		return false, err
 	}
-	e.mu.Lock()
-	e.isLeader = held
-	e.mu.Unlock()
+	e.isLeader.Store(held)
 	return held, nil
 }
 
-// Release drops the lock if this elector currently holds it. No-op if there
-// is no LeaderStore or leadership was never acquired. Uses a fresh
-// context.Background() with an internal timeout, not the caller's ctx, since
-// this typically runs on a shutdown path where ctx may already be canceled.
-func (e *LeaderElector) Release() {
-	e.mu.Lock()
-	if e.ls == nil || !e.isLeader {
-		e.mu.Unlock()
-		return
+// Release drops the lock if this elector currently holds it. No-op (nil) if
+// leadership was never acquired. Uses a fresh context.Background() with an
+// internal timeout, not the caller's ctx, since this typically runs on a
+// shutdown path where ctx may already be canceled.
+//
+// The flag is swapped false BEFORE the store call: a lost graceful release
+// costs at most one lease-TTL of delayed failover (the lock expires on its
+// own), while flipping after would let a second Release during a slow store
+// call issue a duplicate delete.
+//
+// The returned error is informational, not actionable: failover falls back to
+// TTL expiry regardless, and a store outage also surfaces on the successor's
+// TryAcquire every tick. Callers on a shutdown path should log it and move on
+// (the relay runtimes do), not fail shutdown over it.
+func (e *LeaderElector) Release() error {
+	if !e.isLeader.Swap(false) {
+		return nil
 	}
-	e.mu.Unlock()
-
 	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
 	defer cancel()
-	_ = e.ls.ReleaseLeaderLock(ctx, e.lockName, e.holderID)
-
-	e.mu.Lock()
-	e.isLeader = false
-	e.mu.Unlock()
+	return e.ls.ReleaseLeaderLock(ctx, e.lockName, e.holderID)
 }

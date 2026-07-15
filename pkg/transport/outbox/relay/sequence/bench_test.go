@@ -34,7 +34,7 @@ func BenchmarkDrain(b *testing.B) {
 				b.StopTimer()
 				st := newFakeStore()
 				for range tc.n {
-					st.append(msg(0))
+					st.append(msg())
 				}
 				r, err := sequence.NewRelay("bench", st, sender,
 					sequence.WithSequenceBatchSize(tc.batch), sequence.WithStartFromBeginning())

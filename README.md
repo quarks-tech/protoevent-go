@@ -46,7 +46,7 @@ package example.books.v1;
 
 import "quarks_tech/protoevent/v1/options.proto";
 
-option go_package = "example/gen/example/books/v1;bookspb";
+option go_package = "yourapp/gen/books/v1;bookspb";
 
 message BookCreatedEvent {
   option (quarks_tech.protoevent.v1.enabled) = true;
@@ -75,7 +75,7 @@ import (
     "github.com/quarks-tech/protoevent-go/pkg/eventbus"
     "github.com/quarks-tech/protoevent-go/pkg/transport/gochan"
 
-    bookspb "example/gen/example/books/v1"
+    bookspb "yourapp/gen/books/v1"
 )
 
 func main() {
@@ -158,7 +158,7 @@ import (
     "github.com/quarks-tech/protoevent-go/pkg/eventbus"
     "github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
 
-    bookspb "example/gen/example/books/v1"
+    bookspb "yourapp/gen/books/v1"
 )
 
 func main() {
@@ -211,7 +211,7 @@ import (
     "github.com/quarks-tech/protoevent-go/pkg/eventbus"
     "github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
 
-    bookspb "example/gen/example/books/v1"
+    bookspb "yourapp/gen/books/v1"
 )
 
 func main() {

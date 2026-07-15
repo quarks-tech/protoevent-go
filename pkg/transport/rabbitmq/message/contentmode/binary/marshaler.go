@@ -1,6 +1,7 @@
 package binary
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -61,7 +62,7 @@ func marshalMetadata(meta *event.Metadata) amqp.Table {
 
 func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 	if d.Type == "" {
-		return nil, fmt.Errorf("required attribute 'type' is missing")
+		return nil, errors.New("required attribute 'type' is missing")
 	}
 
 	md := &event.Metadata{
@@ -72,19 +73,19 @@ func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 	if v, ok := d.Headers["cloudEvents:specversion"].(string); ok {
 		md.SpecVersion = v
 	} else {
-		return nil, fmt.Errorf("required attribute 'specversion' is missing")
+		return nil, errors.New("required attribute 'specversion' is missing")
 	}
 
 	if v, ok := d.Headers["cloudEvents:id"].(string); ok {
 		md.ID = v
 	} else {
-		return nil, fmt.Errorf("required attribute 'id' is missing")
+		return nil, errors.New("required attribute 'id' is missing")
 	}
 
 	if v, ok := d.Headers["cloudEvents:source"].(string); ok {
 		md.Source = v
 	} else {
-		return nil, fmt.Errorf("required attribute 'source' is missing")
+		return nil, errors.New("required attribute 'source' is missing")
 	}
 
 	if v, ok := d.Headers["cloudEvents:subject"].(string); ok {

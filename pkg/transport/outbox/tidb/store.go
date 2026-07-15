@@ -56,15 +56,18 @@ func NewStore(r Runner) *Store { return &Store{r: r} }
 
 var _ outbox.Store = (*Store)(nil)
 
-// RelayStore is the pool-backed relay store: it embeds a publish-side Store
-// (struct reuse only — the embedded Store runs over the autocommit pool, where
-// CreateOutboxMessage always fails; publishing requires a tx-scoped Store, see
-// NewStore) plus everything the relay runtimes need — read/offset, the
-// sequencer, the retention sweep, and leader election. These all manage their
-// own transactions against the pool, so they require a *sql.DB rather than a
-// transaction-scoped Runner.
+// RelayStore is the pool-backed relay store: everything the relay runtimes
+// need — read/offset, the sequencer, the retention sweep, and leader
+// election. These all manage their own transactions against the pool, so they
+// require a *sql.DB rather than a transaction-scoped Runner.
+//
+// RelayStore deliberately does NOT implement outbox.Store: publishing
+// requires a tx-scoped Store (NewStore over a *sql.Tx) so the outbox row
+// commits atomically with business writes — on the autocommit pool
+// CreateOutboxMessage always fails. Do not re-add a *Store embed here: the
+// promoted method would make outbox.NewSender(relayStore) compile and then
+// fail at the first publish.
 type RelayStore struct {
-	*Store
 	db *sql.DB
 }
 
@@ -76,7 +79,7 @@ type RelayStore struct {
 // error. The failure only appears once the relay runs (publishing works fine),
 // far from the misconfiguration. interpolateParams=true is additionally
 // recommended (see NewStore).
-func NewRelayStore(db *sql.DB) *RelayStore { return &RelayStore{Store: NewStore(db), db: db} }
+func NewRelayStore(db *sql.DB) *RelayStore { return &RelayStore{db: db} }
 
 var (
 	_ sequence.Store          = (*RelayStore)(nil)
@@ -98,7 +101,7 @@ var (
 // (via outbox.WithIDGenerator) MUST emit UUIDs to be usable with this store.
 func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) error {
 	if m.Metadata == nil {
-		return fmt.Errorf("outbox: message metadata is nil")
+		return errors.New("outbox: message metadata is nil")
 	}
 	id, err := uuid.Parse(m.ID)
 	if err != nil {
@@ -108,12 +111,12 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 	if md.Time.IsZero() {
 		// A zero time would be sent as 0001-01-01, below DATETIME(6)'s minimum,
 		// and surface as an opaque driver error; reject it up front instead.
-		return fmt.Errorf("outbox: message metadata time is zero; set Metadata.Time before publishing")
+		return errors.New("outbox: message metadata time is zero; set Metadata.Time before publishing")
 	}
 	if m.CreateTime.IsZero() {
 		// Same DATETIME(6) hazard as md.Time above — and create_time also
 		// anchors retention, so a zero value would be swept immediately.
-		return fmt.Errorf("outbox: message create time is zero; set Message.CreateTime before publishing")
+		return errors.New("outbox: message create time is zero; set Message.CreateTime before publishing")
 	}
 	meta, err := json.Marshal(md)
 	if err != nil {
@@ -189,7 +192,10 @@ LIMIT ?`, afterSeq, limit)
 			CreateTime: createTime,
 		})
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("outbox: list rows: %w", err)
+	}
+	return out, nil
 }
 
 // Offset returns the named consumer's watermark (0 if unset).
@@ -262,7 +268,7 @@ func isDuplicateKey(err error) bool {
 // "Column '<col>' cannot be null") on the named column. The number alone is
 // not enough — any NOT NULL column raises 1048 (e.g. a nil Data on the data
 // column), so the message is matched for the specific column too.
-func isNullColumn(err error, col string) bool {
+func isNullColumn(err error, col string) bool { //nolint:unparam // kept generic: 1048 fires for ANY NOT NULL column; the argument names which guard this is
 	me, ok := errors.AsType[*mysql.MySQLError](err)
 	return ok && me.Number == 1048 && strings.Contains(me.Message, col)
 }

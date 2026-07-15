@@ -66,7 +66,11 @@ func NewSender(client *amqpx.Client, opts ...SenderOption) *Sender {
 
 func (s *Sender) Setup(ctx context.Context, desc *eventbus.ServiceDesc) error {
 	return s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
-		return conn.Channel().ExchangeDeclare(desc.ServiceName, amqp.ExchangeTopic, true, false, false, false, nil)
+		if err := conn.Channel().ExchangeDeclare(desc.ServiceName, amqp.ExchangeTopic, true, false, false, false, nil); err != nil {
+			return fmt.Errorf("declare exchange %q: %w", desc.ServiceName, err)
+		}
+
+		return nil
 	})
 }
 
@@ -83,6 +87,10 @@ func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) er
 	routingKey := mess.Type[pos+1:]
 
 	return s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
-		return conn.Channel().Publish(exchange, routingKey, false, false, mess)
+		if err := conn.Channel().Publish(exchange, routingKey, false, false, mess); err != nil {
+			return fmt.Errorf("publish to exchange %q: %w", exchange, err)
+		}
+
+		return nil
 	})
 }

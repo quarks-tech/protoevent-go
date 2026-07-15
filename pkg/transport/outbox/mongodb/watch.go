@@ -89,9 +89,13 @@ func (m *mongoStream) Next(ctx context.Context) (*stream.Event, bool, error) {
 	if !m.cs.TryNext(ctx) {
 		if err := m.cs.Err(); err != nil {
 			if isHistoryLost(err) {
-				return nil, false, stream.ErrHistoryLost
+				// Wrap rather than replace: this is the break-glass runbook
+				// case, and the server error carries the diagnostics (message,
+				// code, labels) the operator needs. errors.Is still matches
+				// the sentinel.
+				return nil, false, fmt.Errorf("%w: %w", stream.ErrHistoryLost, err)
 			}
-			return nil, false, err
+			return nil, false, fmt.Errorf("outbox: change stream next: %w", err)
 		}
 		return nil, false, nil // empty window
 	}
@@ -168,7 +172,12 @@ func clusterTimeFromToken(tok bson.Raw) (time.Time, bool) {
 	return time.Unix(int64(secs), 0).UTC(), true
 }
 
-func (m *mongoStream) Close(ctx context.Context) error { return m.cs.Close(ctx) }
+func (m *mongoStream) Close(ctx context.Context) error {
+	if err := m.cs.Close(ctx); err != nil {
+		return fmt.Errorf("outbox: close change stream: %w", err)
+	}
+	return nil
+}
 
 // decodeErrorFromRaw builds a *stream.DecodeError from the raw change
 // document when the changeEvent envelope itself fails to decode. Each field

@@ -149,7 +149,7 @@ func TestRelayRestartAfterPrimingDeliversPending(t *testing.T) {
 	// Simulate the process dying: RunOnce holds the leader lease (only Run
 	// releases it on shutdown), so drop the lock the way an expired lease
 	// would, letting the second instance take leadership immediately.
-	if _, err := testDB.Exec("DELETE FROM relay_locks"); err != nil {
+	if _, err := testDB.ExecContext(context.Background(), "DELETE FROM relay_locks"); err != nil {
 		t.Fatalf("expire leader lock: %v", err)
 	}
 
