@@ -477,6 +477,42 @@ func TestListMessagesPoisonRowReturnsPrefixAndDecodeError(t *testing.T) {
 	}
 }
 
+// TestListMessagesJSONNullMetadataIsPoison is the regression test for the
+// JSON-null bypass: `null` unmarshals into a struct VALUE without error
+// (leaving it zero), so before the pointer-target fix a `metadata = 'null'`
+// row sailed past the poison classification and went downstream as an empty
+// event instead of a *DecodeError.
+func TestListMessagesJSONNullMetadataIsPoison(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+
+	publish(t, "ok-1")
+	nullID := publish(t, "null-md")
+
+	st := tidb.NewRelayStore(testDB)
+	ctx := context.Background()
+	if _, err := st.SequenceMessages(ctx, 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+	if _, err := testDB.ExecContext(ctx, "UPDATE outbox_messages SET metadata = 'null' WHERE seq = 2"); err != nil {
+		t.Fatalf("null row: %v", err)
+	}
+
+	msgs, err := st.ListMessages(ctx, 0, 10)
+	de, ok := errors.AsType[*sequence.DecodeError](err)
+	if !ok {
+		t.Fatalf("err = %v, want *sequence.DecodeError (JSON null must classify as poison)", err)
+	}
+	if de.ID != nullID || de.Seq != 2 {
+		t.Fatalf("DecodeError = {ID: %s, Seq: %d}, want {ID: %s, Seq: 2}", de.ID, de.Seq, nullID)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("prefix length = %d, want 1", len(msgs))
+	}
+}
+
 // TestDeleteOffsetUnpinsSweep proves DeleteOffset is the decommissioning step
 // for a retired consumer group: its stale offset row pins MIN(last_seq) and
 // halts the retention sweep until the row is removed.

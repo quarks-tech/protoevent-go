@@ -16,13 +16,22 @@ import (
 
 // MessageFailure routes one failed message through the shared failure policy:
 // the PoisonHandler (nil for stop-the-lane failures — only poison DecodeErrors
-// are ever parked), the Observer, and the Logger.
-func MessageFailure(ctx context.Context, h relay.PoisonHandler, obs relay.Observer, log *slog.Logger, runtime, name string, msg *outbox.Message, err error) {
+// are ever parked), the Observer, and the Logger. Returns the handler's error
+// verbatim (nil when no handler is configured): a non-nil return means the
+// park was NOT confirmed and the caller must not advance past the message.
+//
+// The log field is outbox_id, not event_id: msg.ID is the outbox ROW key,
+// which equals the CloudEvents event ID only under the default
+// ReuseMetadataID generator — under GenerateUUIDv4 the two differ, and a
+// field named event_id would correlate the wrong events.
+func MessageFailure(ctx context.Context, h relay.PoisonHandler, obs relay.Observer, log *slog.Logger, runtime, name string, msg *outbox.Message, err error) error {
+	var parkErr error
 	if h != nil {
-		h(ctx, msg, err)
+		parkErr = h(ctx, msg, err)
 	}
 	Error(obs, name, err)
-	log.Error(runtime+" relay: message failed", "relay", name, "event_id", msg.ID, "err", err)
+	log.Error(runtime+" relay: message failed", "relay", name, "outbox_id", msg.ID, "err", err)
+	return parkErr
 }
 
 // Drained, Error, Sequenced, and Swept are the nil-safe dispatchers for

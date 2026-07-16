@@ -252,6 +252,55 @@ func TestWatchSurfacesInvalidateOnDrop(t *testing.T) {
 	t.Fatal("drop of the outbox collection never surfaced ErrInvalidated")
 }
 
+// TestWatchJSONNullMetadataIsPoison is the regression test for the JSON-null
+// bypass: `null` unmarshals into a struct VALUE without error (leaving it
+// zero), so before the pointer-target fix a metadata document holding the
+// literal bytes "null" sailed past decodeMessage and went downstream as an
+// empty event instead of a *stream.DecodeError.
+func TestWatchJSONNullMetadataIsPoison(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	strm, err := mongodbstore.NewStore(testDB).Watch(ctx, "", testMaxAwait)
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	defer func() { _ = strm.Close(context.Background()) }()
+
+	if _, err := testDB.Collection("outbox_messages").InsertOne(ctx, bson.M{
+		"_id":         "null-md",
+		"metadata":    []byte("null"),
+		"data":        []byte("x"),
+		"create_time": time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("insert null-metadata doc: %v", err)
+	}
+
+	var de *stream.DecodeError
+	for de == nil {
+		e, ok, err := strm.Next(ctx)
+		if err != nil {
+			d, isPoison := errors.AsType[*stream.DecodeError](err)
+			if !isPoison {
+				t.Fatalf("next returned %T (%v), want *stream.DecodeError (JSON null must classify as poison)", err, err)
+			}
+			de = d
+			continue
+		}
+		if ok {
+			t.Fatalf("JSON-null metadata delivered as event %s instead of surfacing as poison", e.Message.ID)
+		}
+	}
+	if de.ID != "null-md" || de.ResumeToken == "" {
+		t.Fatalf("DecodeError = {ID:%q, token empty:%v}, want ID null-md with a resume token", de.ID, de.ResumeToken == "")
+	}
+}
+
 // TestWatchPoisonEventReturnsDecodeError proves an undecodable outbox row
 // surfaces as *stream.DecodeError carrying the event's resume position —
 // NOT a bare error, which would wedge the lane forever (reopen from the last

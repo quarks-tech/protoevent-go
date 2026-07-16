@@ -55,14 +55,19 @@ type Observer struct {
 }
 
 // PoisonHandler is the poison-parking hook shared by both runtimes: called for
-// a message whose PERSISTED PAYLOAD failed to decode (a typed DecodeError),
-// after which the relay advances past it — a poison row can never succeed on
-// retry, so parking it is the only way to keep the lane moving. Send failures
-// are never routed here: a send failure is downstream trouble, not a message
-// fault, and the relay always stops the lane and retries the same message
-// (order AND delivery preserved — the whole point of an outbox). Shutdown
-// cancellation is never routed here either — a canceled run context stops the
-// lane instead of parking healthy messages.
+// a message whose PERSISTED PAYLOAD failed to decode (a typed DecodeError).
+// Return nil ONLY once the message is durably parked (DLQ write committed,
+// alert recorded — whatever "parked" means to you): a nil return authorizes
+// the relay to advance its offset/token past the row, which is irreversible.
+// A non-nil return stops the lane at the poison row instead — exactly as if
+// no handler were configured — and the park is retried next pass, so a
+// transient DLQ outage cannot silently skip an event forever.
+//
+// Send failures are never routed here: a send failure is downstream trouble,
+// not a message fault, and the relay always stops the lane and retries the
+// same message (order AND delivery preserved — the whole point of an outbox).
+// Shutdown cancellation is never routed here either — a canceled run context
+// stops the lane instead of parking healthy messages.
 //
 // STUB CONTRACT: msg may be a partial envelope. The poison path fires
 // precisely because the persisted payload failed to decode, so the handler
@@ -70,7 +75,7 @@ type Observer struct {
 // nil Metadata and Data. A handler that needs the raw poison bytes for
 // forensics must fetch the row by ID from the store; err (unwrappable to the
 // runtime's DecodeError) carries the position and decode failure.
-type PoisonHandler func(ctx context.Context, msg *outbox.Message, err error)
+type PoisonHandler func(ctx context.Context, msg *outbox.Message, err error) error
 
 // LeaderStore enables running multiple relay instances with automatic failover.
 // Only the lock holder processes; others idle. Shared by both runtimes.

@@ -422,7 +422,7 @@ func TestSendFailureStopsLaneEvenWithPoisonHandler(t *testing.T) {
 	})
 	var parked []int64
 	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(), sequence.WithPoisonHandler(
-		func(_ context.Context, m *outbox.Message, _ error) { parked = append(parked, m.Seq) },
+		func(_ context.Context, m *outbox.Message, _ error) error { parked = append(parked, m.Seq); return nil },
 	))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -1294,8 +1294,9 @@ func TestCancelDuringSendDoesNotPark(t *testing.T) {
 	})
 	var parked []int64
 	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
-		sequence.WithPoisonHandler(func(_ context.Context, m *outbox.Message, _ error) {
+		sequence.WithPoisonHandler(func(_ context.Context, m *outbox.Message, _ error) error {
 			parked = append(parked, m.Seq)
+			return nil
 		}))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -1335,8 +1336,9 @@ func TestCancelBetweenSendsStopsLane(t *testing.T) {
 	})
 	var parked []int64
 	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
-		sequence.WithPoisonHandler(func(_ context.Context, m *outbox.Message, _ error) {
+		sequence.WithPoisonHandler(func(_ context.Context, m *outbox.Message, _ error) error {
 			parked = append(parked, m.Seq)
+			return nil
 		}))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -1384,9 +1386,10 @@ func TestPoisonRowParkedWithPoisonHandler(t *testing.T) {
 	var parked []*outbox.Message
 	var parkedErrs []error
 	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
-		sequence.WithPoisonHandler(func(_ context.Context, m *outbox.Message, err error) {
+		sequence.WithPoisonHandler(func(_ context.Context, m *outbox.Message, err error) error {
 			parked = append(parked, m)
 			parkedErrs = append(parkedErrs, err)
+			return nil
 		}))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -1407,6 +1410,59 @@ func TestPoisonRowParkedWithPoisonHandler(t *testing.T) {
 	}
 	if off := st.offsets["c"]; off != 5 {
 		t.Fatalf("offset = %d, want 5 (advanced past the parked poison row)", off)
+	}
+}
+
+// TestPoisonParkFailureStopsLane pins the confirmed-park contract: when the
+// PoisonHandler returns an error (DLQ write failed), the offset must NOT
+// advance past the poison row — committing past it is irreversible and an
+// unconfirmed park would silently skip the event forever. The lane stops at
+// the poison exactly as if no handler were configured, and the park retries
+// next pass.
+func TestPoisonParkFailureStopsLane(t *testing.T) {
+	st := newFakeStore()
+	for range 5 {
+		st.append(msg())
+	}
+	st.poisonSeq = 3
+
+	parkAttempts := 0
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning(),
+		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) error {
+			parkAttempts++
+			return errors.New("dlq write failed")
+		}))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	runErr := r.RunOnce(t.Context())
+	if _, ok := errors.AsType[*sequence.DecodeError](runErr); !ok {
+		t.Fatalf("RunOnce err = %v, want *DecodeError (lane stops at unconfirmed park)", runErr)
+	}
+	if off := st.offsets["c"]; off != 2 {
+		t.Fatalf("offset = %d, want 2 (must NOT advance past the unparked poison)", off)
+	}
+	if parkAttempts != 1 {
+		t.Fatalf("park attempts = %d, want 1", parkAttempts)
+	}
+
+	// Next pass retries the park; a now-healthy DLQ confirms it and the lane
+	// advances past the poison. (Free the fake's leader lock first: r still
+	// holds it, and r2 has a different holder ID.)
+	st.mu.Lock()
+	st.leader = ""
+	st.mu.Unlock()
+	r2, err := sequence.NewRelay("c2", st, noopSender, sequence.WithStartFromBeginning(),
+		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) error { return nil }))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r2.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[healthy dlq]: %v", err)
+	}
+	if off := st.offsets["c2"]; off != 5 {
+		t.Fatalf("offset = %d, want 5 (confirmed park advances past the poison)", off)
 	}
 }
 
@@ -1467,7 +1523,7 @@ func TestObserveDrainedExcludesParkedMessages(t *testing.T) {
 	obs := &drainCountObserver{}
 	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning(),
 		sequence.WithObserver(relay.Observer{OnDrained: obs.ObserveDrained}),
-		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) {}))
+		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) error { return nil }))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -1574,7 +1630,7 @@ func TestPoisonOnlyPageObservesDrained(t *testing.T) {
 	obs := &fullDrainObserver{}
 	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning(),
 		sequence.WithObserver(relay.Observer{OnDrained: obs.ObserveDrained}),
-		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) {}))
+		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) error { return nil }))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}

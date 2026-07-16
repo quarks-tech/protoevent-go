@@ -320,6 +320,7 @@ github.com/posener/complete v1.1.1 h1:ccV59UEOTzVDnDUEFdT95ZzHVZ+5+158q8+SJb2QV5
 github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4 h1:gQz4mCbXsO+nc9n1hCxHcGA3Zx3Eo+UHZoInFGUIXNM=
 github.com/quarks-tech/protoevent v0.2.0 h1:xS4lEct6ecgv04XGfZXli/cagoXviH49KaX1mrkQMxw=
 github.com/quarks-tech/protoevent v0.2.0/go.mod h1:Tc7ZXJDALcjC8Si6Sf4vJ2RljX1hiKxMp7gsfkq7QGE=
+github.com/quarks-tech/protoevent-go/pkg/transport/outbox v0.4.3/go.mod h1:q3F/xk91l7Tb1DMvr/w7l5e9MSMMubLh1GuPzajVw+o=
 github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 h1:OdAsTTz6OkFY5QxjkYwrChwuRruF69c169dPK26NUlk=
 github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/rogpeppe/fastuuid v1.2.0 h1:Ppwyp6VYCF1nvBTXL3trRso7mXMlRrw9ooo375wvi2s=

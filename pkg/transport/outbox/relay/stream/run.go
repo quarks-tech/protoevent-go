@@ -37,6 +37,9 @@ func (r *Relay) Run(ctx context.Context) error {
 		if err := r.leader.Release(); err != nil {
 			r.options.Logger.Warn("stream relay: release leader lock", "relay", r.name, "err", err)
 		}
+		// Graceful release ends this instance's leadership: emit the
+		// transition so telemetry does not leave a dead instance marked leader.
+		r.trackLeadership(false)
 	}()
 
 	for {
@@ -144,8 +147,16 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		}
 		e, ok, err := r.stream.Next(ctx)
 		if err != nil {
-			if de, isPoison := errors.AsType[*DecodeError](err); isPoison && de.ResumeToken != "" && r.options.PoisonHandler != nil && ctx.Err() == nil {
-				// Poison event: park it and resume past it, keeping the lane
+			de, isPoison := errors.AsType[*DecodeError](err)
+			if isPoison && de.ResumeToken != "" && r.options.PoisonHandler != nil && ctx.Err() == nil &&
+				// Advance past the poison event ONLY on a confirmed park
+				// (handler returned nil): persisting the token past it is
+				// irreversible, and an unconfirmed DLQ write would silently
+				// skip the event forever. On park failure the error falls
+				// through below and stops the lane at the poison — same as
+				// having no handler — and the park retries on reopen.
+				r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: de.ID}, err) == nil {
+				// Poison event parked: resume past it, keeping the lane
 				// moving. Requires the event's resume token: extraction is
 				// best-effort, and an empty one is non-parkable — advancing
 				// with it would later persist "" and erase the group's
@@ -153,7 +164,6 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 				// Without a token or a PoisonHandler the error falls through
 				// below and stops the lane without advancing past the event
 				// (at-least-once, order preserved).
-				r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: de.ID}, err)
 				lastTok = de.ResumeToken
 				// CommitTime extraction is best-effort too: a zero one would
 				// (a) be swallowed by the store's monotone guard, freezing the
@@ -217,7 +227,8 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 			// the backlog to the DLQ while advancing the persisted position
 			// past it. The lane reopens at this event — order and delivery
 			// preserved. (The nil handler keeps it out of the DLQ.)
-			r.handleError(ctx, nil, e.Message, sendErr)
+			// nil handler: return is always nil (send failures are never parked).
+			_ = r.handleError(ctx, nil, e.Message, sendErr)
 			stopped = true
 			break
 		}
@@ -340,7 +351,8 @@ func (r *Relay) sleep(ctx context.Context) {
 // handleError routes a genuine per-message failure to the shared relay error
 // policy. h is the configured PoisonHandler for parkable poison events and nil
 // for stop-the-lane send failures (observe+log only — the event will be
-// redelivered, not parked).
-func (r *Relay) handleError(ctx context.Context, h relay.PoisonHandler, msg *outbox.Message, err error) {
-	notify.MessageFailure(ctx, h, r.options.Observer, r.options.Logger, "stream", r.name, msg, err)
+// redelivered, not parked). Returns the handler's park confirmation error
+// (nil when h is nil).
+func (r *Relay) handleError(ctx context.Context, h relay.PoisonHandler, msg *outbox.Message, err error) error {
+	return notify.MessageFailure(ctx, h, r.options.Observer, r.options.Logger, "stream", r.name, msg, err)
 }

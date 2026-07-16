@@ -47,9 +47,19 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("start mongodb: %w", err)
 	}
+	// cleanup paths always run on a FRESH bounded context: on the error paths
+	// the caller's ctx may already be canceled (Terminate would no-op and leak
+	// the container), and an unbounded Background() could hang a wedged
+	// daemon's teardown indefinitely.
+	terminate := func() {
+		tctx, tcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer tcancel()
+		_ = c.Terminate(tctx)
+	}
+
 	uri, err := c.ConnectionString(ctx)
 	if err != nil {
-		_ = c.Terminate(ctx)
+		terminate()
 		return nil, nil, fmt.Errorf("get connection string: %w", err)
 	}
 	// directConnection: the single-node RS advertises a container-internal
@@ -62,8 +72,13 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 	dsn := uri + sep + "directConnection=true"
 	client, err := mongo.Connect(options.Client().ApplyURI(dsn)) // v2: no ctx arg
 	if err != nil {
-		_ = c.Terminate(ctx)
+		terminate()
 		return nil, nil, fmt.Errorf("connect: %w", err)
+	}
+	disconnect := func() {
+		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer dcancel()
+		_ = client.Disconnect(dctx)
 	}
 	// Ping so a bad DSN (or a container that never becomes reachable) fails
 	// loudly here, at Start, with a clear error — instead of surfacing as a
@@ -74,14 +89,14 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err := client.Ping(pingCtx, nil); err != nil {
-		_ = client.Disconnect(context.Background())
-		_ = c.Terminate(ctx)
+		disconnect()
+		terminate()
 		return nil, nil, fmt.Errorf("ping mongodb: %w", err)
 	}
 	inst := &Instance{
 		Client:    client,
 		DB:        client.Database(dbName),
-		terminate: func() { _ = client.Disconnect(context.Background()); _ = c.Terminate(context.Background()) },
+		terminate: func() { disconnect(); terminate() },
 	}
 	return inst, inst.terminate, nil
 }

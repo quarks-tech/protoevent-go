@@ -427,8 +427,9 @@ func TestSendFailureStopsLaneEvenWithPoisonHandler(t *testing.T) {
 		got = append(got, md.ID)
 		return nil
 	})
-	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) error {
 		parked = append(parked, msg.ID)
+		return nil
 	}))
 	_ = r.RunOnce(t.Context())
 
@@ -479,7 +480,7 @@ func TestObserveDrainedCountsOnlySent(t *testing.T) {
 	obs := &countingObserver{}
 	r := mustRelay(t, st, sender,
 		stream.WithObserver(relay.Observer{OnDrained: obs.ObserveDrained, OnError: obs.ObserveError}),
-		stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) {}))
+		stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) error { return nil }))
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -568,8 +569,9 @@ func TestShutdownDoesNotParkBufferedEvents(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) error {
 		parked = append(parked, msg.ID)
+		return nil
 	}))
 	_ = r.RunOnce(ctx)
 
@@ -607,8 +609,9 @@ func TestCancelBetweenEventsStopsLane(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) error {
 		parked = append(parked, msg.ID)
+		return nil
 	}))
 	_ = r.RunOnce(ctx)
 
@@ -649,11 +652,12 @@ func TestDecodeErrorParksAndContinues(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, err error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, err error) error {
 		if _, ok := errors.AsType[*stream.DecodeError](err); !ok {
 			t.Errorf("PoisonHandler err = %v, want a *DecodeError", err)
 		}
 		parked = append(parked, msg.ID)
+		return nil
 	}))
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
@@ -690,7 +694,7 @@ func TestZeroClusterTimePoisonDoesNotRewindWindowCT(t *testing.T) {
 	}
 	st := &fakeStore{stream: fs, loadTok: "existing"}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
-	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) {}))
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) error { return nil }))
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -700,6 +704,36 @@ func TestZeroClusterTimePoisonDoesNotRewindWindowCT(t *testing.T) {
 	}
 	if !st.savedCT.Equal(evCT) {
 		t.Fatalf("saved commitTime = %v, want %v (the in-window event's CT — a zero-CT poison must floor, not rewind)", st.savedCT, evCT)
+	}
+}
+
+// TestPoisonParkFailureStopsLane pins the confirmed-park contract: when the
+// PoisonHandler returns an error, the token must NOT advance past the poison
+// event — the lane stops exactly as if no handler were configured (prefix
+// persisted, DecodeError surfaced), and the park retries on reopen.
+func TestPoisonParkFailureStopsLane(t *testing.T) {
+	de := &stream.DecodeError{ID: "p", ResumeToken: "ptok", CommitTime: time.Now(), Err: errors.New("bad bson")}
+	fs := &fakeStream{
+		events: []*stream.Event{ev("a"), nil},
+		errs:   map[int]error{1: de},
+	}
+	st := &fakeStore{stream: fs, loadTok: "existing"}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	parkAttempts := 0
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) error {
+		parkAttempts++
+		return errors.New("dlq write failed")
+	}))
+
+	runErr := r.RunOnce(t.Context())
+	if _, ok := errors.AsType[*stream.DecodeError](runErr); !ok {
+		t.Fatalf("RunOnce err = %v, want *DecodeError (lane stops at unconfirmed park)", runErr)
+	}
+	if parkAttempts != 1 {
+		t.Fatalf("park attempts = %d, want 1", parkAttempts)
+	}
+	if st.savedTok != "a" {
+		t.Fatalf("saved token = %q, want a (prefix persisted; NOT advanced past the unparked poison)", st.savedTok)
 	}
 }
 
@@ -753,8 +787,9 @@ func TestDecodeErrorWithEmptyTokenIsNotParkable(t *testing.T) {
 		return nil
 	})
 	var parked []string
-	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) {
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) error {
 		parked = append(parked, msg.ID)
+		return nil
 	}))
 	runErr := r.RunOnce(t.Context())
 

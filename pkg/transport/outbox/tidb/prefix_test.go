@@ -64,14 +64,16 @@ func TestPrefixedMigrations(t *testing.T) {
 		}
 		content := string(b)
 		for _, name := range []string{"outbox_messages", "outbox_offsets", "outbox_sequencers", "relay_locks"} {
-			if strings.Contains(content, "orders_"+name) {
-				continue // prefixed occurrences expected
-			}
-			if strings.Contains(content, name) {
+			// Strip the correctly prefixed occurrences FIRST, then any
+			// surviving bare name is a real leak — a plain continue on
+			// "prefixed name present" would mask a bare occurrence sitting
+			// next to a prefixed one in the same file.
+			stripped := strings.ReplaceAll(content, "orders_"+name, "")
+			if strings.Contains(stripped, name) {
 				t.Errorf("%s: table %s appears without prefix", path, name)
 			}
 		}
-		if strings.Contains(strings.ReplaceAll(content, "orders_", ""), "orders_") {
+		if strings.Contains(content, "orders_orders_") {
 			t.Errorf("%s: unexpected double prefix", path)
 		}
 		return nil

@@ -34,7 +34,8 @@ var ErrInvalidated = errors.New("stream: change stream invalidated")
 
 // ErrHistoryLost is the sentinel store implementations return from Stream.Next
 // when the resume token has fallen off the oplog (ChangeStreamHistoryLost).
-// Fatal in v1 — invoke the break-glass runbook.
+// Fatal in v1 — invoke the break-glass runbook in the outbox README
+// ("Runbook: ErrHistoryLost"): a restart cannot fix it and only crash-loops.
 var ErrHistoryLost = errors.New("stream: change stream history lost (resume token off oplog)")
 
 // DecodeError reports a change-stream event whose payload failed to decode.

@@ -44,6 +44,9 @@ func (r *Relay) Run(ctx context.Context) error {
 		if err := r.leader.Release(); err != nil {
 			r.options.Logger.Warn("sequence relay: release leader lock", "relay", r.name, "err", err)
 		}
+		// Graceful release ends this instance's leadership: emit the
+		// transition so telemetry does not leave a dead instance marked leader.
+		r.trackLeadership(false)
 	}()
 
 	// Do one pass immediately instead of waiting a full PollInterval for the
@@ -230,7 +233,8 @@ func (r *Relay) drain(ctx context.Context) error {
 				// while permanently advancing the offset past it. The failed
 				// message retries next tick — order and delivery preserved.
 				// (The nil handler keeps it out of the DLQ; observe+log only.)
-				r.handleError(ctx, nil, m, sendErr)
+				// nil handler: return is always nil (send failures are never parked).
+				_ = r.handleError(ctx, nil, m, sendErr)
 				stopped = true
 				break // stop-the-lane: leave this seq for the next tick
 			}
@@ -245,9 +249,15 @@ func (r *Relay) drain(ctx context.Context) error {
 		// and when the lane already stopped before reaching it.
 		parkedPoison := false
 		if poison != nil && !stopped && !canceled && r.options.PoisonHandler != nil && ctx.Err() == nil {
-			r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: poison.ID, Seq: poison.Seq}, poison)
-			maxSeq = max(maxSeq, poison.Seq)
-			parkedPoison = true
+			// Advance past the poison row ONLY on a confirmed park (handler
+			// returned nil): committing the offset past it is irreversible,
+			// and an unconfirmed DLQ write would silently skip the event
+			// forever. On park failure the lane stops at the poison row —
+			// same as having no handler — and the park retries next pass.
+			if parkErr := r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: poison.ID, Seq: poison.Seq}, poison); parkErr == nil {
+				maxSeq = max(maxSeq, poison.Seq)
+				parkedPoison = true
+			}
 		}
 
 		if maxSeq > offset {
@@ -352,8 +362,9 @@ func (r *Relay) maybeSweep(ctx context.Context) error {
 // handleError routes a genuine per-message failure to the shared relay error
 // policy. h is the configured PoisonHandler for parkable poison rows and nil
 // for stop-the-lane send failures (observe+log only — the message will be
-// retried, not parked). Never called for shutdown cancellation: a canceled
-// run context stops the lane instead.
-func (r *Relay) handleError(ctx context.Context, h relay.PoisonHandler, msg *outbox.Message, err error) {
-	notify.MessageFailure(ctx, h, r.options.Observer, r.options.Logger, "sequence", r.name, msg, err)
+// retried, not parked). Returns the handler's park confirmation error (nil
+// when h is nil). Never called for shutdown cancellation: a canceled run
+// context stops the lane instead.
+func (r *Relay) handleError(ctx context.Context, h relay.PoisonHandler, msg *outbox.Message, err error) error {
+	return notify.MessageFailure(ctx, h, r.options.Observer, r.options.Logger, "sequence", r.name, msg, err)
 }

@@ -38,12 +38,17 @@ func (s boundedStore) LoadToken(ctx context.Context, name string) (string, time.
 // pins it (saveHadDeadline/saveCtxErr). Mirrors sequence/bounded.go
 // CommitOffset — keep the dead-ctx detachment in lockstep.
 func (s boundedStore) SaveToken(ctx context.Context, name string, token string, commitTime time.Time) (bool, error) {
-	var cancel context.CancelFunc
+	// ALWAYS detached from the run ctx's cancellation, not just when it is
+	// already dead: the save records sends that already happened, so a
+	// cancel racing in AFTER the ctx.Err() check but DURING the write would
+	// otherwise abort it and redeliver up to TokenBatchSize-1 acknowledged
+	// sends on restart. Values (trace/log) are preserved; the bound alone
+	// limits it. Mirrors sequence/bounded.go CommitOffset.
+	timeout := s.ttl
 	if ctx.Err() != nil {
-		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
-	} else {
-		ctx, cancel = context.WithTimeout(ctx, s.ttl)
+		timeout = shutdownTimeout
 	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 	return s.inner.SaveToken(ctx, name, token, commitTime)
 }

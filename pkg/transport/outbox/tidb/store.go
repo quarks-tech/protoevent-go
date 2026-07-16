@@ -345,17 +345,25 @@ func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit in
 		if err != nil {
 			return nil, fmt.Errorf("outbox: event_id not a uuid: %w", err)
 		}
-		var md event.Metadata
+		// Unmarshal into a *pointer* target: JSON `null` unmarshals into a
+		// struct value WITHOUT error (leaving it zero), and a zero-metadata
+		// event would slip past the poison classification and be sent
+		// downstream as an empty event. With a pointer target, `null` yields
+		// nil and is classified poison like any other undecodable row.
+		var md *event.Metadata
 		if err := json.Unmarshal(meta, &md); err != nil {
 			// Poison row: hand the decoded prefix back with a typed error so
 			// the relay can deliver up to the poison row and then park it (or
 			// stop the lane) instead of blocking on the whole page.
 			return out, &sequence.DecodeError{ID: id.String(), Seq: seq, Err: err}
 		}
+		if md == nil {
+			return out, &sequence.DecodeError{ID: id.String(), Seq: seq, Err: errors.New("persisted metadata is JSON null")}
+		}
 		out = append(out, &outbox.Message{
 			ID:         id.String(),
 			Seq:        seq,
-			Metadata:   &md,
+			Metadata:   md,
 			Data:       data,
 			CreateTime: createTime,
 		})

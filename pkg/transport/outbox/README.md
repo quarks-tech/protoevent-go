@@ -23,6 +23,7 @@ pkg/transport/outbox/relay/      primitives shared by every relay runtime: Obser
 pkg/transport/outbox/relay/sequence/   TiDB sequenced-log runtime: Store/Sequencer/Sweeper, Options, Relay
 pkg/transport/outbox/relay/stream/     MongoDB change-stream runtime: Store/Stream/Event, Options, Relay
 pkg/transport/outbox/tidb/       reference TiDB store implementation + schema migrations
+pkg/transport/outbox/tidb/tidbmigrate/  one-call schema migration (tidbmigrate.Apply); separate so publish-only builds skip migrate/v4
 pkg/transport/outbox/mongodb/    reference MongoDB store implementation (publish + stream.Store + LeaderStore)
 ```
 
@@ -77,9 +78,11 @@ prepare/exec/close cycle of three wire round trips.)
 
 By default the outbox row ID is `outbox.ReuseMetadataID`: the row's ID is the
 publisher's CloudEvents `Metadata.ID`, so the event the relay eventually emits
-carries exactly the ID the publisher assigned, end to end. Because CloudEvents
-IDs are UUIDs, this also scatters inserts across TiDB regions — hotspot
-avoidance and identity preservation come for free together. Pass
+carries exactly the ID the publisher assigned, end to end. (The row's
+*physical* primary key is a separate `AUTO_INCREMENT id` — a deliberate
+schema trade-off documented in the migration header — so the UUID row ID
+scatters only the `uk_outbox_event` unique-index writes, not the clustered
+PK; the ID choice is about identity, not hotspot avoidance.) Pass
 `outbox.WithSenderOptions(outbox.WithRowIDGenerator(outbox.GenerateUUIDv4))` via
 `FactoryOption` if you need the row's identity decoupled from the event's
 `Metadata.ID` instead — the relayed event still carries the published
@@ -464,19 +467,35 @@ stream position.
 5. **Re-send the gap**: read the outbox collection for the missed window and
    re-publish through the relay's own sender —
 
+   Abort on the FIRST error — skipping past a failed decode or send during
+   recovery silently drops that event forever (the token was already reset):
+
    ```go
-   cur, _ := db.Collection("outbox_messages").Find(ctx,
+   cur, err := db.Collection("outbox_messages").Find(ctx,
        bson.M{"create_time": bson.M{"$gte": gapStart.Add(-overlap)}}, // overlap ≥ 1 oplog-lag margin, e.g. 5m
        options.Find().SetSort(bson.D{{Key: "create_time", Value: 1}}))
+   if err != nil {
+       return err
+   }
+   defer cur.Close(ctx)
    for cur.Next(ctx) {
        var doc struct {
-           Metadata []byte    `bson:"metadata"`
-           Data     []byte    `bson:"data"`
+           Metadata []byte `bson:"metadata"`
+           Data     []byte `bson:"data"`
        }
-       _ = cur.Decode(&doc)
+       if err := cur.Decode(&doc); err != nil {
+           return err // fix the row, rerun the replay from gapStart
+       }
        var md event.Metadata
-       _ = json.Unmarshal(doc.Metadata, &md)
-       _ = sender.Send(ctx, &md, doc.Data) // same Sender the relay uses
+       if err := json.Unmarshal(doc.Metadata, &md); err != nil {
+           return err // poison row: park it manually, then rerun
+       }
+       if err := sender.Send(ctx, &md, doc.Data); err != nil {
+           return err // downstream failed: rerun once it recovers (dedup absorbs)
+       }
+   }
+   if err := cur.Err(); err != nil {
+       return err
    }
    ```
 

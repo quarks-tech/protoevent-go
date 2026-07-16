@@ -378,13 +378,20 @@ func (s *Store) ReleaseLeaderLock(ctx context.Context, name, holderID string) er
 // CreateOutboxMessage's json.Marshal of the CloudEvents metadata. Its only
 // caller is mongoStream.Next (watch.go).
 func decodeMessage(doc outboxDoc) (*outbox.Message, error) {
-	var md event.Metadata
+	// Pointer target: JSON `null` unmarshals into a struct value WITHOUT
+	// error (leaving it zero), and a zero-metadata event would bypass the
+	// poison classification and go downstream empty. With a pointer target,
+	// `null` yields nil and is classified poison (mirrors the TiDB store).
+	var md *event.Metadata
 	if err := json.Unmarshal(doc.Metadata, &md); err != nil {
 		return nil, fmt.Errorf("outbox: unmarshal metadata: %w", err)
 	}
+	if md == nil {
+		return nil, errors.New("outbox: persisted metadata is JSON null")
+	}
 	return &outbox.Message{
 		ID:         doc.ID,
-		Metadata:   &md,
+		Metadata:   md,
 		Data:       doc.Data,
 		CreateTime: doc.CreateTime,
 	}, nil

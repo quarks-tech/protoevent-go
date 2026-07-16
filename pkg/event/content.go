@@ -12,20 +12,33 @@ const (
 // ContentSubtype extracts the codec-selecting subtype from a content type:
 // "application/cloudevents+proto" and "application/proto" both yield
 // ("proto", true). Returns ok=false for content types outside the
-// application/ (or application/cloudevents+) families.
+// application/ (or application/cloudevents+) families, for a bare
+// "application"/"application/cloudevents" with no subtype, and for
+// non-"application/"-delimited lookalikes ("applicationfoo").
+//
+// The content type arrives from the INCOMING message's metadata, so this must
+// never panic on malformed input: the subscriber maps ok=false to an
+// unprocessable-event error instead.
 func ContentSubtype(contentType string) (string, bool) {
 	if !strings.HasPrefix(contentType, cloudeventsContentType) {
-		if strings.HasPrefix(contentType, baseContentType) {
-			return contentType[len(baseContentType)+1:], true
+		subtype, ok := strings.CutPrefix(contentType, baseContentType+"/")
+		if !ok || subtype == "" {
+			return "", false
 		}
-
-		return "", false
+		return subtype, true
 	}
 
-	// guaranteed since != cloudeventsContentType and has cloudeventsContentType prefix
+	// Has the cloudevents prefix; an exact match carries no subtype, and
+	// indexing past it without the length check would panic on it.
+	if len(contentType) == len(cloudeventsContentType) {
+		return "", false
+	}
 	switch contentType[len(cloudeventsContentType)] {
 	case '+', ';':
-		return contentType[len(cloudeventsContentType)+1:], true
+		if rest := contentType[len(cloudeventsContentType)+1:]; rest != "" {
+			return rest, true
+		}
+		return "", false
 	default:
 		return "", false
 	}

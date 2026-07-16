@@ -54,12 +54,16 @@ func (s boundedStore) InitOffsetLatest(ctx context.Context, name string) (int64,
 // suite pins it (commitHadDeadline/commitCtxErr). Mirrors
 // stream/bounded.go SaveToken — keep the dead-ctx detachment in lockstep.
 func (s boundedStore) CommitOffset(ctx context.Context, name string, seq int64) error {
-	var cancel context.CancelFunc
+	// ALWAYS detached from the run ctx's cancellation, not just when it is
+	// already dead: the commit records sends that already happened, so a
+	// cancel racing in AFTER the ctx.Err() check but DURING the write would
+	// otherwise abort it and redeliver the whole acknowledged page on
+	// restart. Values (trace/log) are preserved; the bound alone limits it.
+	timeout := s.ttl
 	if ctx.Err() != nil {
-		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
-	} else {
-		ctx, cancel = context.WithTimeout(ctx, s.ttl)
+		timeout = commitTimeout
 	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
 	return s.inner.CommitOffset(ctx, name, seq)
 }

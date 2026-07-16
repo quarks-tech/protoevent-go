@@ -109,6 +109,7 @@ type options struct {
 	// group has a committed offset.
 	StartFromBeginning bool
 
+	RetentionConfigured    bool          // WithRetention was called (validates window > 0)
 	RetentionWindow        time.Duration // 0 disables the sweep
 	RetentionSweepInterval time.Duration // minimum time between sweeps
 	RetentionSweepBatch    int
@@ -205,6 +206,7 @@ func WithPoisonHandler(h relay.PoisonHandler) Option {
 // PollInterval — retuning the tick does not silently change sweep cadence.
 func WithRetention(window, sweepInterval time.Duration, sweepBatch int) Option {
 	return func(o *options) {
+		o.RetentionConfigured = true
 		o.RetentionWindow = window
 		o.RetentionSweepInterval = sweepInterval
 		o.RetentionSweepBatch = sweepBatch
@@ -323,6 +325,13 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	}
 	if options.PollInterval >= options.LeaseTTL/2 {
 		return nil, fmt.Errorf("sequence: PollInterval (%v) must be < LeaseTTL/2 (%v)", options.PollInterval, options.LeaseTTL/2)
+	}
+	// A caller who CALLED WithRetention gets full validation of all three
+	// parameters: a zero/negative window from a miscomputed config would
+	// otherwise pass the window>0 gate below and silently disable the sweep —
+	// unbounded log growth presenting as a disk incident months later.
+	if options.RetentionConfigured && options.RetentionWindow <= 0 {
+		return nil, fmt.Errorf("sequence: WithRetention window must be > 0, got %v (omit WithRetention entirely to disable the sweep)", options.RetentionWindow)
 	}
 	if options.RetentionWindow > 0 && (options.RetentionSweepInterval <= 0 || options.RetentionSweepBatch <= 0) {
 		return nil, fmt.Errorf("sequence: RetentionWindow (%v) requires RetentionSweepInterval > 0 and RetentionSweepBatch > 0, got %v and %d",
