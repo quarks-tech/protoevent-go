@@ -148,44 +148,49 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		e, ok, err := r.stream.Next(ctx)
 		if err != nil {
 			de, isPoison := errors.AsType[*DecodeError](err)
-			if isPoison && de.ResumeToken != "" && r.options.PoisonHandler != nil && ctx.Err() == nil &&
+			if isPoison && de.ResumeToken != "" && r.options.PoisonHandler != nil && ctx.Err() == nil {
 				// Advance past the poison event ONLY on a confirmed park
 				// (handler returned nil): persisting the token past it is
 				// irreversible, and an unconfirmed DLQ write would silently
-				// skip the event forever. On park failure the error falls
-				// through below and stops the lane at the poison — same as
-				// having no handler — and the park retries on reopen.
-				r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: de.ID}, err) == nil {
-				// Poison event parked: resume past it, keeping the lane
-				// moving. Requires the event's resume token: extraction is
-				// best-effort, and an empty one is non-parkable — advancing
-				// with it would later persist "" and erase the group's
-				// position (restart "at now", silently skipping events).
-				// Without a token or a PoisonHandler the error falls through
-				// below and stops the lane without advancing past the event
-				// (at-least-once, order preserved).
-				lastTok = de.ResumeToken
-				// CommitTime extraction is best-effort too: a zero one would
-				// (a) be swallowed by the store's monotone guard, freezing the
-				// persisted position at the pre-poison token forever (the lane
-				// reopens onto the poison every window), and (b) zero
-				// committedCT, silencing committedTokenAge()'s cliff alarm
-				// exactly during a poison episode. Floor, never rewind: a
-				// poison event must not drag lastCT below a commitTime an
-				// earlier event in THIS window already advanced it to (that
-				// would persist a stale anchor and inflate the cliff metric);
-				// with nothing advanced yet, anchor on the last committed
-				// commitTime — equal passes the monotone $lte filter, so the
-				// token still advances.
-				switch {
-				case de.CommitTime.After(lastCT):
-					lastCT = de.CommitTime
-				case lastCT.IsZero():
-					lastCT = r.committedCT
+				// skip the event forever. Parking requires the event's resume
+				// token: extraction is best-effort, and an empty one is
+				// non-parkable — advancing with it would later persist "" and
+				// erase the group's position (restart "at now", silently
+				// skipping events).
+				parkErr := r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: de.ID}, err)
+				if parkErr == nil {
+					// Poison event parked: resume past it, keeping the lane
+					// moving. CommitTime extraction is best-effort too: a
+					// zero one would (a) be swallowed by the store's monotone
+					// guard, freezing the persisted position at the
+					// pre-poison token forever (the lane reopens onto the
+					// poison every window), and (b) zero committedCT,
+					// silencing committedTokenAge()'s cliff alarm exactly
+					// during a poison episode. Floor, never rewind: a poison
+					// event must not drag lastCT below a commitTime an
+					// earlier event in THIS window already advanced it to
+					// (that would persist a stale anchor and inflate the
+					// cliff metric); with nothing advanced yet, anchor on the
+					// last committed commitTime — equal passes the monotone
+					// $lte filter, so the token still advances.
+					lastTok = de.ResumeToken
+					switch {
+					case de.CommitTime.After(lastCT):
+						lastCT = de.CommitTime
+					case lastCT.IsZero():
+						lastCT = r.committedCT
+					}
+					advanced = true
+					handled++
+					continue
 				}
-				advanced = true
-				handled++
-				continue
+				// Unconfirmed park: fall through below and stop the lane at
+				// the poison — same as having no handler or no token — and
+				// retry the park on reopen. Join the park failure into the
+				// error chain: telemetry alone (handleError observed and
+				// logged it) would leave Run's returned error blind to the
+				// broken DLQ.
+				err = errors.Join(err, parkErr)
 			}
 			// Non-parkable Next error: persist the sent prefix's position
 			// first (the same save the send-failure stop path gets via

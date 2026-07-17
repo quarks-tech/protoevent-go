@@ -248,13 +248,14 @@ func (r *Relay) drain(ctx context.Context) error {
 		// stops at it (at-least-once, order preserved). Skipped on shutdown
 		// and when the lane already stopped before reaching it.
 		parkedPoison := false
+		var parkErr error
 		if poison != nil && !stopped && !canceled && r.options.PoisonHandler != nil && ctx.Err() == nil {
 			// Advance past the poison row ONLY on a confirmed park (handler
 			// returned nil): committing the offset past it is irreversible,
 			// and an unconfirmed DLQ write would silently skip the event
 			// forever. On park failure the lane stops at the poison row —
 			// same as having no handler — and the park retries next pass.
-			if parkErr := r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: poison.ID, Seq: poison.Seq}, poison); parkErr == nil {
+			if parkErr = r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: poison.ID, Seq: poison.Seq}, poison); parkErr == nil {
 				maxSeq = max(maxSeq, poison.Seq)
 				parkedPoison = true
 			}
@@ -298,9 +299,11 @@ func (r *Relay) drain(ctx context.Context) error {
 		case stopped:
 			return nil
 		case poison != nil && !parkedPoison:
-			// No PoisonHandler: what succeeded is committed; surface the decode
-			// failure and stop the lane at the poison row.
-			return listErr
+			// No PoisonHandler (or an unconfirmed park): what succeeded is
+			// committed; surface the decode failure — joined with the park
+			// failure, if any, so a broken DLQ is visible in the error chain,
+			// not just in telemetry — and stop the lane at the poison row.
+			return errors.Join(listErr, parkErr)
 		case !full && !parkedPoison:
 			return nil
 		}

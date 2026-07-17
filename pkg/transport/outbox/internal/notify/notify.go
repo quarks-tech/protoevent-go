@@ -31,6 +31,14 @@ func MessageFailure(ctx context.Context, h relay.PoisonHandler, obs relay.Observ
 	}
 	Error(obs, name, err)
 	log.Error(runtime+" relay: message failed", "relay", name, "outbox_id", msg.ID, "err", err)
+	if parkErr != nil {
+		// The park failure is its own operational event — a broken DLQ/parking
+		// store, distinct from the message fault that triggered it. Without
+		// its own signal, alerting sees only the poison error while the lane
+		// silently stops retrying the park against a dead DLQ.
+		Error(obs, name, parkErr)
+		log.Error(runtime+" relay: poison park failed", "relay", name, "outbox_id", msg.ID, "err", parkErr)
+	}
 	return parkErr
 }
 

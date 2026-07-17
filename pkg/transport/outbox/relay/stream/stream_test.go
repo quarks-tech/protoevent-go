@@ -719,21 +719,61 @@ func TestPoisonParkFailureStopsLane(t *testing.T) {
 	}
 	st := &fakeStore{stream: fs, loadTok: "existing"}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	parkFailure := errors.New("dlq write failed")
 	parkAttempts := 0
-	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) error {
-		parkAttempts++
-		return errors.New("dlq write failed")
-	}))
+	r := mustRelay(t, st, sender,
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) error {
+			parkAttempts++
+			if parkAttempts == 1 {
+				return parkFailure
+			}
+			return nil
+		}))
 
 	runErr := r.RunOnce(t.Context())
 	if _, ok := errors.AsType[*stream.DecodeError](runErr); !ok {
 		t.Fatalf("RunOnce err = %v, want *DecodeError (lane stops at unconfirmed park)", runErr)
+	}
+	if !errors.Is(runErr, parkFailure) {
+		t.Fatalf("RunOnce err = %v, want the DLQ write failure joined into the chain", runErr)
 	}
 	if parkAttempts != 1 {
 		t.Fatalf("park attempts = %d, want 1", parkAttempts)
 	}
 	if st.savedTok != "a" {
 		t.Fatalf("saved token = %q, want a (prefix persisted; NOT advanced past the unparked poison)", st.savedTok)
+	}
+
+	// Run reacts to the pass error by closing the cursor and reopening from
+	// the persisted position (its default transient branch); RunOnce leaves
+	// that to the caller. Simulate the close via a demotion pass, then a
+	// re-acquiring pass reopens at "a" and retries the park — a now-healthy
+	// DLQ confirms it and the lane advances past the poison.
+	st.mu.Lock()
+	st.leader = "other"
+	st.mu.Unlock()
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[demoted]: %v", err)
+	}
+	if fs.closeCount != 1 {
+		t.Fatalf("closeCount = %d, want 1 (cursor released so the retry reopens from the persisted token)", fs.closeCount)
+	}
+	st.mu.Lock()
+	st.leader = ""
+	st.mu.Unlock()
+
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce[healthy dlq]: %v", err)
+	}
+	if got := st.watchTokens; len(got) != 2 || got[1] != "a" {
+		t.Fatalf("watch tokens = %v, want a second Watch resuming from the persisted prefix token a", got)
+	}
+	if parkAttempts != 2 {
+		t.Fatalf("park attempts = %d, want 2 (park retried on reopen)", parkAttempts)
+	}
+	if st.savedTok != "ptok" {
+		t.Fatalf("saved token = %q, want ptok (confirmed park advances past the poison)", st.savedTok)
 	}
 }
 

@@ -1426,11 +1426,15 @@ func TestPoisonParkFailureStopsLane(t *testing.T) {
 	}
 	st.poisonSeq = 3
 
+	parkFailure := errors.New("dlq write failed")
 	parkAttempts := 0
 	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning(),
 		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) error {
 			parkAttempts++
-			return errors.New("dlq write failed")
+			if parkAttempts == 1 {
+				return parkFailure
+			}
+			return nil
 		}))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -1440,6 +1444,9 @@ func TestPoisonParkFailureStopsLane(t *testing.T) {
 	if _, ok := errors.AsType[*sequence.DecodeError](runErr); !ok {
 		t.Fatalf("RunOnce err = %v, want *DecodeError (lane stops at unconfirmed park)", runErr)
 	}
+	if !errors.Is(runErr, parkFailure) {
+		t.Fatalf("RunOnce err = %v, want the DLQ write failure joined into the chain", runErr)
+	}
 	if off := st.offsets["c"]; off != 2 {
 		t.Fatalf("offset = %d, want 2 (must NOT advance past the unparked poison)", off)
 	}
@@ -1447,22 +1454,16 @@ func TestPoisonParkFailureStopsLane(t *testing.T) {
 		t.Fatalf("park attempts = %d, want 1", parkAttempts)
 	}
 
-	// Next pass retries the park; a now-healthy DLQ confirms it and the lane
-	// advances past the poison. (Free the fake's leader lock first: r still
-	// holds it, and r2 has a different holder ID.)
-	st.mu.Lock()
-	st.leader = ""
-	st.mu.Unlock()
-	r2, err := sequence.NewRelay("c2", st, noopSender, sequence.WithStartFromBeginning(),
-		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) error { return nil }))
-	if err != nil {
-		t.Fatalf("NewRelay: %v", err)
-	}
-	if err := r2.RunOnce(t.Context()); err != nil {
+	// The next pass of the SAME group retries the park; a now-healthy DLQ
+	// confirms it and the lane advances past the poison.
+	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce[healthy dlq]: %v", err)
 	}
-	if off := st.offsets["c2"]; off != 5 {
+	if off := st.offsets["c"]; off != 5 {
 		t.Fatalf("offset = %d, want 5 (confirmed park advances past the poison)", off)
+	}
+	if parkAttempts != 2 {
+		t.Fatalf("park attempts = %d, want 2 (park retried on the next pass)", parkAttempts)
 	}
 }
 

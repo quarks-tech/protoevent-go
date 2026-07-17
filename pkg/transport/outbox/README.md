@@ -471,6 +471,8 @@ stream position.
    recovery silently drops that event forever (the token was already reset):
 
    ```go
+   // Prefixed instances (WithCollectionPrefix): read "<prefix>outbox_messages",
+   // matching the "<prefix>outbox_offsets" row consulted in step 2.
    cur, err := db.Collection("outbox_messages").Find(ctx,
        bson.M{"create_time": bson.M{"$gte": gapStart.Add(-overlap)}}, // overlap ≥ 1 oplog-lag margin, e.g. 5m
        options.Find().SetSort(bson.D{{Key: "create_time", Value: 1}}))
