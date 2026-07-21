@@ -74,7 +74,10 @@ func ProcessWithDrain(
 
 		return command(commandCtx, conn)
 	})
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	// The command path already joined ctxErr in its defer — only join here
+	// when the error doesn't carry it yet (e.g. cancellation during
+	// connection acquisition), or the chain would hold ctxErr twice.
+	if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
 		return errors.Join(ctxErr, err)
 	}
 
