@@ -178,6 +178,106 @@ func TestWaitForConsumerStopCancelsConsumerWhenWorkerFails(t *testing.T) {
 	}
 }
 
+// TestWaitForConsumerStopCleanNotifyCloseReturnsNil is the regression test
+// for the typed-nil bug: a clean AMQP shutdown CLOSES the notify channel
+// without sending, the receive yields a nil *amqp.Error, and returning it
+// directly wraps a nil pointer in a non-nil error interface — orderly closure
+// then reads as a failure to the errgroup.
+func TestWaitForConsumerStopCleanNotifyCloseReturnsNil(t *testing.T) {
+	notifyClose := make(chan *amqp.Error)
+	close(notifyClose)
+
+	var cancelCalled atomic.Bool
+	err := WaitForConsumerStop(
+		t.Context(),
+		make(chan struct{}),
+		make(chan struct{}),
+		func() error {
+			cancelCalled.Store(true)
+
+			return nil
+		},
+		notifyClose,
+	)
+	if err != nil {
+		t.Fatalf("WaitForConsumerStop() error = %v (typed-nil *amqp.Error?), want nil", err)
+	}
+	if cancelCalled.Load() {
+		t.Fatal("WaitForConsumerStop canceled the consumer on a clean close")
+	}
+}
+
+// TestWaitForConsumerStopNotifyCloseError proves a real connection error still
+// propagates (the nil-guard must not swallow genuine failures).
+func TestWaitForConsumerStopNotifyCloseError(t *testing.T) {
+	notifyClose := make(chan *amqp.Error, 1)
+	connErr := &amqp.Error{Code: amqp.ConnectionForced, Reason: "broker restart"}
+	notifyClose <- connErr
+
+	err := WaitForConsumerStop(
+		t.Context(),
+		make(chan struct{}),
+		make(chan struct{}),
+		func() error { return nil },
+		notifyClose,
+	)
+	if !errors.Is(err, connErr) {
+		t.Fatalf("WaitForConsumerStop() error = %v, want %v", err, connErr)
+	}
+}
+
+// TestWaitForConsumerStopWorkerDoneNeedsNoCancel pins the completed-worker
+// path: no cancellation, nil error.
+func TestWaitForConsumerStopWorkerDoneNeedsNoCancel(t *testing.T) {
+	workerDone := make(chan struct{})
+	close(workerDone)
+
+	var cancelCalled atomic.Bool
+	err := WaitForConsumerStop(
+		t.Context(),
+		make(chan struct{}),
+		workerDone,
+		func() error {
+			cancelCalled.Store(true)
+
+			return nil
+		},
+		make(chan *amqp.Error),
+	)
+	if err != nil {
+		t.Fatalf("WaitForConsumerStop() error = %v, want nil", err)
+	}
+	if cancelCalled.Load() {
+		t.Fatal("WaitForConsumerStop canceled the consumer after a completed worker")
+	}
+}
+
+// TestWaitForConsumerStopShutdownCancelsConsumer pins the shutdown path: the
+// consumer is canceled and the cancel error (nil here) is returned.
+func TestWaitForConsumerStopShutdownCancelsConsumer(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	var cancelCalled atomic.Bool
+	err := WaitForConsumerStop(
+		ctx,
+		make(chan struct{}),
+		make(chan struct{}),
+		func() error {
+			cancelCalled.Store(true)
+
+			return nil
+		},
+		make(chan *amqp.Error),
+	)
+	if err != nil {
+		t.Fatalf("WaitForConsumerStop() error = %v, want nil", err)
+	}
+	if !cancelCalled.Load() {
+		t.Fatal("WaitForConsumerStop did not cancel the consumer on shutdown")
+	}
+}
+
 func TestDrainDeliveriesSignalsFailureAndContinuesDraining(t *testing.T) {
 	deliveries := make(chan amqp.Delivery, 2)
 	deliveries <- amqp.Delivery{DeliveryTag: 1}

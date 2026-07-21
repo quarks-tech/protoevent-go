@@ -68,14 +68,22 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 	md := new(event.Metadata)
 
 	// require extracts (and consumes) a mandatory envelope attribute; the
-	// leftover dto entries become extensions below.
+	// leftover dto entries become extensions below. Decoding via
+	// json.Unmarshal (not quote-trimming) rejects null/number/object values
+	// and interprets escape sequences — CloudEvents required attributes are
+	// non-empty JSON strings.
 	require := func(key string) (string, error) {
 		raw, ok := dto[key]
 		if !ok {
 			return "", fmt.Errorf("required attribute '%s' is missing", key)
 		}
 		delete(dto, key)
-		return strings.Trim(string(raw), "\""), nil
+
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil || value == "" {
+			return "", fmt.Errorf("required attribute '%s' must be a non-empty string", key)
+		}
+		return value, nil
 	}
 
 	var err error

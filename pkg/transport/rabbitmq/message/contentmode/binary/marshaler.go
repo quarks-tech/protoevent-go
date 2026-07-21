@@ -71,10 +71,11 @@ func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 	}
 
 	// require extracts a mandatory cloudEvents header (always string-typed
-	// on the wire; a wrong-typed value reads as missing on purpose).
+	// on the wire; a wrong-typed or empty value reads as missing on purpose,
+	// matching the d.Type guard above).
 	require := func(key string) (string, error) {
 		v, ok := d.Headers["cloudEvents:"+key].(string)
-		if !ok {
+		if !ok || v == "" {
 			return "", fmt.Errorf("required attribute '%s' is missing", key)
 		}
 		return v, nil

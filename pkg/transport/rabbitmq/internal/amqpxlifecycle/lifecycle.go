@@ -4,6 +4,7 @@ package amqpxlifecycle
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 
@@ -64,14 +65,17 @@ func ProcessWithDrain(
 			stateMu.Unlock()
 
 			if ctxErr != nil {
-				err = ctxErr
+				// Join rather than replace: the caller must see the shutdown
+				// signal (errors.Is(err, ctx.Err()) still matches), but a real
+				// command failure mid-drain must not be masked by it.
+				err = errors.Join(ctxErr, err)
 			}
 		}()
 
 		return command(commandCtx, conn)
 	})
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
+		return errors.Join(ctxErr, err)
 	}
 
 	return err
@@ -96,7 +100,15 @@ func WaitForConsumerStop(
 	case <-workerDone:
 		return nil
 	case connErr := <-notifyClose:
-		return connErr
+		// A clean AMQP shutdown CLOSES the notify channel without sending, so
+		// the receive yields a nil *amqp.Error — returning that directly would
+		// wrap a nil pointer in a non-nil error interface and make orderly
+		// closure look like a failure to the errgroup.
+		if connErr != nil {
+			return connErr
+		}
+
+		return nil
 	}
 }
 
