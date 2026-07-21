@@ -147,6 +147,17 @@ VALUES (NULL, NULLIF(@@tidb_current_ts, 0), ?, ?, ?, NOW(6), ?)`, c.prefix+baseM
 
 var _ outbox.Store = (*Store)(nil)
 
+// Compile-time capability pins for *RelayStore: the sequence runtime discovers
+// every optional capability by type assertion, so signature drift would
+// otherwise downgrade silently (always-leader, no sequencer, no sweep,
+// expire-by-TTL shutdown).
+var (
+	_ sequence.Sequencer       = (*RelayStore)(nil)
+	_ sequence.Sweeper         = (*RelayStore)(nil)
+	_ relay.LeaderStore        = (*RelayStore)(nil)
+	_ relay.LeaderLockReleaser = (*RelayStore)(nil)
+)
+
 // RelayStore is the pool-backed relay store: everything the relay runtimes
 // need — read/offset, the sequencer, the retention sweep, and leader
 // election. These all manage their own transactions against the pool, so they

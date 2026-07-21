@@ -13,10 +13,18 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/stream"
 )
 
-var _ stream.Store = (*Store)(nil)
+// Compile-time capability pins: the runtime discovers LeaderStore and the
+// optional releaser by type assertion, so signature drift would otherwise
+// downgrade silently to always-leader / expire-by-TTL.
+var (
+	_ stream.Store             = (*Store)(nil)
+	_ relay.LeaderStore        = (*Store)(nil)
+	_ relay.LeaderLockReleaser = (*Store)(nil)
+)
 
 // resumeTokenTimestampMarker is the KeyString type marker that opens a resume
 // token's _data payload, immediately followed by the big-endian clusterTime.

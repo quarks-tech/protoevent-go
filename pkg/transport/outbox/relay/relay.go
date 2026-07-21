@@ -89,6 +89,16 @@ type LeaderStore interface {
 	// (dual leader) under clock skew between relay instances. Both reference
 	// implementations do this (TiDB NOW(6), MongoDB $$NOW).
 	TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error)
+}
+
+// LeaderLockReleaser is the OPTIONAL graceful-release capability alongside
+// LeaderStore: on shutdown the relay releases the lock so a standby takes
+// over immediately instead of waiting out the lease TTL. It is optional
+// because release is a courtesy, not a correctness requirement — a store
+// that cannot conditionally delete an owner-checked lock row simply skips it
+// and failover degrades to at most one lease TTL of delay. Both reference
+// implementations provide it.
+type LeaderLockReleaser interface {
 	// ReleaseLeaderLock releases the lock if held by holderID (graceful shutdown).
 	ReleaseLeaderLock(ctx context.Context, name, holderID string) error
 }

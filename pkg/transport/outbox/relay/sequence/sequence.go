@@ -348,6 +348,13 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		options.Logger.Info("sequence relay: store has no relay.LeaderStore capability; running always-leader (single-instance mode)",
 			"relay", name)
 	}
+	if _, canRelease := store.(relay.LeaderLockReleaser); hasLeaderStore && !canRelease {
+		// Also a documented degraded mode, also not silent: without the
+		// optional releaser a graceful shutdown leaves the lease to expire,
+		// delaying standby takeover by up to one LeaseTTL.
+		options.Logger.Info("sequence relay: store has no relay.LeaderLockReleaser capability; on shutdown the leader lease expires by TTL instead of releasing immediately",
+			"relay", name)
+	}
 
 	r := &Relay{
 		name: name,

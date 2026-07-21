@@ -36,18 +36,17 @@ type Elector struct {
 	isLeader atomic.Bool
 }
 
-// nopLeaderStore is the null LeaderStore: every acquire is granted and
-// release is a no-op. NewElector substitutes it for a nil ls — it is
-// the EXPLICIT single-instance mode, not an implementation of the LeaderStore
-// contract: it provides no mutual exclusion and consults no clock. Do not use
-// it as a reference implementation.
+// nopLeaderStore is the null LeaderStore: every acquire is granted. NewElector
+// substitutes it for a nil ls — it is the EXPLICIT single-instance mode, not
+// an implementation of the LeaderStore contract: it provides no mutual
+// exclusion and consults no clock. Do not use it as a reference
+// implementation. It deliberately lacks LeaderLockReleaser (there is nothing
+// to release), which also exercises the optional-capability path.
 type nopLeaderStore struct{}
 
 func (nopLeaderStore) TryAcquireLeaderLock(context.Context, string, string, time.Duration) (bool, error) {
 	return true, nil
 }
-
-func (nopLeaderStore) ReleaseLeaderLock(context.Context, string, string) error { return nil }
 
 // NewElector builds a Elector over ls. ls may be nil: a nil
 // LeaderStore means no election — a nopLeaderStore is substituted and the
@@ -79,9 +78,12 @@ func (e *Elector) TryAcquire(ctx context.Context) (bool, error) {
 }
 
 // Release drops the lock if this elector currently holds it. No-op (nil) if
-// leadership was never acquired. Uses a fresh context.Background() with an
-// internal timeout, not the caller's ctx, since this typically runs on a
-// shutdown path where ctx may already be canceled.
+// leadership was never acquired, or if the store lacks the OPTIONAL
+// relay.LeaderLockReleaser capability — the lease then expires by TTL and a
+// standby takes over after at most one lease term instead of immediately.
+// Uses a fresh context.Background() with an internal timeout, not the
+// caller's ctx, since this typically runs on a shutdown path where ctx may
+// already be canceled.
 //
 // The flag is swapped false BEFORE the store call: a lost graceful release
 // costs at most one lease-TTL of delayed failover (the lock expires on its
@@ -96,7 +98,11 @@ func (e *Elector) Release() error {
 	if !e.isLeader.Swap(false) {
 		return nil
 	}
+	releaser, ok := e.ls.(relay.LeaderLockReleaser)
+	if !ok {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
 	defer cancel()
-	return e.ls.ReleaseLeaderLock(ctx, e.lockName, e.holderID)
+	return releaser.ReleaseLeaderLock(ctx, e.lockName, e.holderID)
 }
