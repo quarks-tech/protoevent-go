@@ -67,37 +67,33 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 
 	md := new(event.Metadata)
 
-	if raw, ok := dto["specversion"]; ok {
-		md.SpecVersion = strings.Trim(string(raw), "\"")
-
-		delete(dto, "specversion")
-	} else {
+	raw, ok := dto["specversion"]
+	if !ok {
 		return nil, nil, errors.New("required attribute 'specversion' is missing")
 	}
+	md.SpecVersion = strings.Trim(string(raw), "\"")
+	delete(dto, "specversion")
 
-	if raw, ok := dto["type"]; ok {
-		md.Type = strings.Trim(string(raw), "\"")
-
-		delete(dto, "type")
-	} else {
+	raw, ok = dto["type"]
+	if !ok {
 		return nil, nil, errors.New("required attribute 'type' is missing")
 	}
+	md.Type = strings.Trim(string(raw), "\"")
+	delete(dto, "type")
 
-	if raw, ok := dto["id"]; ok {
-		md.ID = strings.Trim(string(raw), "\"")
-
-		delete(dto, "id")
-	} else {
+	raw, ok = dto["id"]
+	if !ok {
 		return nil, nil, errors.New("required attribute 'id' is missing")
 	}
+	md.ID = strings.Trim(string(raw), "\"")
+	delete(dto, "id")
 
-	if raw, ok := dto["source"]; ok {
-		md.Source = strings.Trim(string(raw), "\"")
-
-		delete(dto, "source")
-	} else {
+	raw, ok = dto["source"]
+	if !ok {
 		return nil, nil, errors.New("required attribute 'source' is missing")
 	}
+	md.Source = strings.Trim(string(raw), "\"")
+	delete(dto, "source")
 
 	if raw, ok := dto["subject"]; ok {
 		md.Subject = strings.Trim(string(raw), "\"")
@@ -133,15 +129,12 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 		delete(dto, "datacontenttype")
 	}
 
-	var data []byte
-
-	if raw, ok := dto["data"]; ok {
-		data = raw
-
-		delete(dto, "data")
-	} else {
+	raw, ok = dto["data"]
+	if !ok {
 		return nil, nil, errors.New("required attribute 'data' is missing")
 	}
+	data := []byte(raw)
+	delete(dto, "data")
 
 	for k, raw := range dto {
 		if md.Extensions == nil {

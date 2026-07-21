@@ -82,9 +82,9 @@ func Leadership(o relay.Observer, log *slog.Logger, runtime, name string, isLead
 	if o.OnLeadership != nil {
 		o.OnLeadership(name, isLeader)
 	}
+	msg := runtime + " relay: lost leadership"
 	if isLeader {
-		log.Info(runtime+" relay: became leader", "relay", name)
-	} else {
-		log.Info(runtime+" relay: lost leadership", "relay", name)
+		msg = runtime + " relay: became leader"
 	}
+	log.Info(msg, "relay", name)
 }

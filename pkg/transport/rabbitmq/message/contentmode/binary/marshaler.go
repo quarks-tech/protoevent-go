@@ -70,23 +70,23 @@ func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 		Type:            d.Type,
 	}
 
-	if v, ok := d.Headers["cloudEvents:specversion"].(string); ok {
-		md.SpecVersion = v
-	} else {
+	v, ok := d.Headers["cloudEvents:specversion"].(string)
+	if !ok {
 		return nil, errors.New("required attribute 'specversion' is missing")
 	}
+	md.SpecVersion = v
 
-	if v, ok := d.Headers["cloudEvents:id"].(string); ok {
-		md.ID = v
-	} else {
+	v, ok = d.Headers["cloudEvents:id"].(string)
+	if !ok {
 		return nil, errors.New("required attribute 'id' is missing")
 	}
+	md.ID = v
 
-	if v, ok := d.Headers["cloudEvents:source"].(string); ok {
-		md.Source = v
-	} else {
+	v, ok = d.Headers["cloudEvents:source"].(string)
+	if !ok {
 		return nil, errors.New("required attribute 'source' is missing")
 	}
+	md.Source = v
 
 	if v, ok := d.Headers["cloudEvents:subject"].(string); ok {
 		md.Subject = v

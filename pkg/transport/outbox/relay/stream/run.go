@@ -254,12 +254,16 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		// when the token is unchanged since the last save (an idle stream would
 		// otherwise persist the same position every DrainWindow) — the lag
 		// bookkeeping still advances locally.
-		if tok, ct := r.stream.Checkpoint(); tok != "" {
-			if tok == r.lastSavedTok {
-				r.committedCT = ct
-			} else if err := r.saveToken(ctx, tok, ct); err != nil {
-				return err
-			}
+		tok, ct := r.stream.Checkpoint()
+		if tok == "" {
+			break
+		}
+		if tok == r.lastSavedTok {
+			r.committedCT = ct
+			break
+		}
+		if err := r.saveToken(ctx, tok, ct); err != nil {
+			return err
 		}
 	}
 

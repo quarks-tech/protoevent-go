@@ -46,8 +46,12 @@ func defaultSenderOptions() senderOptions {
 
 type SenderOption func(opts *senderOptions)
 
+type commandProcessor interface {
+	Process(context.Context, amqpx.Command) error
+}
+
 type Sender struct {
-	client  *amqpx.Client
+	client  commandProcessor
 	options senderOptions
 }
 
@@ -87,7 +91,7 @@ func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) er
 	routingKey := mess.Type[pos+1:]
 
 	return s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
-		if err := conn.Channel().Publish(exchange, routingKey, false, false, mess); err != nil {
+		if err := conn.Channel().PublishWithContext(ctx, exchange, routingKey, false, false, mess); err != nil {
 			return fmt.Errorf("publish to exchange %q: %w", exchange, err)
 		}
 

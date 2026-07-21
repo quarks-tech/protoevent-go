@@ -14,6 +14,7 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/amqpxlifecycle"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
 )
 
@@ -215,60 +216,85 @@ func (r *Receiver) setupBindings(conn *connpool.Conn, infos []eventbus.ServiceIn
 	return nil
 }
 
-func (r *Receiver) Receive(ctx context.Context, processor eventbus.Processor) error {
-	return r.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
-		return r.receive(ctx, conn, processor)
+func (r *Receiver) Receive(shutdownCtx context.Context, processor eventbus.Processor) error {
+	return amqpxlifecycle.ProcessWithDrain(shutdownCtx, r.client.Process, func(commandCtx context.Context, conn *connpool.Conn) error {
+		return r.receive(shutdownCtx, commandCtx, conn, processor)
 	})
 }
 
-// The consume errgroup is deliberately detached from ctx: cancellation must
-// stop the consumer and let in-flight deliveries drain instead of aborting
-// the group, so ctx is watched explicitly in the control goroutine.
-//
-//nolint:contextcheck
-func (r *Receiver) receive(ctx context.Context, conn *connpool.Conn, processor eventbus.Processor) error {
-	if err := conn.Channel().Qos(r.options.prefetchCount, 0, false); err != nil {
+// The consume errgroup is deliberately detached from shutdownCtx: cancellation
+// stops the consumer while the amqpx command context and borrowed connection
+// remain alive until buffered and in-flight deliveries drain.
+func (r *Receiver) receive(
+	shutdownCtx context.Context,
+	commandCtx context.Context,
+	conn *connpool.Conn,
+	processor eventbus.Processor,
+) error {
+	channel := conn.Channel()
+	if err := channel.Qos(r.options.prefetchCount, 0, false); err != nil {
 		return fmt.Errorf("set channel qos: %w", err)
 	}
 
-	deliveries, err := conn.Channel().Consume(r.options.incomingQueue, r.options.consumerTag, false, false, false, false, nil)
+	// ConsumeWithContext owns a goroutine that may call Channel.Cancel after the
+	// command returns. Cancellation is kept inside this joined command instead.
+	deliveries, err := channel.Consume(
+		r.options.incomingQueue,
+		r.options.consumerTag,
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
 	if err != nil {
 		return fmt.Errorf("consume queue %q: %w", r.options.incomingQueue, err)
 	}
 
 	eg, egCtx := errgroup.WithContext(context.Background())
+	workerFailed := make(chan struct{})
+	workerDone := make(chan struct{})
+	notifyClose := channel.NotifyClose(make(chan *amqp.Error, 1))
 
 	eg.Go(func() error {
-		select {
-		case <-ctx.Done():
-			if cErr := conn.Channel().Cancel(r.options.consumerTag, false); cErr != nil {
-				return fmt.Errorf("cancel consumer %q: %w", r.options.consumerTag, cErr)
-			}
+		return amqpxlifecycle.WaitForConsumerStop(
+			shutdownCtx,
+			workerFailed,
+			workerDone,
+			func() error {
+				if cErr := channel.Cancel(r.options.consumerTag, false); cErr != nil {
+					return fmt.Errorf("cancel consumer %q: %w", r.options.consumerTag, cErr)
+				}
 
-			return nil
-		case <-egCtx.Done():
-			if cErr := conn.Close(); cErr != nil {
-				return fmt.Errorf("close connection: %w", cErr)
-			}
-
-			return nil
-		case connErr := <-conn.NotifyClose(make(chan *amqp.Error)):
-			return connErr
-		}
+				return nil
+			},
+			notifyClose,
+		)
 	})
 
 	eg.Go(func() error {
-		for delivery := range deliveries {
-			select {
-			case <-egCtx.Done():
-				return nil
-			default:
-				dErr := r.processDelivery(&delivery, processor)
+		defer close(workerDone)
 
-				if ackErr := r.doAcknowledge(conn, &delivery, dErr); ackErr != nil {
+		err := amqpxlifecycle.DrainDeliveries(
+			egCtx,
+			shutdownCtx,
+			deliveries,
+			workerFailed,
+			func(groupCtx context.Context, delivery *amqp.Delivery) error {
+				dErr := r.processDelivery(delivery, processor)
+				if groupCtx.Err() != nil {
+					return nil
+				}
+
+				if ackErr := r.doAcknowledge(commandCtx, conn, delivery, dErr); ackErr != nil {
 					return fmt.Errorf("do acknowledge: %w", ackErr)
 				}
-			}
+
+				return nil
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("drain deliveries: %w", err)
 		}
 
 		return nil
@@ -290,14 +316,14 @@ func (r *Receiver) processDelivery(delivery *amqp.Delivery, processor eventbus.P
 	return eventbus.NewUnprocessableEventError(err)
 }
 
-func (r *Receiver) doAcknowledge(conn *connpool.Conn, d *amqp.Delivery, err error) error {
+func (r *Receiver) doAcknowledge(ctx context.Context, conn *connpool.Conn, d *amqp.Delivery, err error) error {
 	switch {
 	case err == nil:
 		if aErr := d.Ack(false); aErr != nil {
 			return fmt.Errorf("ack delivery: %w", aErr)
 		}
 	case eventbus.IsUnprocessableEventError(err), hasExceededRetryCount(d, r.options.maxRetries):
-		return r.putIntoParkingLot(conn, d)
+		return r.putIntoParkingLot(ctx, conn, d)
 	default:
 		if rErr := d.Reject(false); rErr != nil {
 			return fmt.Errorf("reject delivery: %w", rErr)
@@ -307,7 +333,7 @@ func (r *Receiver) doAcknowledge(conn *connpool.Conn, d *amqp.Delivery, err erro
 	return nil
 }
 
-func (r *Receiver) putIntoParkingLot(conn *connpool.Conn, d *amqp.Delivery) error {
+func (r *Receiver) putIntoParkingLot(ctx context.Context, conn *connpool.Conn, d *amqp.Delivery) error {
 	msg := amqp.Publishing{
 		Headers:         d.Headers,
 		Type:            d.Type,
@@ -317,7 +343,7 @@ func (r *Receiver) putIntoParkingLot(conn *connpool.Conn, d *amqp.Delivery) erro
 		Body:            d.Body,
 	}
 
-	err := conn.Channel().Publish(r.options.dlxExchange, parkingLot, false, false, msg)
+	err := conn.Channel().PublishWithContext(ctx, r.options.dlxExchange, parkingLot, false, false, msg)
 	if err != nil {
 		return fmt.Errorf("put into parking lot: %w", err)
 	}

@@ -166,12 +166,13 @@ func main() {
 
     // Create AMQP client
     client := amqpx.NewClient(&amqpx.Config{
-        Host:     "localhost",
-        Port:     5672,
-        Username: "guest",
-        Password: "guest",
+        Address: "guest:guest@localhost:5672/",
     })
-    defer client.Close()
+    defer func() {
+        if err := client.Close(); err != nil {
+            log.Printf("close AMQP client: %v", err)
+        }
+    }()
 
     // Publisher
     sender := rabbitmq.NewSender(client)
@@ -218,12 +219,13 @@ func main() {
     ctx := context.Background()
 
     client := amqpx.NewClient(&amqpx.Config{
-        Host:     "localhost",
-        Port:     5672,
-        Username: "guest",
-        Password: "guest",
+        Address: "guest:guest@localhost:5672/",
     })
-    defer client.Close()
+    defer func() {
+        if err := client.Close(); err != nil {
+            log.Printf("close AMQP client: %v", err)
+        }
+    }()
 
     // Subscriber with topology setup
     subscriber := eventbus.NewSubscriber("books-consumer")
