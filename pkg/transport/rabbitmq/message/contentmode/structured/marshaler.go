@@ -67,33 +67,30 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 
 	md := new(event.Metadata)
 
-	raw, ok := dto["specversion"]
-	if !ok {
-		return nil, nil, errors.New("required attribute 'specversion' is missing")
+	// require extracts (and consumes) a mandatory envelope attribute; the
+	// leftover dto entries become extensions below.
+	require := func(key string) (string, error) {
+		raw, ok := dto[key]
+		if !ok {
+			return "", fmt.Errorf("required attribute '%s' is missing", key)
+		}
+		delete(dto, key)
+		return strings.Trim(string(raw), "\""), nil
 	}
-	md.SpecVersion = strings.Trim(string(raw), "\"")
-	delete(dto, "specversion")
 
-	raw, ok = dto["type"]
-	if !ok {
-		return nil, nil, errors.New("required attribute 'type' is missing")
+	var err error
+	if md.SpecVersion, err = require("specversion"); err != nil {
+		return nil, nil, err
 	}
-	md.Type = strings.Trim(string(raw), "\"")
-	delete(dto, "type")
-
-	raw, ok = dto["id"]
-	if !ok {
-		return nil, nil, errors.New("required attribute 'id' is missing")
+	if md.Type, err = require("type"); err != nil {
+		return nil, nil, err
 	}
-	md.ID = strings.Trim(string(raw), "\"")
-	delete(dto, "id")
-
-	raw, ok = dto["source"]
-	if !ok {
-		return nil, nil, errors.New("required attribute 'source' is missing")
+	if md.ID, err = require("id"); err != nil {
+		return nil, nil, err
 	}
-	md.Source = strings.Trim(string(raw), "\"")
-	delete(dto, "source")
+	if md.Source, err = require("source"); err != nil {
+		return nil, nil, err
+	}
 
 	if raw, ok := dto["subject"]; ok {
 		md.Subject = strings.Trim(string(raw), "\"")
@@ -129,11 +126,12 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 		delete(dto, "datacontenttype")
 	}
 
-	raw, ok = dto["data"]
+	// data is required too, but stays raw bytes: no quote-trimming.
+	rawData, ok := dto["data"]
 	if !ok {
 		return nil, nil, errors.New("required attribute 'data' is missing")
 	}
-	data := []byte(raw)
+	data := []byte(rawData)
 	delete(dto, "data")
 
 	for k, raw := range dto {

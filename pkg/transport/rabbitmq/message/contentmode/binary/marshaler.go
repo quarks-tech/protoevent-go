@@ -70,23 +70,26 @@ func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 		Type:            d.Type,
 	}
 
-	v, ok := d.Headers["cloudEvents:specversion"].(string)
-	if !ok {
-		return nil, errors.New("required attribute 'specversion' is missing")
+	// require extracts a mandatory cloudEvents header (always string-typed
+	// on the wire; a wrong-typed value reads as missing on purpose).
+	require := func(key string) (string, error) {
+		v, ok := d.Headers["cloudEvents:"+key].(string)
+		if !ok {
+			return "", fmt.Errorf("required attribute '%s' is missing", key)
+		}
+		return v, nil
 	}
-	md.SpecVersion = v
 
-	v, ok = d.Headers["cloudEvents:id"].(string)
-	if !ok {
-		return nil, errors.New("required attribute 'id' is missing")
+	var err error
+	if md.SpecVersion, err = require("specversion"); err != nil {
+		return nil, err
 	}
-	md.ID = v
-
-	v, ok = d.Headers["cloudEvents:source"].(string)
-	if !ok {
-		return nil, errors.New("required attribute 'source' is missing")
+	if md.ID, err = require("id"); err != nil {
+		return nil, err
 	}
-	md.Source = v
+	if md.Source, err = require("source"); err != nil {
+		return nil, err
+	}
 
 	if v, ok := d.Headers["cloudEvents:subject"].(string); ok {
 		md.Subject = v

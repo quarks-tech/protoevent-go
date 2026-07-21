@@ -443,14 +443,14 @@ func TestSaveTokenSameSecondTokenOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	if tok != tokMid || !gotCT.Equal(ct) {
-		t.Fatalf("after same-second stale save: token rewound (got early=%v), want mid kept", tok == tokEarly)
+		t.Fatalf("after same-second stale save: token changed, want mid kept (early=%v late=%v ct=%v)", tok == tokEarly, tok == tokLate, gotCT)
 	}
 	// Same second, later token: must advance.
 	if persisted, err := st.SaveToken(ctx, "c", tokLate, ct); err != nil || !persisted {
 		t.Fatalf("same-second later save: persisted=%v err=%v, want true, nil", persisted, err)
 	}
 	if tok, _, err = st.LoadToken(ctx, "c"); err != nil || tok != tokLate {
-		t.Fatalf("after same-second later save: token = late? %v err=%v, want true", tok == tokLate, err)
+		t.Fatalf("after same-second later save: token not advanced to late (mid=%v early=%v) err=%v", tok == tokMid, tok == tokEarly, err)
 	}
 	// Idempotent re-save of the stored token is accepted ($lte equality path).
 	if persisted, err := st.SaveToken(ctx, "c", tokLate, ct); err != nil || !persisted {
@@ -500,7 +500,7 @@ func TestSaveTokenKeyedSaveRespectsCoarseGuardOnLegacyRow(t *testing.T) {
 		t.Fatalf("newer keyed save: persisted=%v err=%v, want true, nil", persisted, err)
 	}
 	if tok, _, err := st.LoadToken(ctx, "c"); err != nil || tok != fresh {
-		t.Fatalf("row not healed onto keyed save: err=%v", err)
+		t.Fatalf("row not healed onto keyed save (still opaque=%v stale=%v) err=%v", tok == "opaque-tok", tok == stale, err)
 	}
 }
 
