@@ -149,13 +149,11 @@ var _ outbox.Store = (*Store)(nil)
 
 // Compile-time capability pins for *RelayStore: the sequence runtime discovers
 // every optional capability by type assertion, so signature drift would
-// otherwise downgrade silently (always-leader, no sequencer, no sweep,
-// expire-by-TTL shutdown).
+// otherwise downgrade silently (always-leader, no sequencer, no sweep).
 var (
-	_ sequence.Sequencer       = (*RelayStore)(nil)
-	_ sequence.Sweeper         = (*RelayStore)(nil)
-	_ relay.LeaderStore        = (*RelayStore)(nil)
-	_ relay.LeaderLockReleaser = (*RelayStore)(nil)
+	_ sequence.Sequencer = (*RelayStore)(nil)
+	_ sequence.Sweeper   = (*RelayStore)(nil)
+	_ relay.LeaderStore  = (*RelayStore)(nil)
 )
 
 // RelayStore is the pool-backed relay store: everything the relay runtimes

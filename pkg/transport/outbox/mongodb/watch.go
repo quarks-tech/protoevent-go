@@ -17,13 +17,12 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/stream"
 )
 
-// Compile-time capability pins: the runtime discovers LeaderStore and the
-// optional releaser by type assertion, so signature drift would otherwise
-// downgrade silently to always-leader / expire-by-TTL.
+// Compile-time capability pins: the runtime discovers LeaderStore by type
+// assertion, so signature drift would otherwise downgrade silently to
+// always-leader.
 var (
-	_ stream.Store             = (*Store)(nil)
-	_ relay.LeaderStore        = (*Store)(nil)
-	_ relay.LeaderLockReleaser = (*Store)(nil)
+	_ stream.Store      = (*Store)(nil)
+	_ relay.LeaderStore = (*Store)(nil)
 )
 
 // resumeTokenTimestampMarker is the KeyString type marker that opens a resume

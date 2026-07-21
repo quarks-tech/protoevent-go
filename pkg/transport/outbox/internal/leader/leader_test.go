@@ -239,27 +239,3 @@ func TestNilLeaderStoreReleaseIsNoop(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 }
-
-// acquireOnlyLeaderStore implements relay.LeaderStore WITHOUT the optional
-// relay.LeaderLockReleaser capability.
-type acquireOnlyLeaderStore struct{}
-
-func (acquireOnlyLeaderStore) TryAcquireLeaderLock(context.Context, string, string, time.Duration) (bool, error) {
-	return true, nil
-}
-
-// TestReleaseSkippedWithoutReleaserCapability pins the optional-releaser
-// contract: a LeaderStore lacking relay.LeaderLockReleaser must make Release a
-// clean no-op (the lease expires by TTL and a standby takes over one lease
-// term later), never a panic or an error.
-func TestReleaseSkippedWithoutReleaserCapability(t *testing.T) {
-	e := leader.NewElector(acquireOnlyLeaderStore{}, "lock", "holder-1", time.Second)
-
-	held, err := e.TryAcquire(t.Context())
-	if err != nil || !held {
-		t.Fatalf("TryAcquire = %v, %v; want true, nil", held, err)
-	}
-	if err := e.Release(); err != nil {
-		t.Fatalf("Release without releaser capability: %v, want nil (expire-by-TTL mode)", err)
-	}
-}
