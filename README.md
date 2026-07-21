@@ -272,7 +272,7 @@ one Kafka partition) and support independent consumer groups, each with its
 own offset/resume token; a new group starts at "latest" (future events only)
 by default.
 
-```
+```text
 ┌──────────────┐  insert (seq=NULL)   ┌──────────────────┐
 │  business tx │ ────────────────────►│   outbox (log)    │
 └──────────────┘                      └─────────┬────────┘

@@ -10,9 +10,9 @@ const (
 )
 
 // ContentSubtype extracts the codec-selecting subtype from a content type:
-// "application/cloudevents+proto" and "application/proto" both yield
-// ("proto", true). Returns ok=false for content types outside the
-// application/ (or application/cloudevents+) families, for a bare
+// "application/cloudevents+proto", "application/cloudevents;proto", and
+// "application/proto" all yield ("proto", true). Returns ok=false for content
+// types outside the application/ family, for a bare
 // "application"/"application/cloudevents" with no subtype, and for
 // non-"application/"-delimited lookalikes ("applicationfoo").
 //

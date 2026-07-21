@@ -28,9 +28,11 @@ type Message struct {
 	// Data is the serialized event payload.
 	Data []byte
 
-	// CreateTime is when the message was inserted into the outbox (stamped by
-	// the Sender at publish). Distinct from Metadata.Time (the event's
-	// occurred-at, which publishers may backdate). Used as the age anchor for
-	// drain-lag observability and insert-time retention.
+	// CreateTime is the insertion-time anchor. The Sender stamps it at
+	// publish; the MongoDB store persists that value (see its clock caveat),
+	// while the TiDB store ignores it and re-stamps from the database clock
+	// on insert. Distinct from Metadata.Time (the event's occurred-at, which
+	// publishers may backdate). Used as the age anchor for drain-lag
+	// observability and insert-time retention.
 	CreateTime time.Time
 }

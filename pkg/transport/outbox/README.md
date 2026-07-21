@@ -17,7 +17,7 @@ godoc.
 
 ## Package layout
 
-```
+```text
 pkg/transport/outbox/            publish side (transport-agnostic): Message, Store, Sender, PublisherFactory
 pkg/transport/outbox/relay/      primitives shared by every relay runtime: Observer, PoisonHandler, LeaderStore
 pkg/transport/outbox/relay/sequence/   TiDB sequenced-log runtime: Store/Sequencer/Sweeper, Options, Relay

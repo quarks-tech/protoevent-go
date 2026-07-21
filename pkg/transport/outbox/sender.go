@@ -46,7 +46,9 @@ func GenerateUUIDv4(_ *event.Metadata) (string, error) {
 // metadata document, under any generator; this default additionally makes the
 // row key match it.)
 //
-// Because CloudEvents ids are themselves UUIDs, this also scatters outbox
+// Because ids minted by the eventbus default generator are UUIDs (CloudEvents
+// itself allows any unique string — the TiDB store additionally requires
+// UUIDs and rejects others loudly at publish), this also scatters outbox
 // primary-key inserts across TiDB Regions the same way a freshly minted UUID
 // would (see storage ADR 012) — so the default gets hotspot avoidance and
 // identity preservation together, with no tradeoff between them.
