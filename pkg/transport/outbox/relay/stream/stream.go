@@ -71,13 +71,18 @@ type Store interface {
 	LoadToken(ctx context.Context, name string) (token string, commitTime time.Time, err error)
 
 	// SaveToken persists the resume token + its commitTime for the consumer
-	// group. Implementations MUST be monotone in commitTime: a save carrying
-	// an older commitTime than the stored row must not rewind it (a stale
-	// leader finishing a slow window could otherwise overwrite a newer
-	// position). persisted reports whether the row now holds THIS token: false
-	// means the save was classified stale and skipped — the caller must not
-	// advance its local committed-position trackers on a false return, or its
-	// lag/cliff reporting diverges from what is actually stored.
+	// group. Implementations MUST be monotone in the token's server-assigned
+	// position: a save carrying an older position than the stored row must
+	// not rewind it (a stale leader finishing a slow window could otherwise
+	// overwrite a newer position). commitTime is the coarse anchor for that
+	// guard; when the token encoding itself is ordered, implementations
+	// SHOULD compare tokens directly so ties within commitTime's granularity
+	// cannot rewind either (the mongodb store compares resume-token
+	// KeyStrings, which carry the full (T, I) timestamp). persisted reports
+	// whether the row now holds THIS token: false means the save was
+	// classified stale and skipped — the caller must not advance its local
+	// committed-position trackers on a false return, or its lag/cliff
+	// reporting diverges from what is actually stored.
 	SaveToken(ctx context.Context, name string, token string, commitTime time.Time) (persisted bool, err error)
 
 	// Watch opens a change stream on the outbox collection, filtered to inserts,

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -181,6 +182,32 @@ func clusterTimeFromToken(tok bson.Raw) (time.Time, bool) {
 	}
 	secs := binary.BigEndian.Uint32(b[1:5])
 	return time.Unix(int64(secs), 0).UTC(), true
+}
+
+// tokenKeyFromString extracts a resume token's KeyString payload as a
+// case-normalized hex string, the store's fine-grained ordering key. KeyString
+// bytes are memcmp-ordered by design (that is what makes tokens comparable
+// server-side), and fixed-width hex preserves byte order, so lexicographic
+// comparison of two keys reproduces the server's token order — including the
+// increment half of the timestamp and the document position that the
+// second-granularity clusterTime anchor truncates away. Best-effort like
+// clusterTimeFromToken: ok=false on any surprise (non-token strings, foreign
+// formats), and SaveToken falls back to the coarse clusterTime guard.
+func tokenKeyFromString(token string) (string, bool) {
+	v, err := bson.Raw(token).LookupErr("_data")
+	if err != nil {
+		return "", false
+	}
+	s, ok := v.StringValueOK()
+	if !ok || s == "" {
+		return "", false
+	}
+	// Validate it is hex before lowercasing: only then is ToLower
+	// order-preserving (all digits map within [0-9a-f]).
+	if _, err := hex.DecodeString(s); err != nil {
+		return "", false
+	}
+	return strings.ToLower(s), true
 }
 
 func (m *mongoStream) Close(ctx context.Context) error {

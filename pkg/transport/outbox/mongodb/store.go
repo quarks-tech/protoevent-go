@@ -224,6 +224,14 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) er
 		// the row on its next pass — an event lost before the relay drains it.
 		return errors.New("outbox: message create time is zero; set Message.CreateTime before publishing")
 	}
+	if msg.Metadata.Time.IsZero() {
+		// The read side (decodeMessage) classifies zero-Time metadata as
+		// poison — the marker of a JSON-valid-but-empty document. Enforcing
+		// the invariant here keeps a sloppy direct-Sender publish from
+		// planting rows the relay would park (mirrors the TiDB store, where
+		// the occur_time column makes the same rejection structural).
+		return errors.New("outbox: message metadata time is zero; set Metadata.Time before publishing")
+	}
 	if sess := mongo.SessionFromContext(ctx); sess == nil || !sess.TransactionRunning() {
 		return errors.New("outbox: create message: ctx has no running transaction; " +
 			"publish must share the business write's session (see the README's publishing example)")
@@ -261,36 +269,62 @@ func (s *Store) LoadToken(ctx context.Context, name string) (string, time.Time, 
 // restarts "at now", silently skipping every event in between). The store
 // rejects it with an error rather than trusting every caller to guard.
 //
-// The save is monotone in clusterTime (per the stream.Store contract): the
-// filter only matches a stored row whose cluster_time <= the incoming one, so
-// a stale leader finishing a slow window cannot rewind a newer position. When
-// the stored row is newer, the filter matches nothing and the upsert attempts
-// an insert, which hits the _id unique index — that duplicate-key error MEANS
-// "stored token is newer" and the stale save is skipped, reported as
-// persisted=false so the caller does not advance its local trackers past a
-// position that was never stored. A stored row LACKING cluster_time (never
-// written by this package; external tampering or manual repair) also matches,
-// so a legacy/damaged row is healed by the next save instead of freezing the
-// token forever behind the same duplicate-key path.
+// The save is monotone in the token's server-assigned position (per the
+// stream.Store contract). The ordering key is the token's own KeyString
+// payload (token_key, see tokenKeyFromString): KeyStrings compare bytewise in
+// server order, carrying the FULL (T, I) timestamp plus document position —
+// so a stale leader saving an EARLIER token within the same clusterTime
+// second is rejected too, a tie the coarse second-granularity cluster_time
+// anchor cannot see. When the incoming token is not KeyString-shaped (never
+// the case for real MongoDB resume tokens), the filter falls back to the
+// coarse monotone-in-clusterTime guard and clears token_key so the row
+// degrades coherently.
+//
+// In both modes a newer stored row makes the filter match nothing and the
+// upsert attempts an insert, which hits the _id unique index — that
+// duplicate-key error MEANS "stored position is newer" and the stale save is
+// skipped, reported as persisted=false so the caller does not advance its
+// local trackers past a position that was never stored. A stored row LACKING
+// the ordering fields (never written by this package; external tampering,
+// manual repair, or rows written before token_key existed) also matches, so a
+// legacy/damaged row is healed by the next save instead of freezing the token
+// forever behind the same duplicate-key path.
 func (s *Store) SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) (bool, error) {
 	if token == "" {
 		return false, fmt.Errorf("outbox: save token: empty resume token for group %q; an empty token is never a valid position (it would erase the stored one)", name)
 	}
-	_, err := s.db.Collection(s.collOffsets).UpdateOne(ctx,
-		bson.M{"_id": name, "$or": bson.A{
+	set := bson.M{
+		"resume_token": []byte(token),
+		"cluster_time": clusterTime.UTC(),
+		"update_time":  time.Now().UTC(),
+	}
+	update := bson.M{"$set": set}
+	var guard bson.A
+	if key, ok := tokenKeyFromString(token); ok {
+		set["token_key"] = key
+		guard = bson.A{
+			// Fine-grained: full token order, covers same-second ties.
+			bson.M{"token_key": bson.M{"$lte": key}},
+			// Rows without token_key keep the coarse guard while upgrading,
+			// so a stale keyed save cannot slip in through the $exists hole.
+			bson.M{"token_key": bson.M{"$exists": false}, "cluster_time": bson.M{"$lte": clusterTime.UTC()}},
+			bson.M{"token_key": bson.M{"$exists": false}, "cluster_time": bson.M{"$exists": false}},
+		}
+	} else {
+		update["$unset"] = bson.M{"token_key": ""}
+		guard = bson.A{
 			bson.M{"cluster_time": bson.M{"$lte": clusterTime.UTC()}},
 			bson.M{"cluster_time": bson.M{"$exists": false}},
-		}},
-		bson.M{"$set": bson.M{
-			"resume_token": []byte(token),
-			"cluster_time": clusterTime.UTC(),
-			"update_time":  time.Now().UTC(),
-		}},
+		}
+	}
+	_, err := s.db.Collection(s.collOffsets).UpdateOne(ctx,
+		bson.M{"_id": name, "$or": guard},
+		update,
 		options.UpdateOne().SetUpsert(true),
 	)
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
-			return false, nil // stored row carries a newer clusterTime; stale save skipped
+			return false, nil // stored row carries a newer position; stale save skipped
 		}
 		return false, fmt.Errorf("outbox: save token: %w", err)
 	}
@@ -388,6 +422,13 @@ func decodeMessage(doc outboxDoc) (*outbox.Message, error) {
 	}
 	if md == nil {
 		return nil, errors.New("outbox: persisted metadata is JSON null")
+	}
+	if md.Time.IsZero() {
+		// JSON-valid-but-empty metadata ("{}") decodes into a non-nil md with
+		// every field zero. The write side rejects zero Metadata.Time (see
+		// CreateOutboxMessage), so such a row was not written by this store —
+		// classify it poison like the null case (mirrors the TiDB store).
+		return nil, errors.New("outbox: persisted metadata has zero time")
 	}
 	return &outbox.Message{
 		ID:         doc.ID,

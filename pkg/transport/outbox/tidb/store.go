@@ -360,6 +360,14 @@ func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit in
 		if md == nil {
 			return out, &sequence.DecodeError{ID: id.String(), Seq: seq, Err: errors.New("persisted metadata is JSON null")}
 		}
+		if md.Time.IsZero() {
+			// JSON-valid-but-empty metadata ("{}") decodes into a non-nil md
+			// with every field zero. The write side rejects zero Metadata.Time
+			// (see CreateOutboxMessage), so such a row was not written by this
+			// store — classify it poison like the null case instead of sending
+			// an empty event downstream.
+			return out, &sequence.DecodeError{ID: id.String(), Seq: seq, Err: errors.New("persisted metadata has zero time")}
+		}
 		out = append(out, &outbox.Message{
 			ID:         id.String(),
 			Seq:        seq,

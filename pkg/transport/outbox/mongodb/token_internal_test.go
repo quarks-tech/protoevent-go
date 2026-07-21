@@ -3,6 +3,7 @@ package mongodb
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,4 +66,59 @@ func mustRaw(t *testing.T, d bson.D) bson.Raw {
 		t.Fatalf("marshal: %v", err)
 	}
 	return raw
+}
+
+// TestTokenKeyFromStringOrdersSameSecondTokens pins SaveToken's fine-grained
+// ordering key: two tokens sharing the clusterTime SECOND but differing in the
+// increment must produce keys whose lexicographic order matches the server's
+// token order — the tie the coarse cluster_time anchor cannot see.
+func TestTokenKeyFromStringOrdersSameSecondTokens(t *testing.T) {
+	const secs = uint32(1752444000)
+	mk := func(incr uint32) string {
+		payload := make([]byte, 9)
+		payload[0] = resumeTokenTimestampMarker
+		binary.BigEndian.PutUint32(payload[1:5], secs)
+		binary.BigEndian.PutUint32(payload[5:9], incr)
+		return string(rawToken(t, hex.EncodeToString(payload)))
+	}
+	k1, ok1 := tokenKeyFromString(mk(1))
+	k2, ok2 := tokenKeyFromString(mk(2))
+	if !ok1 || !ok2 {
+		t.Fatalf("ok = %v, %v for well-formed tokens, want true, true", ok1, ok2)
+	}
+	if k1 >= k2 {
+		t.Fatalf("key order broken: key(incr=1) = %q not < key(incr=2) = %q", k1, k2)
+	}
+	// Case-insensitive: the same payload hex-encoded upper-case must yield the
+	// same key (the store normalizes before comparing).
+	upper, ok := tokenKeyFromString(string(rawToken(t, strings.ToUpper(hex.EncodeToString(func() []byte {
+		p := make([]byte, 9)
+		p[0] = resumeTokenTimestampMarker
+		binary.BigEndian.PutUint32(p[1:5], secs)
+		binary.BigEndian.PutUint32(p[5:9], 1)
+		return p
+	}())))))
+	if !ok || upper != k1 {
+		t.Fatalf("upper-case token key = %q ok=%v, want %q (case-normalized)", upper, ok, k1)
+	}
+}
+
+// TestTokenKeyFromStringBestEffort proves key extraction fails soft (ok=false)
+// on every non-token shape, so SaveToken falls back to the coarse clusterTime
+// guard instead of erroring.
+func TestTokenKeyFromStringBestEffort(t *testing.T) {
+	cases := map[string]string{
+		"opaque string":  "tok1",
+		"missing _data":  string(mustRaw(t, bson.D{{Key: "other", Value: "x"}})),
+		"non-string":     string(mustRaw(t, bson.D{{Key: "_data", Value: int32(1)}})),
+		"non-hex":        string(rawToken(t, "zz")),
+		"empty payload":  string(rawToken(t, "")),
+		"malformed bson": "\x01\x02",
+		"empty":          "",
+	}
+	for name, tok := range cases {
+		if _, ok := tokenKeyFromString(tok); ok {
+			t.Errorf("%s: ok = true, want false", name)
+		}
+	}
 }

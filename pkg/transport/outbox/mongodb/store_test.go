@@ -76,9 +76,24 @@ func TestCreateOutboxMessageRejectsZeroCreateTime(t *testing.T) {
 // phantom event), before any driver call — same nil-*mongo.Database trick.
 func TestCreateOutboxMessageRejectsTransactionlessCtx(t *testing.T) {
 	st := mongodbstore.NewStore(nil)
-	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id", Metadata: event.NewMetadata("t"), CreateTime: time.Now()})
+	md := event.NewMetadata("t")
+	md.Time = time.Now()
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id", Metadata: md, CreateTime: time.Now()})
 	if err == nil || !strings.Contains(err.Error(), "transaction") {
 		t.Fatalf("expected transactionless-ctx rejection, got %v", err)
+	}
+}
+
+// TestCreateOutboxMessageRejectsZeroMetadataTime proves the write side of the
+// zero-Time invariant the read side relies on: decodeMessage classifies
+// zero-Time metadata as poison (the "{}" marker), so a publish carrying it
+// must be rejected up front instead of planting a row the relay would park.
+// Fires before any driver call (nil db).
+func TestCreateOutboxMessageRejectsZeroMetadataTime(t *testing.T) {
+	st := mongodbstore.NewStore(nil)
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id", Metadata: event.NewMetadata("t"), CreateTime: time.Now()})
+	if err == nil || !strings.Contains(err.Error(), "metadata time is zero") {
+		t.Fatalf("err = %v, want descriptive zero-metadata-time error", err)
 	}
 }
 
@@ -388,6 +403,104 @@ func TestSaveTokenMonotoneClusterTime(t *testing.T) {
 	}
 	if tok != "tok3" || !gotCT.Equal(t2) {
 		t.Fatalf("after equal-clusterTime save: token = %q ct = %v, want tok3 %v", tok, gotCT, t2)
+	}
+}
+
+// TestSaveTokenSameSecondTokenOrder pins the fine-grained CAS: real
+// (KeyString-shaped) resume tokens sharing the same clusterTime SECOND are
+// ordered by the token itself — a stale leader saving an EARLIER same-second
+// token must be rejected (persisted=false, row unchanged), while a LATER
+// same-second token still advances. The coarse cluster_time guard alone
+// cannot distinguish these ties.
+func TestSaveTokenSameSecondTokenOrder(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	ctx := context.Background()
+
+	const secs = uint32(1752444000)
+	ct := time.Unix(int64(secs), 0).UTC()
+	mkTok := func(incr uint32) string {
+		raw, err := bson.Marshal(bson.D{{Key: "_data", Value: fmt.Sprintf("82%08x%08x", secs, incr)}})
+		if err != nil {
+			t.Fatalf("marshal token: %v", err)
+		}
+		return string(raw)
+	}
+	tokEarly, tokMid, tokLate := mkTok(1), mkTok(2), mkTok(3)
+
+	if persisted, err := st.SaveToken(ctx, "c", tokMid, ct); err != nil || !persisted {
+		t.Fatalf("save mid: persisted=%v err=%v, want true, nil", persisted, err)
+	}
+	// Same second, earlier token: must be classified stale.
+	if persisted, err := st.SaveToken(ctx, "c", tokEarly, ct); err != nil || persisted {
+		t.Fatalf("same-second stale save: persisted=%v err=%v, want false, nil", persisted, err)
+	}
+	tok, gotCT, err := st.LoadToken(ctx, "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tok != tokMid || !gotCT.Equal(ct) {
+		t.Fatalf("after same-second stale save: token rewound (got early=%v), want mid kept", tok == tokEarly)
+	}
+	// Same second, later token: must advance.
+	if persisted, err := st.SaveToken(ctx, "c", tokLate, ct); err != nil || !persisted {
+		t.Fatalf("same-second later save: persisted=%v err=%v, want true, nil", persisted, err)
+	}
+	if tok, _, err = st.LoadToken(ctx, "c"); err != nil || tok != tokLate {
+		t.Fatalf("after same-second later save: token = late? %v err=%v, want true", tok == tokLate, err)
+	}
+	// Idempotent re-save of the stored token is accepted ($lte equality path).
+	if persisted, err := st.SaveToken(ctx, "c", tokLate, ct); err != nil || !persisted {
+		t.Fatalf("idempotent re-save: persisted=%v err=%v, want true, nil", persisted, err)
+	}
+}
+
+// TestSaveTokenKeyedSaveRespectsCoarseGuardOnLegacyRow proves the upgrade
+// path is not a rewind hole: a row saved WITHOUT token_key (opaque token —
+// pre-upgrade rows take the same shape) is guarded by cluster_time, so a
+// KeyString-shaped save carrying an OLDER clusterTime is still classified
+// stale, while a newer keyed save heals the row onto the fine-grained key.
+func TestSaveTokenKeyedSaveRespectsCoarseGuardOnLegacyRow(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	ctx := context.Background()
+
+	const baseSecs = uint32(1752444000)
+	base := time.Unix(int64(baseSecs), 0).UTC()
+	mkTok := func(secs uint32) string {
+		raw, err := bson.Marshal(bson.D{{Key: "_data", Value: fmt.Sprintf("82%08x%08x", secs, uint32(1))}})
+		if err != nil {
+			t.Fatalf("marshal token: %v", err)
+		}
+		return string(raw)
+	}
+
+	// Opaque token → coarse row without token_key.
+	if persisted, err := st.SaveToken(ctx, "c", "opaque-tok", base); err != nil || !persisted {
+		t.Fatalf("save opaque: persisted=%v err=%v, want true, nil", persisted, err)
+	}
+	// Keyed save with OLDER clusterTime must NOT slip in through the
+	// missing-token_key hole.
+	stale := mkTok(baseSecs - 60)
+	if persisted, err := st.SaveToken(ctx, "c", stale, base.Add(-time.Minute)); err != nil || persisted {
+		t.Fatalf("stale keyed save over coarse row: persisted=%v err=%v, want false, nil", persisted, err)
+	}
+	if tok, _, err := st.LoadToken(ctx, "c"); err != nil || tok != "opaque-tok" {
+		t.Fatalf("coarse row rewound by stale keyed save: token = %q err=%v, want opaque-tok", tok, err)
+	}
+	// Newer keyed save heals the row.
+	fresh := mkTok(baseSecs + 60)
+	if persisted, err := st.SaveToken(ctx, "c", fresh, base.Add(time.Minute)); err != nil || !persisted {
+		t.Fatalf("newer keyed save: persisted=%v err=%v, want true, nil", persisted, err)
+	}
+	if tok, _, err := st.LoadToken(ctx, "c"); err != nil || tok != fresh {
+		t.Fatalf("row not healed onto keyed save: err=%v", err)
 	}
 }
 
