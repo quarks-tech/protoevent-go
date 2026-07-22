@@ -106,17 +106,18 @@ func (m *mongoStream) Next(ctx context.Context) (*stream.Event, bool, error) {
 	// TryNext returns false when the current batch is drained WITHOUT closing
 	// the stream (respecting maxAwaitTime) — exactly the window semantics we want.
 	if !m.cs.TryNext(ctx) {
-		if err := m.cs.Err(); err != nil {
-			if isHistoryLost(err) {
-				// Wrap rather than replace: this is the break-glass runbook
-				// case, and the server error carries the diagnostics (message,
-				// code, labels) the operator needs. errors.Is still matches
-				// the sentinel.
-				return nil, false, fmt.Errorf("%w: %w", stream.ErrHistoryLost, err)
-			}
-			return nil, false, fmt.Errorf("outbox: change stream next: %w", err)
+		err := m.cs.Err()
+		if err == nil {
+			return nil, false, nil // empty window
 		}
-		return nil, false, nil // empty window
+		if isHistoryLost(err) {
+			// Wrap rather than replace: this is the break-glass runbook
+			// case, and the server error carries the diagnostics (message,
+			// code, labels) the operator needs. errors.Is still matches
+			// the sentinel.
+			return nil, false, fmt.Errorf("%w: %w", stream.ErrHistoryLost, err)
+		}
+		return nil, false, fmt.Errorf("outbox: change stream next: %w", err)
 	}
 	var ce changeEvent
 	if err := m.cs.Decode(&ce); err != nil {

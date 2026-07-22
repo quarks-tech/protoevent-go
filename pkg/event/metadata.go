@@ -21,7 +21,7 @@ type Metadata struct {
 	Subject         string
 	ID              string
 	Time            time.Time
-	Extensions      map[string]interface{}
+	Extensions      map[string]any
 	DataSchema      *url.URL
 	DataContentType string
 }

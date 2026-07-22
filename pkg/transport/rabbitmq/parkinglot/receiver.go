@@ -364,7 +364,7 @@ func (r *Receiver) putIntoParkingLot(ctx context.Context, conn *connpool.Conn, d
 }
 
 func hasExceededRetryCount(d *amqp.Delivery, max int64) bool {
-	death, ok := d.Headers["x-death"].([]interface{})
+	death, ok := d.Headers["x-death"].([]any)
 	if !ok {
 		return false
 	}

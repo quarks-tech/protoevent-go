@@ -16,7 +16,7 @@ import (
 type Marshaler struct{}
 
 func (m Marshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, error) {
-	dto := map[string]interface{}{
+	dto := map[string]any{
 		"specversion": md.SpecVersion,
 		"id":          md.ID,
 		"type":        md.Type,
@@ -144,10 +144,10 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 
 	for k, raw := range dto {
 		if md.Extensions == nil {
-			md.Extensions = make(map[string]interface{})
+			md.Extensions = make(map[string]any)
 		}
 
-		var v interface{}
+		var v any
 
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return nil, nil, fmt.Errorf("unmarshal extension attribute %q: %w", k, err)

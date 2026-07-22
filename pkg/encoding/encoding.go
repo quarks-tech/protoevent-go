@@ -16,9 +16,9 @@ type Codec interface {
 	// static; the result cannot change between calls.
 	Name() string
 	// Marshal returns the wire format of v.
-	Marshal(v interface{}) ([]byte, error)
+	Marshal(v any) ([]byte, error)
 	// Unmarshal parses the wire format into v.
-	Unmarshal(data []byte, v interface{}) error
+	Unmarshal(data []byte, v any) error
 }
 
 var registeredCodecs = make(map[string]Codec)

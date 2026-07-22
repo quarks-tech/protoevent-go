@@ -117,7 +117,7 @@ func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 	for k, v := range d.Headers {
 		if !strings.HasPrefix(k, "cloudEvents") {
 			if md.Extensions == nil {
-				md.Extensions = make(map[string]interface{})
+				md.Extensions = make(map[string]any)
 			}
 
 			md.Extensions[k] = v

@@ -22,7 +22,7 @@ type Sender interface {
 }
 
 type Publisher interface {
-	Publish(ctx context.Context, name string, e interface{}, opts ...PublishOption) error
+	Publish(ctx context.Context, name string, e any, opts ...PublishOption) error
 }
 
 type PublishOption func(m *event.Metadata)
@@ -89,10 +89,10 @@ func WithEventDataSchema(schema *url.URL) PublishOption {
 	}
 }
 
-func WithEventExtension(name string, value interface{}) PublishOption {
+func WithEventExtension(name string, value any) PublishOption {
 	return func(m *event.Metadata) {
 		if m.Extensions == nil {
-			m.Extensions = make(map[string]interface{})
+			m.Extensions = make(map[string]any)
 		}
 
 		m.Extensions[name] = value
@@ -149,7 +149,7 @@ func NewPublisher(sender Sender, opts ...PublisherOption) *PublisherImpl {
 	return p
 }
 
-func (p *PublisherImpl) Publish(ctx context.Context, name string, e interface{}, opts ...PublishOption) error {
+func (p *PublisherImpl) Publish(ctx context.Context, name string, e any, opts ...PublishOption) error {
 	opts = combine(p.options.publishOptions, opts)
 
 	if p.options.interceptor != nil {
@@ -159,7 +159,7 @@ func (p *PublisherImpl) Publish(ctx context.Context, name string, e interface{},
 	return publish(ctx, name, e, p, opts...)
 }
 
-func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, opts ...PublishOption) error {
+func publish(ctx context.Context, name string, e any, p *PublisherImpl, opts ...PublishOption) error {
 	md := event.NewMetadata(name)
 
 	for _, opt := range opts {

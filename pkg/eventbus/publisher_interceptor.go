@@ -2,9 +2,9 @@ package eventbus
 
 import "context"
 
-type PublishFn func(ctx context.Context, name string, e interface{}, p *PublisherImpl, opts ...PublishOption) error
+type PublishFn func(ctx context.Context, name string, e any, p *PublisherImpl, opts ...PublishOption) error
 
-type PublisherInterceptor func(ctx context.Context, name string, e interface{}, p *PublisherImpl, pf PublishFn, opts ...PublishOption) error
+type PublisherInterceptor func(ctx context.Context, name string, e any, p *PublisherImpl, pf PublishFn, opts ...PublishOption) error
 
 func WithPublisherInterceptor(f PublisherInterceptor) PublisherOption {
 	return func(o *publisherOptions) {
@@ -32,7 +32,7 @@ func chainPublisherInterceptors(p *PublisherImpl) {
 	case 1:
 		chainedInt = interceptors[0]
 	default:
-		chainedInt = func(ctx context.Context, name string, e interface{}, p *PublisherImpl, invoker PublishFn, opts ...PublishOption) error {
+		chainedInt = func(ctx context.Context, name string, e any, p *PublisherImpl, invoker PublishFn, opts ...PublishOption) error {
 			return interceptors[0](ctx, name, e, p, chainInvoker(interceptors, 0, invoker), opts...)
 		}
 	}
@@ -43,7 +43,7 @@ func chainInvoker(interceptors []PublisherInterceptor, curr int, finalInvoker Pu
 	if curr == len(interceptors)-1 {
 		return finalInvoker
 	}
-	return func(ctx context.Context, name string, e interface{}, p *PublisherImpl, opts ...PublishOption) error {
+	return func(ctx context.Context, name string, e any, p *PublisherImpl, opts ...PublishOption) error {
 		return interceptors[curr+1](ctx, name, e, p, chainInvoker(interceptors, curr+1, finalInvoker), opts...)
 	}
 }

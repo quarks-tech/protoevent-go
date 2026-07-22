@@ -29,7 +29,7 @@ type Setuper interface {
 type Processor func(md *event.Metadata, data []byte) error
 
 // EventHandler handles a single event. The handler implementation is captured
-// in the closure, so no interface{} is passed at runtime.
+// in the closure, so no any-typed value is passed at runtime.
 //
 // Parameters:
 //   - ctx: request context

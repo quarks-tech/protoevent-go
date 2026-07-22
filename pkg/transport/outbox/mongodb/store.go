@@ -322,10 +322,10 @@ func (s *Store) SaveToken(ctx context.Context, name string, token string, cluste
 		update,
 		options.UpdateOne().SetUpsert(true),
 	)
+	if mongo.IsDuplicateKeyError(err) {
+		return false, nil // stored row carries a newer position; stale save skipped
+	}
 	if err != nil {
-		if mongo.IsDuplicateKeyError(err) {
-			return false, nil // stored row carries a newer position; stale save skipped
-		}
 		return false, fmt.Errorf("outbox: save token: %w", err)
 	}
 	return true, nil
