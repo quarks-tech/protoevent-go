@@ -45,15 +45,21 @@ func chainSubscriberInterceptors(s *Subscriber) {
 
 func chainInterceptors(interceptors []SubscriberInterceptor) SubscriberInterceptor {
 	return func(ctx context.Context, md *event.Metadata, e any, handler Handler) error {
-		var i int
-		var next Handler
-		next = func(ctx context.Context, e any) error {
-			if i == len(interceptors)-1 {
-				return interceptors[i](ctx, md, e, handler)
-			}
-			i++
-			return interceptors[i-1](ctx, md, e, next)
-		}
-		return next(ctx, e)
+		return interceptors[0](ctx, md, e, chainHandler(interceptors, 0, md, handler))
+	}
+}
+
+// chainHandler builds interceptor curr's next-Handler with an IMMUTABLE
+// position — each nesting level owns its index (mirroring the publisher
+// chain's chainInvoker), so an interceptor that calls next more than once (a
+// retry interceptor) re-runs the SAME downstream chain. The previous
+// closure-shared mutable index made the second pass skip every interceptor
+// between the caller and the tail.
+func chainHandler(interceptors []SubscriberInterceptor, curr int, md *event.Metadata, finalHandler Handler) Handler {
+	if curr == len(interceptors)-1 {
+		return finalHandler
+	}
+	return func(ctx context.Context, e any) error {
+		return interceptors[curr+1](ctx, md, e, chainHandler(interceptors, curr+1, md, finalHandler))
 	}
 }

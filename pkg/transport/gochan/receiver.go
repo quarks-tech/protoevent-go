@@ -13,18 +13,22 @@ func (r receiver) Receive(ctx context.Context, processor eventbus.Processor) err
 		return ErrNilContext
 	}
 
-	for m := range r {
+	// Select on ctx and the channel together: ranging over the channel alone
+	// would observe cancellation only when a message arrives, leaving an idle
+	// subscriber blocked until Close despite a canceled ctx.
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
+		case m, ok := <-r:
+			if !ok {
+				return nil
+			}
 			if err := processor(m.meta, m.data); err != nil {
 				return err
 			}
 		}
 	}
-
-	return nil
 }
 
 func (r receiver) Setup(_ context.Context, _ string, _ ...eventbus.ServiceInfo) error {
