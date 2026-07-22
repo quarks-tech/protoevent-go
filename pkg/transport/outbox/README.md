@@ -464,13 +464,19 @@ stream position.
 3. **Reset the stored token** so the next start opens at "now":
    `store.DeleteToken(ctx, "<group>")` (or, in mongosh,
    `db.outbox_offsets.deleteOne({_id: "<group>"})`).
-4. **Restart the relay.** It now behaves as a fresh group: delivers from
-   "now" onward.
+4. **Restart the relay and record the replay ceiling**: note the wall-clock
+   time of the restart — `replayUntil := time.Now()`. The fresh group
+   delivers everything from "now" onward live, so the replay must stop
+   there: events after `replayUntil` are NOT part of the gap.
 5. **Re-send the gap**: read the outbox collection for the missed window and
    re-publish through the relay's own sender —
 
    Abort on the FIRST error — skipping past a failed decode or send during
-   recovery silently drops that event forever (the token was already reset):
+   recovery silently drops that event forever (the token was already reset).
+   Bound BOTH ends of the window: without the `$lt` ceiling the replay
+   re-reads every event published after the restart — already delivered
+   live — and on a busy outbox never catches up. The overlap margins on
+   both ends are absorbed by consumer dedup; a missed event is not:
 
    ```go
    // Prefixed instances (WithCollectionPrefix): set collPrefix to match, so this
@@ -478,7 +484,10 @@ stream position.
    // consulted in step 2.
    const collPrefix = ""
    cur, err := db.Collection(collPrefix+"outbox_messages").Find(ctx,
-       bson.M{"create_time": bson.M{"$gte": gapStart.Add(-overlap)}}, // overlap ≥ 1 oplog-lag margin, e.g. 5m
+       bson.M{"create_time": bson.M{
+           "$gte": gapStart.Add(-overlap),    // overlap ≥ 1 oplog-lag margin, e.g. 5m
+           "$lt":  replayUntil.Add(overlap),  // ceiling from step 4: live delivery owns everything after
+       }},
        options.Find().SetSort(bson.D{{Key: "create_time", Value: 1}}))
    if err != nil {
        return err
