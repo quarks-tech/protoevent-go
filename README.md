@@ -309,7 +309,7 @@ err := txStore.WithTransaction(ctx, func(ctx context.Context, store MyStore) err
     }
 
     return factory.Create(store).PublishBookCreatedEvent(ctx, &bookspb.BookCreatedEvent{
-        BookId: book.ID,
+        Id: book.ID,
     })
 })
 ```

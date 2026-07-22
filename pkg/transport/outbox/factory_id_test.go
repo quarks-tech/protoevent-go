@@ -10,14 +10,16 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 )
 
-// TestFactoryForwardsSenderOptions verifies that sender options supplied to the
-// factory reach the underlying outbox sender — here, ReuseMetadataID makes the
-// persisted Message.ID equal the event's Metadata.ID.
+// TestFactoryForwardsSenderOptions verifies that sender options supplied to
+// the factory reach the underlying outbox sender. GenerateUUIDv4 is the
+// NON-default row-ID generator on purpose: with the default (ReuseMetadataID,
+// row ID == metadata ID) the assertion would pass even if the option were
+// silently dropped.
 func TestFactoryForwardsSenderOptions(t *testing.T) {
 	identity := func(p eventbus.Publisher) eventbus.Publisher { return p }
 
 	factory := outbox.NewPublisherFactory(identity,
-		outbox.WithSenderOptions(outbox.WithRowIDGenerator(outbox.ReuseMetadataID)),
+		outbox.WithSenderOptions(outbox.WithRowIDGenerator(outbox.GenerateUUIDv4)),
 		outbox.WithPublisherOptions(
 			eventbus.WithDefaultPublishOptions(eventbus.WithEventSource("books-service")),
 		),
@@ -30,10 +32,10 @@ func TestFactoryForwardsSenderOptions(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 
-	// ReuseMetadataID (a forwarded sender option) makes the row ID equal the
-	// event's metadata ID, whatever the publisher minted.
-	if store.msg.ID != store.msg.Metadata.ID {
-		t.Fatalf("message ID %q != metadata ID %q; sender option not forwarded",
+	// GenerateUUIDv4 (the forwarded sender option) mints a fresh row ID, so
+	// it must differ from the event's metadata ID — the default would match.
+	if store.msg.ID == store.msg.Metadata.ID {
+		t.Fatalf("message ID %q == metadata ID %q; WithRowIDGenerator not forwarded (default applied)",
 			store.msg.ID, store.msg.Metadata.ID)
 	}
 	// The publish option was forwarded too.

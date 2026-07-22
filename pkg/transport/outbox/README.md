@@ -59,7 +59,7 @@ err := txStore.WithTransaction(ctx, func(ctx context.Context, store MyStore) err
     }
 
     return factory.Create(store).PublishBookCreatedEvent(ctx, &bookspb.BookCreatedEvent{
-        BookId: book.ID,
+        Id: book.ID,
     })
 })
 ```
@@ -334,7 +334,7 @@ _, err = sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
     }
 
     return nil, factory.Create(st).PublishBookCreatedEvent(sc, &bookspb.BookCreatedEvent{
-        BookId: book.ID,
+        Id: book.ID,
     })
 })
 ```
@@ -468,6 +468,13 @@ stream position.
    time of the restart — `replayUntil := time.Now()`. The fresh group
    delivers everything from "now" onward live, so the replay must stop
    there: events after `replayUntil` are NOT part of the gap.
+   Ordering is NOT preserved during break-glass recovery: the restarted
+   relay delivers new events live while step 5 back-fills older ones. This
+   is deliberate — restarting FIRST closes the loss window (replay-first
+   would open a fresh gap between the replay ceiling and the restart), and
+   the inversion is absorbed by the same consumer `Metadata.ID` idempotency
+   that at-least-once already requires. A consumer that needs strict order
+   must pause its own processing until step 5 completes.
 5. **Re-send the gap**: read the outbox collection for the missed window and
    re-publish through the relay's own sender —
 

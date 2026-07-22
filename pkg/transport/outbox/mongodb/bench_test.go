@@ -85,7 +85,15 @@ func BenchmarkSaveToken(b *testing.B) {
 	ctx := context.Background()
 	st := mongodbstore.NewStore(testDB)
 
-	token := strings.Repeat("a", 100) // ~100 bytes: realistic resume-token size
+	// A real KeyString-shaped token ({"_data": <hex>}, ~100 hex chars like a
+	// production resume token) so SaveToken takes the fine-grained token_key
+	// path — an opaque string would benchmark the coarse cluster_time
+	// fallback instead.
+	rawToken, err := bson.Marshal(bson.D{{Key: "_data", Value: "82" + "00000001" + "00000001" + strings.Repeat("00", 41)}})
+	if err != nil {
+		b.Fatalf("marshal token: %v", err)
+	}
+	token := string(rawToken)
 	ct := time.Now().UTC()
 
 	for b.Loop() {
