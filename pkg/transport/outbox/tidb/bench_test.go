@@ -82,10 +82,13 @@ func BenchmarkListMessages(b *testing.B) {
 // BenchmarkPublishParallel measures CreateOutboxMessage inside a transaction
 // under concurrent load (b.RunParallel): each goroutine opens its own
 // transaction on the pool, publishes one message, and commits, mirroring
-// BenchmarkPublish's per-op shape. The design claims the publish path stays
-// contention-free (no hot row: no shared counter, no FOR UPDATE) — so this
-// parallel ns/op should scale with concurrency, not collapse toward (or
-// exceed) BenchmarkPublish's serial ns/op.
+// BenchmarkPublish's per-op shape. The design claims the publish path is
+// LOCK-contention-free (no shared counter row, no FOR UPDATE — those belong
+// to the sequencer pass) — so this parallel ns/op should scale with
+// concurrency, not collapse toward (or exceed) BenchmarkPublish's serial
+// ns/op. It does NOT claim hotspot-freedom: the AUTO_INCREMENT PK's
+// tail-Region write hotspot is the migration header's accepted trade, and a
+// single-node benchmark cannot see it either way.
 func BenchmarkPublishParallel(b *testing.B) {
 	if testDB == nil {
 		b.Skip("no TiDB")
