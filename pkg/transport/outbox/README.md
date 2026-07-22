@@ -5,9 +5,11 @@ same database transaction as the business change, then relayed to a downstream
 transport (e.g. RabbitMQ) in commit order. Publish-time writes never block on the
 broker, and a crashed relay simply resumes from the last committed offset — the
 event is never delivered before the transaction that produced it has committed,
-and never silently dropped as long as retention is sized per the rule below
-(outbox retention > oplog window > relay-downtime SLO; see the ErrHistoryLost
-runbook for the recovery path when that budget is blown).
+and never silently dropped as long as retention outlives relay downtime —
+each backend's sizing rule and recovery path is documented in its own section
+(TiDB: the delivery-gated sweep window; MongoDB: retention > oplog window >
+relay-downtime SLO, with the ErrHistoryLost runbook when that budget is
+blown).
 
 This package implements a **sequenced-log** design: the outbox table is an
 append-only log, a leader-elected sequencer pass assigns a dense, gapless offset

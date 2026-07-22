@@ -207,6 +207,8 @@ package main
 import (
     "context"
     "log"
+    "os/signal"
+    "syscall"
 
     "github.com/quarks-tech/amqpx"
     "github.com/quarks-tech/protoevent-go/pkg/eventbus"
@@ -216,7 +218,11 @@ import (
 )
 
 func main() {
-    ctx := context.Background()
+    // SIGINT/SIGTERM cancels ctx; the receiver then drains in-flight
+    // deliveries (amqpx ProcessWithDrain) and Subscribe returns nil on a
+    // clean shutdown.
+    ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+    defer stop()
 
     client := amqpx.NewClient(&amqpx.Config{
         Address: "guest:guest@localhost:5672/",
