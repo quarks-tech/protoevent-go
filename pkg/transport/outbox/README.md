@@ -307,9 +307,12 @@ inside it just work).
 ### Publishing
 
 Publishing is unchanged from the TiDB path — the same `PublisherFactory`
-wrapping a generated typed publisher, created inside a transaction — only the
-transaction mechanism and store differ (a MongoDB session instead of a
-`*sql.Tx`):
+wrapping a generated typed publisher, created inside a transaction. The store
+owns the transaction runner (`Store.WithTransaction` delegates to the
+driver's `Session.WithTransaction`, keeping its transient-error and commit
+retry loops) and hands the callback a **session-bound** store — the
+transaction is a value in your hands, like the TiDB store's tx-scoped
+`Runner`, not something threaded through a magic ctx:
 
 ```go
 factory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
@@ -322,22 +325,27 @@ factory := outbox.NewPublisherFactory(bookspb.NewEventPublisher,
 
 st := mongodb.NewStore(db) // db is a *mongo.Database
 
-sess, err := db.Client().StartSession()
-if err != nil {
-    return err
-}
-defer sess.EndSession(ctx)
-
-_, err = sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
-    if err := saveBook(sc, book); err != nil {
-        return nil, err
+err := st.WithTransaction(ctx, func(ctx context.Context, tx *mongodb.Store) error {
+    // ctx is the driver's session context, so your own collection writes
+    // join the same transaction with no extra wiring.
+    if err := saveBook(ctx, book); err != nil {
+        return err
     }
 
-    return nil, factory.Create(st).PublishBookCreatedEvent(sc, &bookspb.BookCreatedEvent{
+    return factory.Create(tx).PublishBookCreatedEvent(ctx, &bookspb.BookCreatedEvent{
         Id: book.ID,
     })
 })
 ```
+
+If your repository layer owns the session (one transaction across several
+stores — the `MyStore` embedding pattern from the TiDB example), bind
+explicitly instead: run `sess.WithTransaction` yourself and use
+`st.WithSession(sess)` — the bound store joins that session's transaction
+even on a plain ctx, and fails loudly if called with a ctx carrying a
+DIFFERENT session or with no transaction running. A raw session-ctx publish
+on the unbound store keeps working (the guard accepts it), but the bound
+forms make the transaction visible in the types.
 
 As with TiDB, the default `outbox.ReuseMetadataID` makes the row's `_id` the
 publisher's CloudEvents `Metadata.ID`, so the event the relay eventually emits
@@ -438,8 +446,9 @@ context stops the lane instead of parking healthy messages.
 2. **`EnsureIndexes`** — call it on every startup (idempotent). Skipping it
    means **no TTL index is ever created and the outbox collection grows
    forever, silently** — `WithRetention` alone changes nothing.
-3. **Publish** — `outbox.NewSender(store).Send` inside
-   `mongo.Session.WithTransaction` (a transactionless ctx is rejected loudly).
+3. **Publish** — inside `store.WithTransaction` (or on a
+   `store.WithSession(sess)`-bound copy under your own session runner); an
+   unbound, transactionless publish is rejected loudly.
 4. **Relay** — `stream.NewRelay(name, store, sender, …)`; replicas of one
    group need no extra config (leader election is automatic). Size
    `TokenBatchSize × worst-case Send latency < LeaseTTL` (see NewRelay's

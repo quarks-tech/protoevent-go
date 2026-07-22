@@ -97,9 +97,51 @@ type Store struct {
 	db        *mongo.Database
 	retention time.Duration
 
+	// sess, when non-nil, is the transaction the store is bound to (see
+	// WithSession): CreateOutboxMessage joins it explicitly instead of
+	// sniffing the caller's ctx. Relay-side methods ignore it.
+	sess *mongo.Session
+
 	collMessages string
 	collOffsets  string
 	collLocks    string
+}
+
+// WithSession returns a copy of the Store bound to sess: CreateOutboxMessage
+// joins sess's transaction as an explicit value — mirroring the TiDB store's
+// tx-scoped Runner — instead of requiring the caller to thread the driver's
+// session context. Bind inside Session.WithTransaction, or use
+// Store.WithTransaction, which does both. A nil sess returns the store
+// unchanged (unbound); the publish-time guard then fails constructively.
+//
+// The bound copy is transaction-scoped: like the session itself it is not
+// safe for concurrent use. The unbound original remains pool-scoped and
+// shareable.
+func (s *Store) WithSession(sess *mongo.Session) *Store {
+	if sess == nil {
+		return s
+	}
+	bound := *s
+	bound.sess = sess
+	return &bound
+}
+
+// WithTransaction runs fn inside a MongoDB transaction and hands it a
+// session-bound *Store: the transaction is a value in fn's hands, and fn's
+// ctx is the driver's session context, so the caller's own writes join the
+// same transaction with no extra wiring. Retry semantics (transient errors,
+// unknown commit results) are the driver's own Session.WithTransaction.
+func (s *Store) WithTransaction(ctx context.Context, fn func(ctx context.Context, tx *Store) error) error {
+	sess, err := s.db.Client().StartSession()
+	if err != nil {
+		return fmt.Errorf("outbox: start session: %w", err)
+	}
+	defer sess.EndSession(ctx)
+
+	_, err = sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
+		return nil, fn(sc, s.WithSession(sess))
+	})
+	return err
 }
 
 // Option configures a Store at construction time.
@@ -195,11 +237,15 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 	return nil
 }
 
-// CreateOutboxMessage inserts an unsequenced event envelope. ctx MUST carry a
-// session with a running transaction (mongo.Session.WithTransaction binds it):
-// an outbox row that commits independently of the business write is a phantom
-// event, so a transactionless ctx is rejected loudly — the same fail-loud
-// stance the TiDB store takes for autocommit publishes.
+// CreateOutboxMessage inserts an unsequenced event envelope. It MUST run
+// inside a transaction: either on a session-bound store (WithSession /
+// WithTransaction — the transaction as an explicit value, preferred) or with
+// a ctx carrying a running session (mongo.Session.WithTransaction). An
+// outbox row that commits independently of the business write is a phantom
+// event, so the unbound-and-transactionless case is rejected loudly — the
+// same fail-loud stance the TiDB store takes for autocommit publishes. A
+// bound store additionally rejects a ctx carrying a DIFFERENT session rather
+// than silently picking one of two transactions.
 //
 // msg.ID must be non-empty (it is the row's _id; an empty _id would make the
 // SECOND publish fail with a far-from-cause duplicate-key error). Unlike the
@@ -232,9 +278,25 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) er
 		// the occur_time column makes the same rejection structural).
 		return errors.New("outbox: message metadata time is zero; set Metadata.Time before publishing")
 	}
-	if sess := mongo.SessionFromContext(ctx); sess == nil || !sess.TransactionRunning() {
-		return errors.New("outbox: create message: ctx has no running transaction; " +
-			"publish must share the business write's session (see the README's publishing example)")
+	ctxSess := mongo.SessionFromContext(ctx)
+	switch {
+	case s.sess != nil:
+		// Bound store (WithSession / WithTransaction): the transaction is an
+		// explicit value — join it regardless of the ctx, but never silently
+		// pick between two competing transactions.
+		if ctxSess != nil && ctxSess != s.sess {
+			return errors.New("outbox: create message: ctx carries a different session than the store is bound to; " +
+				"use one transaction, not two")
+		}
+		if !s.sess.TransactionRunning() {
+			return errors.New("outbox: create message: bound session has no running transaction; " +
+				"bind inside Session.WithTransaction, or use Store.WithTransaction")
+		}
+		ctx = mongo.NewSessionContext(ctx, s.sess)
+	case ctxSess == nil || !ctxSess.TransactionRunning():
+		return errors.New("outbox: create message: no transaction; " +
+			"use Store.WithTransaction (or WithSession inside mongo.Session.WithTransaction) — " +
+			"an outbox row that commits independently of the business write is a phantom event")
 	}
 	meta, err := json.Marshal(msg.Metadata)
 	if err != nil {

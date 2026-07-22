@@ -706,3 +706,143 @@ func TestLeaderLockExpiredLeaseTakeover(t *testing.T) {
 		t.Fatal("A re-acquired while B holds a live lease")
 	}
 }
+
+// newTestMessage builds a directly-insertable outbox message (bypassing the
+// Sender) for the session-binding tests.
+func newTestMessage() *outbox.Message {
+	md := event.NewMetadata("books.created")
+	md.ID = uuid.NewString()
+	md.Source = "books-service"
+	md.Time = time.Now().UTC()
+	return &outbox.Message{ID: md.ID, Metadata: md, Data: []byte("x"), CreateTime: time.Now().UTC()}
+}
+
+// TestStoreWithTransactionPublishesAndCommits pins variant B: one call, no
+// session ceremony — fn gets a session-bound tx store and the driver's
+// session ctx, and a clean return commits the insert.
+func TestStoreWithTransactionPublishesAndCommits(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	msg := newTestMessage()
+
+	err := st.WithTransaction(context.Background(), func(ctx context.Context, tx *mongodbstore.Store) error {
+		return tx.CreateOutboxMessage(ctx, msg)
+	})
+	if err != nil {
+		t.Fatalf("WithTransaction: %v", err)
+	}
+	n, err := testDB.Collection("outbox_messages").CountDocuments(context.Background(), bson.M{"_id": msg.ID})
+	if err != nil || n != 1 {
+		t.Fatalf("count = %d err = %v, want 1 (committed)", n, err)
+	}
+}
+
+// TestStoreWithTransactionRollsBackOnError pins the abort path: fn's error
+// surfaces AND the insert does not commit.
+func TestStoreWithTransactionRollsBackOnError(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	msg := newTestMessage()
+	boom := errors.New("business write failed")
+
+	err := st.WithTransaction(context.Background(), func(ctx context.Context, tx *mongodbstore.Store) error {
+		if err := tx.CreateOutboxMessage(ctx, msg); err != nil {
+			return err
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("WithTransaction error = %v, want the callback's own error", err)
+	}
+	n, err := testDB.Collection("outbox_messages").CountDocuments(context.Background(), bson.M{"_id": msg.ID})
+	if err != nil || n != 0 {
+		t.Fatalf("count = %d err = %v, want 0 (rolled back)", n, err)
+	}
+}
+
+// TestWithSessionBindsWithoutMagicCtx pins variant A's whole point: a
+// session-bound store joins the transaction even when the caller passes a
+// PLAIN ctx — the transaction is a value, not ctx magic.
+func TestWithSessionBindsWithoutMagicCtx(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	msg := newTestMessage()
+
+	sess, err := testDB.Client().StartSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.EndSession(context.Background())
+
+	_, err = sess.WithTransaction(context.Background(), func(context.Context) (any, error) {
+		// Deliberately NOT the session ctx — the plain Background ctx is the
+		// assertion: the bound store must join the transaction on its own.
+		return nil, st.WithSession(sess).CreateOutboxMessage(context.Background(), msg) //nolint:contextcheck // plain ctx is the point
+	})
+	if err != nil {
+		t.Fatalf("bound-store publish with plain ctx: %v", err)
+	}
+	n, err := testDB.Collection("outbox_messages").CountDocuments(context.Background(), bson.M{"_id": msg.ID})
+	if err != nil || n != 1 {
+		t.Fatalf("count = %d err = %v, want 1 (joined the bound session's txn)", n, err)
+	}
+}
+
+// TestCreateOutboxMessageBoundSessionWithoutTxnFails pins the constructive
+// guard: WithSession outside a running transaction fails loudly, naming the
+// fix, instead of writing a phantom row.
+func TestCreateOutboxMessageBoundSessionWithoutTxnFails(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+
+	sess, err := testDB.Client().StartSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.EndSession(context.Background())
+
+	err = st.WithSession(sess).CreateOutboxMessage(context.Background(), newTestMessage())
+	if err == nil || !strings.Contains(err.Error(), "transaction") {
+		t.Fatalf("err = %v, want descriptive no-running-transaction error", err)
+	}
+}
+
+// TestCreateOutboxMessageSessionConflictFails pins the never-pick-silently
+// rule: a store bound to one session called with a ctx carrying a DIFFERENT
+// session is a caller bug and must error, not choose.
+func TestCreateOutboxMessageSessionConflictFails(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+
+	sessA, err := testDB.Client().StartSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessA.EndSession(context.Background())
+	sessB, err := testDB.Client().StartSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessB.EndSession(context.Background())
+
+	ctx := mongo.NewSessionContext(context.Background(), sessA)
+	err = st.WithSession(sessB).CreateOutboxMessage(ctx, newTestMessage())
+	if err == nil || !strings.Contains(err.Error(), "different session") {
+		t.Fatalf("err = %v, want session-conflict rejection", err)
+	}
+}
