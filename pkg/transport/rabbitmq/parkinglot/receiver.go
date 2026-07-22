@@ -216,18 +216,22 @@ func (r *Receiver) setupBindings(conn *connpool.Conn, infos []eventbus.ServiceIn
 	return nil
 }
 
+// Receive consumes via amqpx.Client.ProcessWithDrain (drain-on-cancel mode):
+// shutdownCtx cancellation stops connection acquisition, while a running
+// consume command keeps its connection, drains, and returns nil — so a clean
+// shutdown yields nil, not context.Canceled. The client's Config.DrainTimeout
+// bounds the drain; size it to the deployment's shutdown budget.
 func (r *Receiver) Receive(shutdownCtx context.Context, processor eventbus.Processor) error {
-	return amqpxlifecycle.ProcessWithDrain(shutdownCtx, r.client.Process, func(commandCtx context.Context, conn *connpool.Conn) error {
-		return r.receive(shutdownCtx, commandCtx, conn, processor)
+	return r.client.ProcessWithDrain(shutdownCtx, func(commandCtx context.Context, conn *connpool.Conn) error {
+		return r.receive(commandCtx, conn, processor)
 	})
 }
 
 // The consume errgroup is deliberately detached from shutdownCtx: cancellation
-// stops the consumer while the amqpx command context and borrowed connection
-// remain alive until buffered and in-flight deliveries drain.
+// stops the consumer while the borrowed connection remains alive (amqpx drain
+// mode) until buffered and in-flight deliveries drain.
 func (r *Receiver) receive(
 	shutdownCtx context.Context,
-	commandCtx context.Context,
 	conn *connpool.Conn,
 	processor eventbus.Processor,
 ) error {
@@ -286,7 +290,7 @@ func (r *Receiver) receive(
 					return nil
 				}
 
-				if ackErr := r.doAcknowledge(commandCtx, conn, delivery, dErr); ackErr != nil {
+				if ackErr := r.doAcknowledge(shutdownCtx, conn, delivery, dErr); ackErr != nil {
 					return fmt.Errorf("do acknowledge: %w", ackErr)
 				}
 
@@ -343,7 +347,11 @@ func (r *Receiver) putIntoParkingLot(ctx context.Context, conn *connpool.Conn, d
 		Body:            d.Body,
 	}
 
-	err := conn.Channel().PublishWithContext(ctx, r.options.dlxExchange, parkingLot, false, false, msg)
+	// Parking a poison delivery must succeed DURING drain, when ctx is the
+	// already-canceled shutdown context (amqpx drain mode hands the command
+	// its own canceled ctx) — detach for the broker op, or amqp091's ctx
+	// fast-path rejects the publish and the delivery is never parked.
+	err := conn.Channel().PublishWithContext(context.WithoutCancel(ctx), r.options.dlxExchange, parkingLot, false, false, msg)
 	if err != nil {
 		return fmt.Errorf("put into parking lot: %w", err)
 	}

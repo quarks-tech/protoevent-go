@@ -159,9 +159,14 @@ func (r *Receiver) setupTopology(conn *connpool.Conn, infos []eventbus.ServiceIn
 	return nil
 }
 
+// Receive consumes via amqpx.Client.ProcessWithDrain (drain-on-cancel mode):
+// shutdownCtx cancellation stops connection acquisition, while a running
+// consume command keeps its connection, drains, and returns nil — so a clean
+// shutdown yields nil, not context.Canceled. The client's Config.DrainTimeout
+// bounds the drain; size it to the deployment's shutdown budget.
 func (r *Receiver) Receive(shutdownCtx context.Context, processor eventbus.Processor) error {
-	return amqpxlifecycle.ProcessWithDrain(shutdownCtx, r.client.Process, func(_ context.Context, conn *connpool.Conn) error {
-		return r.receive(shutdownCtx, conn, processor)
+	return r.client.ProcessWithDrain(shutdownCtx, func(commandCtx context.Context, conn *connpool.Conn) error {
+		return r.receive(commandCtx, conn, processor)
 	})
 }
 

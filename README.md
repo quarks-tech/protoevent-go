@@ -220,6 +220,11 @@ func main() {
 
     client := amqpx.NewClient(&amqpx.Config{
         Address: "guest:guest@localhost:5672/",
+        // Consumer drain budget on shutdown (amqpx ProcessWithDrain): in-flight
+        // deliveries get this long to finish before the connection is
+        // force-closed. Default 30s — size it to the deployment's termination
+        // grace period.
+        // DrainTimeout: 20 * time.Second,
     })
     defer func() {
         if err := client.Close(); err != nil {

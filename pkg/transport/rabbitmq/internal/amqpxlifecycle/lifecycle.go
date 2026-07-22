@@ -1,88 +1,17 @@
-// Package amqpxlifecycle adapts long-lived RabbitMQ consumers to the bounded
-// cancellation semantics of amqpx commands.
+// Package amqpxlifecycle provides the graceful-shutdown choreography for
+// long-lived RabbitMQ consumers: multiplexing the stop reasons (application
+// shutdown, worker failure, broker-initiated close) and draining prefetched
+// deliveries so Channel.Cancel can complete. Connection lifetime across
+// cancellation is handled by amqpx itself (Client.ProcessWithDrain, since
+// amqpx v0.3.2) — this package only owns what happens on the channel.
 package amqpxlifecycle
 
 import (
 	"context"
-	"errors"
 	"io"
-	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
-
-	"github.com/quarks-tech/amqpx"
-	"github.com/quarks-tech/amqpx/connpool"
 )
-
-// ProcessWithDrain lets ctx cancel connection acquisition, but once a command
-// attempt starts it keeps the borrowed connection alive until that attempt
-// returns. The command must observe the caller's shutdown context separately,
-// stop accepting deliveries, and drain its in-flight work before returning.
-func ProcessWithDrain(
-	ctx context.Context,
-	process func(context.Context, amqpx.Command) error,
-	command amqpx.Command,
-) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	processCtx, cancelProcess := context.WithCancel(context.WithoutCancel(ctx))
-	defer cancelProcess()
-
-	var (
-		stateMu         sync.Mutex
-		commandRunning  bool
-		shutdownDrained bool
-	)
-
-	stopCancel := context.AfterFunc(ctx, func() {
-		stateMu.Lock()
-		shouldCancel := !commandRunning && !shutdownDrained
-		stateMu.Unlock()
-
-		if shouldCancel {
-			cancelProcess()
-		}
-	})
-	defer stopCancel()
-
-	err := process(processCtx, func(commandCtx context.Context, conn *connpool.Conn) (err error) {
-		stateMu.Lock()
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			stateMu.Unlock()
-
-			return ctxErr
-		}
-		commandRunning = true
-		stateMu.Unlock()
-
-		defer func() {
-			stateMu.Lock()
-			commandRunning = false
-			ctxErr := ctx.Err()
-			shutdownDrained = ctxErr != nil
-			stateMu.Unlock()
-
-			if ctxErr != nil {
-				// Join rather than replace: the caller must see the shutdown
-				// signal (errors.Is(err, ctx.Err()) still matches), but a real
-				// command failure mid-drain must not be masked by it.
-				err = errors.Join(ctxErr, err)
-			}
-		}()
-
-		return command(commandCtx, conn)
-	})
-	// The command path already joined ctxErr in its defer — only join here
-	// when the error doesn't carry it yet (e.g. cancellation during
-	// connection acquisition), or the chain would hold ctxErr twice.
-	if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
-		return errors.Join(ctxErr, err)
-	}
-
-	return err
-}
 
 // WaitForConsumerStop cancels the AMQP consumer when either application
 // shutdown or the delivery worker fails. A completed worker needs no further
