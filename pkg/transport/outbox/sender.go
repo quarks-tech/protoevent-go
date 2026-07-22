@@ -21,8 +21,8 @@ import (
 type RowIDGenerator func(md *event.Metadata) (string, error)
 
 // GenerateUUIDv4 is a non-default RowIDGenerator. It ignores the metadata and mints a
-// fresh random UUID v4 as the outbox row's unique primary key, independent of
-// the caller-controlled Metadata.ID.
+// fresh random UUID v4 as the outbox row's identity — MongoDB's _id, TiDB's
+// unique event_id column — independent of the caller-controlled Metadata.ID.
 //
 // This only decouples the row key from the event's identity: the full
 // event.Metadata (including the publisher-assigned ID) is persisted in the
@@ -48,15 +48,17 @@ func GenerateUUIDv4(_ *event.Metadata) (string, error) {
 //
 // Because ids minted by the eventbus default generator are UUIDs (CloudEvents
 // itself allows any unique string — the TiDB store additionally requires
-// UUIDs and rejects others loudly at publish), this also scatters outbox
-// primary-key inserts across TiDB Regions the same way a freshly minted UUID
-// would (see storage ADR 012) — so the default gets hotspot avoidance and
-// identity preservation together, with no tradeoff between them.
+// UUIDs and rejects others loudly at publish), the row-identity writes stay
+// scattered: MongoDB's _id and TiDB's uk_outbox_event unique-INDEX entries
+// land across ranges the way any fresh UUID would. (TiDB's clustered primary
+// key is a separate AUTO_INCREMENT id whose tail hotspot is a deliberate,
+// documented trade in the migration header — the row ID choice neither causes
+// nor cures it.)
 //
 // Delivery order is the log order (assigned seq for the TiDB runtime, oplog
 // commit order for the MongoDB runtime), never the row ID, so the ID format
 // does not affect ordering. The only requirement is that Metadata.ID be
-// unique (it is the row's primary key).
+// unique (it is the row's identity: MongoDB's _id, TiDB's unique event_id).
 func ReuseMetadataID(md *event.Metadata) (string, error) {
 	return md.ID, nil
 }

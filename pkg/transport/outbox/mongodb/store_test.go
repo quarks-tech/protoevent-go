@@ -18,6 +18,7 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 	mongodbstore "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/mongodb"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/mongodb/mongodbtest"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/stream"
 )
 
 func TestNewStoreConstructs(t *testing.T) {
@@ -844,5 +845,64 @@ func TestCreateOutboxMessageSessionConflictFails(t *testing.T) {
 	err = st.WithSession(sessB).CreateOutboxMessage(ctx, newTestMessage())
 	if err == nil || !strings.Contains(err.Error(), "different session") {
 		t.Fatalf("err = %v, want session-conflict rejection", err)
+	}
+}
+
+// TestRealResumeTokenParsesForKeyedSave is the token-format CANARY: SaveToken's
+// fine-grained ordering and the commit-time anchor both parse the resume
+// token's _data KeyString, which MongoDB documents as opaque. The parsing
+// fails SOFT by design (coarse fallback), so a server/driver upgrade that
+// changes the layout would otherwise degrade precision silently — this test
+// makes it loud by asserting, against a REAL server token, that (a) the keyed
+// path was taken (token_key persisted) and (b) the token-derived commit time
+// is sane.
+func TestRealResumeTokenParsesForKeyedSave(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	st := mongodbstore.NewStore(testDB)
+	ctx := context.Background()
+
+	strm, err := st.Watch(ctx, "", 5*time.Second)
+	if err != nil {
+		t.Fatalf("watch: %v", err)
+	}
+	defer func() { _ = strm.Close(context.Background()) }()
+
+	publish(t, "canary")
+
+	// The first Next calls can return empty batches before the insert's
+	// change event arrives; poll until the event is delivered.
+	var ev *stream.Event
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var ok bool
+		var err error
+		ev, ok, err = strm.Next(ctx)
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("change event did not arrive within 30s")
+		}
+	}
+	if ev.CommitTime.IsZero() || time.Since(ev.CommitTime) > time.Hour {
+		t.Fatalf("commit time = %v: token-embedded clusterTime failed to parse on a real server token", ev.CommitTime)
+	}
+
+	if persisted, err := st.SaveToken(ctx, "canary", ev.ResumeToken, ev.CommitTime); err != nil || !persisted {
+		t.Fatalf("save token: persisted=%v err=%v", persisted, err)
+	}
+	var doc bson.M
+	if err := testDB.Collection("outbox_offsets").FindOne(ctx, bson.M{"_id": "canary"}).Decode(&doc); err != nil {
+		t.Fatalf("read offsets row: %v", err)
+	}
+	if _, hasKey := doc["token_key"]; !hasKey {
+		t.Fatal("offsets row has no token_key: tokenKeyFromString failed on a REAL server resume token — " +
+			"the server/driver token layout changed and SaveToken silently degraded to the coarse cluster_time guard")
 	}
 }
