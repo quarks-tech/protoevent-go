@@ -11,11 +11,13 @@ each backend's sizing rule and recovery path is documented in its own section
 relay-downtime SLO, with the ErrHistoryLost runbook when that budget is
 blown).
 
-This package implements a **sequenced-log** design: the outbox table is an
-append-only log, a leader-elected sequencer pass assigns a dense, gapless offset
-(`seq`) to committed rows after the fact (so a transaction that started earlier but
-committed later can never be skipped), and one or more relays drain the log in
-`seq` order per consumer group. This README is the design reference: rationale and
+The relay runtimes implement a **sequenced-log** design over the
+database-free publish API (the base `outbox` package only writes rows —
+sequencing and ordered draining live in `relay/sequence` and `relay/stream`):
+the outbox table is an append-only log, a leader-elected sequencer pass
+assigns a dense, gapless offset (`seq`) to committed rows after the fact (so
+a transaction that started earlier but committed later can never be skipped),
+and one or more relays drain the log in `seq` order per consumer group. This README is the design reference: rationale and
 guarantees live in the sections below, schema in the store modules' migrations and
 godoc.
 
@@ -503,7 +505,10 @@ stream position.
    const collPrefix = ""
    cur, err := db.Collection(collPrefix+"outbox_messages").Find(ctx,
        bson.M{"create_time": bson.M{
-           "$gte": gapStart.Add(-overlap),    // overlap ≥ 1 oplog-lag margin, e.g. 5m
+           // overlap must cover BOTH the worst-case oplog lag AND the clock
+           // skew between the domains being compared: gapStart is server
+           // clusterTime, create_time is publisher-stamped. e.g. 5m.
+           "$gte": gapStart.Add(-overlap),
            "$lt":  replayUntil.Add(overlap),  // ceiling from step 4: live delivery owns everything after
        }},
        options.Find().SetSort(bson.D{{Key: "create_time", Value: 1}}))

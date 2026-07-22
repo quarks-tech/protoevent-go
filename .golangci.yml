@@ -76,9 +76,11 @@ linters:
       - path: pkg/transport/
         linters:
           - wrapcheck
-      # Shutdown-path helpers (LeaderElector.Release, closeStream) run where
-      # the caller's ctx is already dead and use fresh bounded contexts BY
-      # DESIGN (documented on each); contextcheck cannot express that.
+      # Shutdown-path helpers (closeStream, the bounded final offset/token
+      # writes) run where the caller's ctx is already dead and use fresh
+      # bounded contexts BY DESIGN (documented on each); contextcheck cannot
+      # express that. (The leader elector's Release lives in internal/leader
+      # and takes no ctx parameter, so contextcheck has nothing to flag there.)
       - path: pkg/transport/outbox/relay/
         linters:
           - contextcheck

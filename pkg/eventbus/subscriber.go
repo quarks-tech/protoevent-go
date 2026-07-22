@@ -11,7 +11,11 @@ import (
 )
 
 // Receiver is the transport seam on the subscribe side: it blocks delivering
-// incoming events to p until ctx is canceled or the transport fails.
+// incoming events to p until ctx is canceled, the transport fails, or the
+// transport shuts down cleanly. A clean shutdown returns nil — a
+// drain-capable transport (the rabbitmq receiver) finishes in-flight
+// deliveries after ctx cancellation and reports the planned stop as success,
+// not as context.Canceled.
 type Receiver interface {
 	Receive(ctx context.Context, p Processor) error
 }

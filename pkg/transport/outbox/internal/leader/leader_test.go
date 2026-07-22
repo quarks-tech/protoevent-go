@@ -11,11 +11,12 @@ import (
 )
 
 // releaseCall records one ReleaseLeaderLock invocation, including whether the
-// ctx passed to it was already done (used to sanity-check Release's own
-// internal context).
+// ctx passed to it was already done and whether it carried a deadline (used
+// to sanity-check Release's own internal bounded context).
 type releaseCall struct {
 	name, holderID string
 	ctxErr         error
+	hasDeadline    bool
 }
 
 // fakeLeaderStore is a configurable relay.LeaderStore fake: TryAcquire can be
@@ -45,7 +46,8 @@ func (s *fakeLeaderStore) TryAcquireLeaderLock(_ context.Context, _, _ string, _
 func (s *fakeLeaderStore) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.releaseCalls = append(s.releaseCalls, releaseCall{name: name, holderID: holderID, ctxErr: ctx.Err()})
+	_, hasDeadline := ctx.Deadline()
+	s.releaseCalls = append(s.releaseCalls, releaseCall{name: name, holderID: holderID, ctxErr: ctx.Err(), hasDeadline: hasDeadline})
 	return s.releaseErr
 }
 
@@ -169,6 +171,11 @@ func TestReleaseCallsStoreForCurrentHolderWhenLeader(t *testing.T) {
 	// this is the only observable proxy for "uses its own context".
 	if calls[0].ctxErr != nil {
 		t.Fatalf("ctx passed to ReleaseLeaderLock was already done: %v, want a fresh context", calls[0].ctxErr)
+	}
+	// ...and that fresh context must be BOUNDED: an unbounded release on a
+	// wedged store would hang shutdown.
+	if !calls[0].hasDeadline {
+		t.Fatal("ctx passed to ReleaseLeaderLock has no deadline, want the internal release timeout")
 	}
 }
 
