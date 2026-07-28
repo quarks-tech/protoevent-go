@@ -153,6 +153,7 @@ var _ outbox.Store = (*Store)(nil)
 var (
 	_ sequence.Sequencer = (*RelayStore)(nil)
 	_ sequence.Sweeper   = (*RelayStore)(nil)
+	_ sequence.Clock     = (*RelayStore)(nil)
 	_ relay.LeaderStore  = (*RelayStore)(nil)
 )
 
@@ -189,6 +190,7 @@ type relayQueries struct {
 	readLockHolder string
 	releaseLock    string
 	sweep          string
+	storeNow       string
 }
 
 func buildRelayQueries(c config) relayQueries {
@@ -254,6 +256,7 @@ WHERE seq IS NOT NULL
   AND seq <= (SELECT MIN(last_seq) FROM %s)
   AND create_time < NOW(6) - INTERVAL ? MICROSECOND
 LIMIT ?`, messages, offsets),
+		storeNow: `SELECT NOW(6)`,
 	}
 }
 
@@ -279,6 +282,7 @@ var (
 	_ sequence.Store     = (*RelayStore)(nil)
 	_ sequence.Sequencer = (*RelayStore)(nil)
 	_ sequence.Sweeper   = (*RelayStore)(nil)
+	_ sequence.Clock     = (*RelayStore)(nil)
 	_ relay.LeaderStore  = (*RelayStore)(nil)
 )
 
@@ -297,9 +301,18 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 	if m.Metadata == nil {
 		return errors.New("outbox: message metadata is nil")
 	}
+	// The error names the remedy, because of WHERE this fails: the insert runs
+	// inside the caller's business transaction, so a non-UUID id does not merely
+	// fail the publish — it rolls back the user's whole request. The default row-ID
+	// generator reuses Metadata.ID, and CloudEvents allows any unique string there,
+	// so a service that publishes ids like "order-42-created" hits this on its first
+	// write with no hint that the fix is one option away.
 	id, err := uuid.Parse(m.ID)
 	if err != nil {
-		return fmt.Errorf("outbox: parse message ID %q: %w", m.ID, err)
+		return fmt.Errorf("outbox: message ID %q is not a UUID (the event_id column is BINARY(16)): %w"+
+			" — either publish UUID event ids, or decouple the row key from them with"+
+			" outbox.NewSender(store, outbox.WithRowIDGenerator(outbox.GenerateUUIDv4))",
+			m.ID, err)
 	}
 	md := m.Metadata
 	if md.Time.IsZero() {
@@ -392,25 +405,42 @@ func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit in
 }
 
 // Offset returns the named consumer's watermark (0 if unset).
-func (rs *RelayStore) Offset(ctx context.Context, name string) (int64, error) {
+func (rs *RelayStore) Offset(ctx context.Context, name string) (int64, bool, error) {
 	var seq int64
 	err := rs.db.QueryRowContext(ctx, rs.q.offset, name).Scan(&seq)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
+		// No row: the relay primes. Distinct from a row holding 0, which is a
+		// committed position and must not be re-primed — see sequence.Store.Offset.
+		return 0, false, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("outbox: offset: %w", err)
+		return 0, false, fmt.Errorf("outbox: offset: %w", err)
 	}
-	return seq, nil
+	return seq, true, nil
 }
 
-// CommitOffset advances the watermark monotonically (GREATEST).
+// CommitOffset advances the watermark monotonically (GREATEST) and creates the
+// row if absent — the relay registers a replay-from-beginning group by
+// committing seq 0, so that the sweep's MIN(last_seq) cutoff accounts for it
+// before it has delivered anything.
 func (rs *RelayStore) CommitOffset(ctx context.Context, name string, seq int64) error {
 	_, err := rs.db.ExecContext(ctx, rs.q.commitOffset, name, seq)
 	if err != nil {
 		return fmt.Errorf("outbox: commit offset: %w", err)
 	}
 	return nil
+}
+
+// StoreNow returns the database's current time (sequence.Clock), so the relay
+// reports lag against the same clock that stamped create_time instead of the
+// relay host's — see sequence.Clock for why that matters. NOW(6) matches the
+// column's microsecond precision.
+func (rs *RelayStore) StoreNow(ctx context.Context) (time.Time, error) {
+	var now time.Time
+	if err := rs.db.QueryRowContext(ctx, rs.q.storeNow).Scan(&now); err != nil {
+		return time.Time{}, fmt.Errorf("outbox: store now: %w", err)
+	}
+	return now, nil
 }
 
 // InitOffsetLatest creates the named consumer group's offset row at the

@@ -1,0 +1,188 @@
+package structured
+
+import (
+	"testing"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+
+	"github.com/quarks-tech/protoevent-go/pkg/event"
+)
+
+// TestMarshalRejectsCoreAttributeCollision pins that an extension cannot overwrite
+// a core CloudEvents attribute.
+//
+// Structured mode puts extensions in the same flat JSON object as the core
+// attributes (binary mode does not — it prefixes core attributes with
+// cloudEvents:), so merging extensions over the map lets an extension named
+// "source", "type" or "data" replace the real attribute. The consumer then routes
+// on a type nobody registered and parks every delivery, or decodes the extension
+// value as the payload — and the failure only appears after a switch to structured
+// mode, with nothing in the error naming the extension.
+func TestMarshalRejectsCoreAttributeCollision(t *testing.T) {
+	core := []string{"specversion", "id", "type", "source", "data", "datacontenttype", "dataschema", "subject", "time"}
+
+	for _, name := range core {
+		t.Run(name, func(t *testing.T) {
+			md := event.NewMetadata("books.v1.BookCreated")
+			md.ID = "x"
+			md.Source = "/svc"
+			md.Extensions = map[string]any{name: "hijacked"}
+
+			if _, err := (Marshaler{}).Marshal(md, []byte(`{}`)); err == nil {
+				t.Fatalf("Marshal() error = nil for an extension named %q, want a collision error", name)
+			}
+		})
+	}
+}
+
+// TestMarshalAcceptsNonCollidingExtensions pins that ordinary extensions still
+// pass through.
+func TestMarshalAcceptsNonCollidingExtensions(t *testing.T) {
+	md := event.NewMetadata("books.v1.BookCreated")
+	md.ID = "x"
+	md.Source = "/svc"
+	md.Extensions = map[string]any{"traceparent": "00-abc-def-01", "tenant": "acme"}
+
+	pub, err := Marshaler{}.Marshal(md, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	md2, _, err := Marshaler{}.Unmarshal(&amqp.Delivery{Body: pub.Body})
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if md2.Type != "books.v1.BookCreated" {
+		t.Fatalf("Type = %q, want the published type", md2.Type)
+	}
+	if md2.Extensions["tenant"] != "acme" {
+		t.Fatalf("Extensions[tenant] = %v, want acme", md2.Extensions["tenant"])
+	}
+}
+
+// TestUnmarshalAcceptsScalarAttributes pins wire compatibility for string-valued
+// CloudEvents attributes emitted as JSON numbers or booleans.
+//
+// Every one of these attributes is a string in the spec, but publishers in other
+// languages do emit `"id": 12345`, and the quote-trimming decoder this replaced
+// accepted them (as "12345"). A strict string-only decoder would make such a
+// publisher unconsumable overnight, every delivery failing as unprocessable.
+func TestUnmarshalAcceptsScalarAttributes(t *testing.T) {
+	bodies := map[string]string{
+		"numeric id":        `{"specversion":"1.0","type":"books.v1.BookCreated","id":12345,"source":"/svc","data":{}}`,
+		"boolean id":        `{"specversion":"1.0","type":"books.v1.BookCreated","id":true,"source":"/svc","data":{}}`,
+		"numeric version":   `{"specversion":1.0,"type":"books.v1.BookCreated","id":"x","source":"/svc","data":{}}`,
+		"whitespace-padded": `{"specversion":"1.0","type":"books.v1.BookCreated","id": 12345 ,"source":"/svc","data":{}}`,
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			md, _, err := Marshaler{}.Unmarshal(&amqp.Delivery{Body: []byte(body)})
+			if err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if md.Type != "books.v1.BookCreated" {
+				t.Fatalf("Type = %q, want books.v1.BookCreated", md.Type)
+			}
+			if md.ID == "" {
+				t.Fatal("ID = \"\", want the scalar coerced to its literal text")
+			}
+		})
+	}
+}
+
+// TestUnmarshalRejectsNonScalarAttributes pins the limit of that tolerance: null,
+// objects and arrays carry no string value, and the old quote-trimming path
+// "accepted" them as their raw JSON text.
+func TestUnmarshalRejectsNonScalarAttributes(t *testing.T) {
+	bodies := map[string]string{
+		"null id":     `{"specversion":"1.0","type":"t.E","id":null,"source":"/svc","data":{}}`,
+		"object id":   `{"specversion":"1.0","type":"t.E","id":{"a":1},"source":"/svc","data":{}}`,
+		"array id":    `{"specversion":"1.0","type":"t.E","id":[1,2],"source":"/svc","data":{}}`,
+		"empty id":    `{"specversion":"1.0","type":"t.E","id":"","source":"/svc","data":{}}`,
+		"missing id":  `{"specversion":"1.0","type":"t.E","source":"/svc","data":{}}`,
+		"object subj": `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","subject":{"a":1},"data":{}}`,
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := (Marshaler{}).Unmarshal(&amqp.Delivery{Body: []byte(body)}); err == nil {
+				t.Fatal("Unmarshal() error = nil, want a rejection")
+			}
+		})
+	}
+}
+
+// TestUnmarshalTreatsNullOptionalAttributesAsAbsent pins that an OPTIONAL attribute
+// can never fail a delivery for being absent-shaped. Generated serializers commonly
+// write every field, so `"subject": null` is ordinary on the wire; the
+// quote-trimming decoder this replaced never failed on it, and routing optional
+// attributes through a strict decoder would dead-letter every event from such a
+// publisher.
+func TestUnmarshalTreatsNullOptionalAttributesAsAbsent(t *testing.T) {
+	bodies := map[string]string{
+		"null subject":         `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","subject":null,"data":{}}`,
+		"null time":            `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","time":null,"data":{}}`,
+		"null dataschema":      `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","dataschema":null,"data":{}}`,
+		"null datacontenttype": `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","datacontenttype":null,"data":{}}`,
+		"empty subject":        `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","subject":"","data":{}}`,
+		"all of them":          `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","subject":null,"time":null,"dataschema":null,"datacontenttype":null,"data":{}}`,
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			md, _, err := Marshaler{}.Unmarshal(&amqp.Delivery{Body: []byte(body)})
+			if err != nil {
+				t.Fatalf("Unmarshal: %v (a null optional attribute must read as absent, not malformed)", err)
+			}
+			if md.Subject != "" {
+				t.Fatalf("Subject = %q, want empty", md.Subject)
+			}
+			if !md.Time.IsZero() {
+				t.Fatalf("Time = %v, want zero", md.Time)
+			}
+			if md.DataSchema != nil {
+				t.Fatalf("DataSchema = %v, want nil", md.DataSchema)
+			}
+		})
+	}
+}
+
+// TestUnmarshalRejectsNonScalarOptionalAttributes pins the limit: an object or
+// array carries no string to use, and accepting its raw JSON text is what produced
+// garbage metadata before.
+func TestUnmarshalRejectsNonScalarOptionalAttributes(t *testing.T) {
+	bodies := map[string]string{
+		"object subject": `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","subject":{"a":1},"data":{}}`,
+		"array subject":  `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","subject":[1,2],"data":{}}`,
+		"object time":    `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","time":{"a":1},"data":{}}`,
+		// An explicitly-present empty time is a malformed timestamp, not "absent":
+		// accepting it yields a zero Metadata.Time, the outbox poison marker.
+		"empty time":   `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","time":"","data":{}}`,
+		"garbage time": `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","time":"not-a-date","data":{}}`,
+	}
+
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := (Marshaler{}).Unmarshal(&amqp.Delivery{Body: []byte(body)}); err == nil {
+				t.Fatal("Unmarshal() error = nil, want a rejection")
+			}
+		})
+	}
+}
+
+// TestUnmarshalInterpretsEscapesInOptionalAttributes pins that optional
+// attributes go through the same JSON decoder as the required ones. The
+// quote-trimming path left escape sequences uninterpreted, so a subject
+// containing a quote arrived corrupted.
+func TestUnmarshalInterpretsEscapesInOptionalAttributes(t *testing.T) {
+	body := `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","subject":"a\"b","data":{}}`
+
+	md, _, err := Marshaler{}.Unmarshal(&amqp.Delivery{Body: []byte(body)})
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if md.Subject != `a"b` {
+		t.Fatalf("Subject = %q, want %q (escapes must be interpreted, not left raw)", md.Subject, `a"b`)
+	}
+}

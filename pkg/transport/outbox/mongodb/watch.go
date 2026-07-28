@@ -156,16 +156,19 @@ func (m *mongoStream) Next(ctx context.Context) (*stream.Event, bool, error) {
 // Fallback for a token whose payload defies the known layout: client "now"
 // truncated to whole seconds (bson.Timestamp granularity — millisecond
 // precision would compare NEWER than a same-second event and misclassify the
-// very next event-token save as stale).
-func (m *mongoStream) Checkpoint() (string, time.Time) {
+// very next event-token save as stale). The third return reports which of the two
+// it is, because the relay may persist either but may only CALIBRATE its clock
+// offset from a server-derived one — calibrating from the local substitute would
+// mark the offset trustworthy while it is really the raw host clock.
+func (m *mongoStream) Checkpoint() (string, time.Time, bool) {
 	tok := m.cs.ResumeToken()
 	if tok == nil {
-		return "", time.Time{}
+		return "", time.Time{}, false
 	}
 	if ct, ok := clusterTimeFromToken(tok); ok {
-		return string(tok), ct
+		return string(tok), ct, true
 	}
-	return string(tok), time.Now().UTC().Truncate(time.Second)
+	return string(tok), time.Now().UTC().Truncate(time.Second), false
 }
 
 // clusterTimeFromToken extracts the clusterTime embedded in a resume token.
@@ -253,6 +256,21 @@ func decodeErrorFromRaw(raw bson.Raw, err error) *stream.DecodeError {
 // isHistoryLost reports whether err is the server's ChangeStreamHistoryLost
 // error (code 286), signaled either by the bare code or by the
 // NonResumableChangeStreamError label the server attaches to it.
+//
+// The label check is deliberately broader than code 286. The server also attaches
+// that label to other non-resumable stream failures (an invalidated stream, a
+// dropped collection), so this over-reports: such a failure is answered with
+// ErrHistoryLost, sending the operator to the break-glass DeleteToken + manual
+// re-read runbook when a different response was the right one.
+//
+// That is the chosen side of the trade. The alternative — keying on the code alone
+// — under-reports on any server version that surfaces the condition via the label
+// without the bare code, and an unrecognized history-lost error is not a survivable
+// state: the relay retries a resume point the oplog no longer contains, forever,
+// with the one actionable signal never raised. An over-eager break-glass verdict
+// costs an operator a wasted investigation; a missed one costs a wedged relay. If a
+// server version is ever confirmed to attach this label to a resumable condition,
+// narrow it then — with that version named here.
 func isHistoryLost(err error) bool {
 	se, ok := errors.AsType[mongo.ServerError](err)
 	if !ok {

@@ -76,7 +76,7 @@ func TestRelayEndToEndOrderAndDelivery(t *testing.T) {
 		t.Fatalf("delivered IDs =\n%v\nwant (published order)\n%v", sender.ids, wantIDs)
 	}
 	// Offset advanced to 50.
-	off, err := tidb.NewRelayStore(testDB).Offset(context.Background(), "e2e")
+	off, _, err := tidb.NewRelayStore(testDB).Offset(context.Background(), "e2e")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +176,7 @@ func TestRelayRestartAfterPrimingDeliversPending(t *testing.T) {
 	if !reflect.DeepEqual(sender.ids, wantIDs) {
 		t.Fatalf("delivered IDs =\n%v\nwant (published order)\n%v", sender.ids, wantIDs)
 	}
-	off, err := tidb.NewRelayStore(testDB).Offset(ctx, "restart")
+	off, _, err := tidb.NewRelayStore(testDB).Offset(ctx, "restart")
 	if err != nil {
 		t.Fatal(err)
 	}

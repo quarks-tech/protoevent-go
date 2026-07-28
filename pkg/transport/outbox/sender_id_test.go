@@ -32,7 +32,7 @@ func TestSenderDefaultReusesMetadataID(t *testing.T) {
 	store := &captureStore{}
 	sender := outbox.NewSender(store)
 
-	if err := sender.Send(context.Background(), newMetadata("event-id"), nil); err != nil {
+	if err := sender.Send(t.Context(), newMetadata("event-id"), nil); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
@@ -48,7 +48,7 @@ func TestSenderGenerateV4Option(t *testing.T) {
 	store := &captureStore{}
 	sender := outbox.NewSender(store, outbox.WithRowIDGenerator(outbox.GenerateUUIDv4))
 
-	if err := sender.Send(context.Background(), newMetadata("event-id"), nil); err != nil {
+	if err := sender.Send(t.Context(), newMetadata("event-id"), nil); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
@@ -68,7 +68,7 @@ func TestSenderReuseMetadataID(t *testing.T) {
 	store := &captureStore{}
 	sender := outbox.NewSender(store, outbox.WithRowIDGenerator(outbox.ReuseMetadataID))
 
-	if err := sender.Send(context.Background(), newMetadata("event-id"), nil); err != nil {
+	if err := sender.Send(t.Context(), newMetadata("event-id"), nil); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestSenderCustomGenerator(t *testing.T) {
 		return "custom-id", nil
 	}))
 
-	if err := sender.Send(context.Background(), newMetadata("event-id"), nil); err != nil {
+	if err := sender.Send(t.Context(), newMetadata("event-id"), nil); err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
@@ -99,7 +99,7 @@ func TestSenderGeneratorErrorPropagates(t *testing.T) {
 		return "", sentinel
 	}))
 
-	err := sender.Send(context.Background(), newMetadata("event-id"), nil)
+	err := sender.Send(t.Context(), newMetadata("event-id"), nil)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want %v", err, sentinel)
 	}

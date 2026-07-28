@@ -4,6 +4,12 @@ go 1.26.5
 
 require (
 	github.com/google/uuid v1.6.0
+	// RELEASE GATE: these two pins are PROVISIONAL. This module uses outbox APIs
+	// (relay/stream) that the pinned outbox v0.4.3 tag does not contain, so it
+	// builds only inside the repo's go.work. `make check-modules` reproduces what
+	// an external `go get` sees. See ../tidb/go.mod for the publishing order (a
+	// `replace` cannot substitute: Go ignores replace directives in a non-main
+	// module, so a consumer would still resolve the tag below).
 	github.com/quarks-tech/protoevent-go v0.4.2
 	github.com/quarks-tech/protoevent-go/pkg/transport/outbox v0.4.3
 	github.com/testcontainers/testcontainers-go v0.43.0

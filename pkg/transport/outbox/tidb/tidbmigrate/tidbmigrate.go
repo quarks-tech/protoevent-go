@@ -80,6 +80,10 @@ func Apply(db *sql.DB, opts ...Option) error {
 	if err != nil {
 		return fmt.Errorf("outbox: migrate: acquire conn: %w", err)
 	}
+	if err := checkMultiStatements(ctx, conn); err != nil {
+		_ = conn.Close()
+		return err
+	}
 	drv, err := migratemysql.WithConnection(ctx, conn, &mysqlCfg)
 	if err != nil {
 		_ = conn.Close()
@@ -94,5 +98,25 @@ func Apply(db *sql.DB, opts ...Option) error {
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return fmt.Errorf("outbox: migrate: apply: %w", err)
 	}
+	return nil
+}
+
+// checkMultiStatements fails early, and in the operator's own terms, when the DSN
+// does not allow multiple statements per Exec.
+//
+// golang-migrate hands each migration file to the driver as ONE Exec, and
+// 000001_create_outbox.up.sql is five statements. Without multiStatements=true the
+// driver rejects everything after the first, and the error it produces —
+// "Error 1064: You have an error in your SQL syntax ... near 'CREATE TABLE
+// outbox_sequencers'" — points at this package's DDL and reads like a bug in the
+// library rather than a missing DSN parameter. A two-statement probe turns that
+// into a message that names the actual fix.
+func checkMultiStatements(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, "SELECT 1; SELECT 1"); err != nil {
+		return fmt.Errorf("outbox: migrate: the DSN must set multiStatements=true "+
+			"(golang-migrate applies each migration file as a single statement batch, and the schema migration is "+
+			"several statements; without it the driver rejects the DDL with a misleading syntax error): %w", err)
+	}
+
 	return nil
 }

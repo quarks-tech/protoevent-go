@@ -3,7 +3,6 @@ package rabbitmq
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -78,6 +77,14 @@ func (s *Sender) Setup(ctx context.Context, desc *eventbus.ServiceDesc) error {
 	})
 }
 
+// splitEventType maps an event type onto AMQP routing: the service part is the
+// exchange, the event part the routing key. The split itself is event.SplitType —
+// the one definition of the event-type shape, shared with the publisher's
+// write-side guard and the subscriber's routing, so the three cannot drift.
+func splitEventType(eventType string) (exchange, routingKey string, err error) {
+	return event.SplitType(eventType)
+}
+
 func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) error {
 	mess, err := s.options.marshaler.Marshal(meta, data)
 	if err != nil {
@@ -86,9 +93,13 @@ func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) er
 
 	mess.DeliveryMode = s.options.deliveryMode
 
-	pos := strings.LastIndex(meta.Type, ".")
-	exchange := mess.Type[:pos]
-	routingKey := mess.Type[pos+1:]
+	// Route off meta.Type, the authoritative event type — a marshaler is free to
+	// leave amqp.Publishing.Type empty or rewrite it. meta.Type may come from a
+	// persisted outbox row, so a malformed value must error, not panic.
+	exchange, routingKey, err := splitEventType(meta.Type)
+	if err != nil {
+		return err
+	}
 
 	return s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
 		if err := conn.Channel().PublishWithContext(ctx, exchange, routingKey, false, false, mess); err != nil {

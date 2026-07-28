@@ -24,6 +24,7 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/leader"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/notify"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
@@ -117,7 +118,16 @@ type Stream interface {
 	// stop-the-lane (which persists nothing itself) still has a prior
 	// position to reopen from, instead of restarting at a fresh "now" and
 	// silently skipping the failed event.
-	Checkpoint() (token string, commitTime time.Time)
+	//
+	// serverTime reports whether commitTime came from the SERVER's clock (decoded
+	// out of the token) or is a local-clock substitute the implementation fell back
+	// to. Both are fine to persist — the monotone save guard only needs a
+	// comparable value — but only a server-derived one may be used to calibrate the
+	// relay's clock-offset estimate. Feeding a local substitute into that
+	// calibration would mark the estimate "calibrated" while it is really the raw
+	// host clock, i.e. exactly the skew-blind measurement the estimate exists to
+	// avoid, with no signal that it happened.
+	Checkpoint() (token string, commitTime time.Time, serverTime bool)
 	Close(ctx context.Context) error
 }
 
@@ -146,6 +156,7 @@ type options struct {
 	Logger        *slog.Logger // defaults to a discard logger
 	Observer      relay.Observer
 	PoisonHandler relay.PoisonHandler
+	Unsendable    relay.UnsendableClassifier // nil: every send failure stops the lane
 }
 
 // defaultOptions returns the default stream relay configuration. The zero
@@ -194,13 +205,23 @@ func WithObserver(obs relay.Observer) Option {
 // WithPoisonHandler installs the poison-parking hook: an event whose payload
 // fails to decode (*DecodeError with a usable resume token) is handed to h
 // and the relay advances past it — retrying a poison event can never succeed,
-// so parking it is the only way to keep the lane moving. Send failures are
-// NOT parked regardless of this option: a send failure is downstream trouble,
-// and the lane always stops and redelivers the same event on reopen (order
-// and delivery preserved). Without a PoisonHandler a poison event stops the
-// lane.
+// so parking it is the only way to keep the lane moving. Send failures are not
+// parked by default: a send failure is downstream trouble, and the lane stops
+// and redelivers the same event on reopen (order and delivery preserved) —
+// unless an UnsendableClassifier claims it, see WithUnsendableClassifier.
+// Without a PoisonHandler a poison event stops the lane.
 func WithPoisonHandler(h relay.PoisonHandler) Option {
 	return func(o *options) { o.PoisonHandler = h }
+}
+
+// WithUnsendableClassifier installs the escape hatch for an event the downstream
+// transport will never accept: when f reports a send failure permanent for that
+// specific event, it is parked through the PoisonHandler and the lane advances
+// past it instead of redelivering it on every reopen forever. Every failure f
+// does not claim still stops the lane. Requires WithPoisonHandler. See
+// relay.UnsendableClassifier for the (narrow) contract f must honor.
+func WithUnsendableClassifier(f relay.UnsendableClassifier) Option {
+	return func(o *options) { o.Unsendable = f }
 }
 
 // Relay tails the outbox change stream for one consumer group and forwards to
@@ -218,10 +239,32 @@ type Relay struct {
 	committedCT  time.Time
 	lastSavedTok string // last token successfully persisted (skip no-op saves on idle windows)
 
+	// clockOffset is (MongoDB server clock - this host's clock), calibrated from a
+	// clusterTime read while the relay was CAUGHT UP, where that reading is the
+	// stream head and therefore the server's "now". It lets committedTokenAge
+	// measure lag against the present without a query and without folding NTP skew
+	// between the pod and the primary into the number. clockCalibrated is false
+	// until a first caught-up window happens; see calibrateClock/serverNow.
+	clockOffset     time.Duration
+	clockCalibrated bool
+	// calibratedHead is the head the current offset was derived from, so a stream
+	// sitting at an unchanged position cannot recalibrate the estimate backwards.
+	calibratedHead time.Time
+
 	// wasLeader tracks the last observed leadership state so transitions —
 	// and only transitions — reach OnLeadership/the log (see trackLeadership).
 	wasLeader bool
+
+	// stuck escalates a lane that keeps stopping at the same resume token into a
+	// single relay.StuckLaneError per episode. Keyed on the raw token so the
+	// per-event Progress call allocates nothing. See noteStuck.
+	stuck notify.StuckTracker[string]
 }
+
+// StuckLaneError is relay.StuckLaneError, re-exported so callers of this package
+// need not import relay to match on it. See its doc for the contract; Position
+// carries "resume token <tok>" for this runtime.
+type StuckLaneError = relay.StuckLaneError
 
 // NewRelay creates a stream relay for the named consumer group. It validates
 // the configuration and returns an error when:
@@ -273,14 +316,22 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	if options.DrainWindow >= options.LeaseTTL/2 {
 		return nil, fmt.Errorf("stream: DrainWindow (%v) must be < LeaseTTL/2 (%v)", options.DrainWindow, options.LeaseTTL/2)
 	}
+	if options.Unsendable != nil && options.PoisonHandler == nil {
+		return nil, errors.New("stream: WithUnsendableClassifier requires WithPoisonHandler (there is nowhere to park an unsendable event otherwise)")
+	}
 
-	ls, hasLeaderStore := store.(relay.LeaderStore)
-	if !hasLeaderStore {
+	// A store implementing only PART of relay.LeaderStore is rejected outright
+	// (see relay.CheckLeaderStore): silently degrading a broken lock
+	// implementation to always-leader runs dual leaders across replicas.
+	ls, err := relay.CheckLeaderStore(store)
+	if err != nil {
+		return nil, fmt.Errorf("stream: %w", err)
+	}
+	if ls == nil {
 		// Always-leader is a documented single-instance mode, not an error —
-		// but it must not be a silent one: a custom store that MEANT to
-		// implement relay.LeaderStore would otherwise run dual leaders in a
-		// multi-replica deployment with no signal until duplicate delivery
-		// is noticed.
+		// but it must not be a silent one: a multi-replica deployment over such
+		// a store runs dual leaders with no signal until duplicate delivery is
+		// noticed.
 		options.Logger.Info("stream relay: store has no relay.LeaderStore capability; running always-leader (single-instance mode)",
 			"relay", name)
 	}

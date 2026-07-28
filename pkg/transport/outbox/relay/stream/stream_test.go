@@ -93,14 +93,15 @@ func (f senderFunc) Send(ctx context.Context, md *event.Metadata, d []byte) erro
 
 // fakeStream serves a scripted list of events, then empty windows.
 type fakeStream struct {
-	events     []*stream.Event
-	errs       map[int]error // when set for slot i, Next returns the error instead of events[i] (events[i] is a nil placeholder)
-	i          int
-	pbrt       string
-	pbrtCT     time.Time
-	closeCount int
-	nextErr    error         // when set, Next always returns this error instead of draining events
-	blockDur   time.Duration // when set, an empty-window Next sleeps this long first, mirroring the real driver's maxAwaitTime block instead of returning instantly (which would busy-spin a bubbled Run)
+	events         []*stream.Event
+	errs           map[int]error // when set for slot i, Next returns the error instead of events[i] (events[i] is a nil placeholder)
+	i              int
+	pbrt           string
+	pbrtCT         time.Time
+	pbrtLocalClock bool // Checkpoint reports pbrtCT as a local-clock substitute, not server-derived
+	closeCount     int
+	nextErr        error         // when set, Next always returns this error instead of draining events
+	blockDur       time.Duration // when set, an empty-window Next sleeps this long first, mirroring the real driver's maxAwaitTime block instead of returning instantly (which would busy-spin a bubbled Run)
 
 	// Recorded by Close, so tests can assert the close context is a fresh
 	// bounded one (deadline set, not already canceled) even on shutdown paths.
@@ -127,7 +128,13 @@ func (s *fakeStream) Next(context.Context) (*stream.Event, bool, error) {
 	}
 	return nil, false, nil // window empty
 }
-func (s *fakeStream) Checkpoint() (string, time.Time) { return s.pbrt, s.pbrtCT }
+
+// Checkpoint reports its clusterTime as server-derived unless pbrtLocalClock is
+// set, which models the real store's fallback for a token whose payload defies the
+// known layout (mongodb.mongoStream.Checkpoint).
+func (s *fakeStream) Checkpoint() (string, time.Time, bool) {
+	return s.pbrt, s.pbrtCT, !s.pbrtLocalClock
+}
 func (s *fakeStream) Close(ctx context.Context) error {
 	s.closeCount++
 	_, s.closeHadDeadline = ctx.Deadline()
@@ -268,6 +275,305 @@ func TestRunOnceDeliversAndPersistsLastToken(t *testing.T) {
 	}
 	if st.savedTok != "b" {
 		t.Fatalf("saved token = %q, want b (last processed)", st.savedTok)
+	}
+}
+
+// evAt builds an event whose resume position carries a specific server
+// clusterTime, for the lag-domain assertions.
+func evAt(tok string, ct time.Time) *stream.Event {
+	e := ev(tok)
+	e.CommitTime = ct
+	return e
+}
+
+// TestCommittedTokenAgeToleratesClockSkew pins the cliff metric's immunity to
+// clock skew between the relay pod and the MongoDB primary. committedCT is a
+// server clusterTime, so subtracting it from a raw host clock folds the whole
+// offset into the signal: on a pod whose clock trails the primary the result goes
+// NEGATIVE for a genuinely lagging token, and a gauge plots that as ~0 — so the
+// one alarm meant to fire before the token falls off the oplog stays flat and the
+// relay eventually hits ErrHistoryLost.
+//
+// The server here runs 24 hours ahead of the host, an absurd offset chosen so that
+// any leak of the raw host clock into the result is unmissable. The relay first
+// reaches a caught-up window (which is what calibrates the offset), then the token
+// is left to age 30 minutes.
+func TestCommittedTokenAgeToleratesClockSkew(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const skew = 24 * time.Hour
+
+		serverNow := time.Now().Add(skew)
+
+		// No events: the window ends caught up, so the Checkpoint IS the head.
+		fs := &fakeStream{pbrt: "head-1", pbrtCT: serverNow}
+		st := &fakeStore{stream: fs}
+
+		var ages []time.Duration
+		r := mustRelay(t, st, senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil }),
+			stream.WithObserver(relay.Observer{
+				OnDrained: func(_ string, _ int, oldestAge time.Duration, _ bool) {
+					ages = append(ages, oldestAge)
+				},
+			}))
+
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		if len(ages) != 1 {
+			t.Fatalf("OnDrained fired %d times, want 1", len(ages))
+		}
+		if ages[0] > time.Second {
+			t.Fatalf("committedTokenAge = %v for a caught-up relay, want ~0 "+
+				"(a raw host-clock measurement would report -24h or +24h)", ages[0])
+		}
+
+		// The stream head stops advancing and time passes: the committed token is
+		// now genuinely 30 minutes behind the present.
+		time.Sleep(30 * time.Minute)
+		synctest.Wait()
+
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce (second): %v", err)
+		}
+
+		last := ages[len(ages)-1]
+		if last < 30*time.Minute || last > 31*time.Minute {
+			t.Fatalf("committedTokenAge = %v after 30m, want ~30m (skew must not leak into the signal)", last)
+		}
+	})
+}
+
+// TestCommittedTokenAgeCalibratesOnBusyRelay pins that the clock offset is
+// calibrated on ANY caught-up window, not only on a completely event-free one.
+//
+// A relay under continuous load never has an event-free window: every window
+// delivers something and ends in the advanced branch. If calibration lives only in
+// the empty-window branch, such a relay never calibrates for its whole process
+// lifetime and the lag metric silently degrades to the raw host clock — which is
+// exactly the skew-blindness the offset exists to remove, and it degrades without
+// any signal.
+//
+// The group already has a stored token, so the fresh-group baseline (which would
+// calibrate on its own) is not in play; the server runs 24 hours ahead of the host
+// so an uncalibrated measurement is unmistakable.
+func TestCommittedTokenAgeCalibratesOnBusyRelay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const skew = 24 * time.Hour
+
+		head := time.Now().Add(skew)           // server "now"
+		eventCT := head.Add(-10 * time.Minute) // events genuinely 10m behind the head
+
+		fs := &fakeStream{
+			events: []*stream.Event{evAt("a", eventCT), evAt("b", eventCT)},
+			pbrt:   "head-1",
+			pbrtCT: head,
+		}
+		// Non-empty stored token: an existing group, so RunOnce skips the
+		// fresh-group baseline persist and its calibration.
+		st := &fakeStore{stream: fs, loadTok: "prev", loadCT: eventCT}
+
+		var ages []time.Duration
+		r := mustRelay(t, st, senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil }),
+			stream.WithObserver(relay.Observer{
+				OnDrained: func(_ string, _ int, oldestAge time.Duration, _ bool) {
+					ages = append(ages, oldestAge)
+				},
+			}))
+
+		// One window: delivers both events AND runs out of them (caught up).
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+
+		if len(ages) != 1 {
+			t.Fatalf("OnDrained fired %d times, want 1", len(ages))
+		}
+		if ages[0] < 9*time.Minute || ages[0] > 11*time.Minute {
+			t.Fatalf("committedTokenAge = %v, want ~10m: a window that delivered events but ended caught up "+
+				"must still calibrate the clock offset, or a busy relay never calibrates and the metric "+
+				"falls back to the raw host clock (which reports ~0 here)", ages[0])
+		}
+	})
+}
+
+// TestCommittedTokenAgeGrowsWhileBacklogged pins the metric against the trap that
+// anchoring it to the stream's own readings creates. A relay replaying a backlog
+// reads OLD events, so the newest clusterTime it has seen equals the position it
+// just committed — anchor the age to that and the gauge reads ~0 for a relay hours
+// behind, silent in exactly the case the alarm exists for. (Nor can the true head
+// be observed mid-backlog: ResumeToken reports the last returned document while a
+// batch is in flight.)
+func TestCommittedTokenAgeGrowsWhileBacklogged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Calibrate on a caught-up window, then feed a 6-hour-old backlog.
+		serverNow := time.Now()
+		fs := &fakeStream{pbrt: "head-1", pbrtCT: serverNow}
+		st := &fakeStore{stream: fs}
+
+		var ages []time.Duration
+		r := mustRelay(t, st, senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil }),
+			stream.WithObserver(relay.Observer{
+				OnDrained: func(_ string, _ int, oldestAge time.Duration, _ bool) {
+					ages = append(ages, oldestAge)
+				},
+			}))
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce (calibrate): %v", err)
+		}
+
+		// Six hours of real time pass while the relay works through events whose
+		// clusterTimes are all six hours old — the backlog case.
+		time.Sleep(6 * time.Hour)
+		synctest.Wait()
+
+		old := serverNow
+		fs.events = []*stream.Event{evAt("old-1", old), evAt("old-2", old)}
+		fs.i = 0
+
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce (backlog): %v", err)
+		}
+
+		last := ages[len(ages)-1]
+		if last < 6*time.Hour {
+			t.Fatalf("committedTokenAge = %v for a relay 6h behind, want >= 6h "+
+				"(anchoring the age to the events the relay is replaying reports ~0 and never alerts)", last)
+		}
+	})
+}
+
+// TestCommittedTokenAgeGrowsDuringStopTheLane pins the metric against the failure
+// it exists for. During an outage the relay reopens onto the same failed event
+// every window, so NEITHER clusterTime advances: a pure server-domain subtraction
+// freezes at ~0 for the whole incident, the cliff alert never fires, and the relay
+// eventually dies with ErrHistoryLost. The reported age must keep growing with
+// elapsed time even while the stream head stands still.
+//
+// synctest's fake clock makes the elapsed term deterministic.
+func TestCommittedTokenAgeGrowsDuringStopTheLane(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		serverNow := time.Now().Add(-24 * time.Hour)
+
+		st := &fakeStore{stream: &fakeStream{
+			events:  []*stream.Event{evAt("a", serverNow), evAt("stuck", serverNow)},
+			pbrt:    "a",
+			pbrtCT:  serverNow,
+			nextErr: nil,
+		}}
+
+		sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+			if md.ID == "stuck" {
+				return errors.New("broker down")
+			}
+			return nil
+		})
+
+		var ages []time.Duration
+		r := mustRelay(t, st, sender, stream.WithObserver(relay.Observer{
+			OnDrained: func(_ string, _ int, oldestAge time.Duration, _ bool) {
+				ages = append(ages, oldestAge)
+			},
+		}))
+
+		// First pass: "a" is delivered and committed, "stuck" fails.
+		if err := r.RunOnce(t.Context()); err != nil && !errors.Is(err, stream.ErrLaneStopped) {
+			t.Fatalf("RunOnce: %v", err)
+		}
+
+		// The stream is exhausted, so subsequent windows observe no new head at
+		// all — the frozen-metric scenario.
+		time.Sleep(30 * time.Minute)
+		synctest.Wait()
+
+		if err := r.RunOnce(t.Context()); err != nil && !errors.Is(err, stream.ErrLaneStopped) {
+			t.Fatalf("RunOnce (second): %v", err)
+		}
+
+		if len(ages) < 2 {
+			t.Fatalf("OnDrained fired %d times, want >= 2", len(ages))
+		}
+		last := ages[len(ages)-1]
+		if last < 30*time.Minute {
+			t.Fatalf("committedTokenAge = %v after 30m of a stop-the-lane outage, want >= 30m "+
+				"(a frozen gauge means the resume-token-cliff alert never fires)", last)
+		}
+	})
+}
+
+// TestCommittedTokenAgeNeverNegative pins the floor: a stale head observation
+// must not produce a negative lag, which no gauge can represent.
+func TestCommittedTokenAgeNeverNegative(t *testing.T) {
+	serverNow := time.Now().Add(-24 * time.Hour)
+	st := &fakeStore{stream: &fakeStream{events: []*stream.Event{evAt("a", serverNow)}}}
+
+	var ages []time.Duration
+	r := mustRelay(t, st, senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil }),
+		stream.WithObserver(relay.Observer{
+			OnDrained: func(_ string, _ int, oldestAge time.Duration, _ bool) {
+				ages = append(ages, oldestAge)
+			},
+		}))
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(ages) != 1 {
+		t.Fatalf("OnDrained fired %d times, want 1", len(ages))
+	}
+	if ages[0] < 0 {
+		t.Fatalf("committedTokenAge = %v, want >= 0", ages[0])
+	}
+}
+
+// TestUnsendableClassifierParksAndAdvances pins the stream runtime's escape
+// hatch for an event the broker will never accept. Without it such an event is
+// redelivered from the same reopened position on every window forever, and every
+// event behind it stops being delivered — recoverable only by hand-editing the
+// persisted token.
+func TestUnsendableClassifierParksAndAdvances(t *testing.T) {
+	st := &fakeStore{stream: &fakeStream{events: []*stream.Event{ev("a"), ev("bad"), ev("c")}}}
+
+	unsendable := errors.New("body exceeds frame_max")
+	var delivered []string
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if md.ID == "bad" {
+			return unsendable
+		}
+		delivered = append(delivered, md.ID)
+		return nil
+	})
+
+	var parked []string
+	r := mustRelay(t, st, sender,
+		stream.WithPoisonHandler(func(_ context.Context, m *outbox.Message, _ error) error {
+			parked = append(parked, m.ID)
+			return nil
+		}),
+		stream.WithUnsendableClassifier(func(err error) bool { return errors.Is(err, unsendable) }),
+	)
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(parked) != 1 || parked[0] != "bad" {
+		t.Fatalf("parked = %v, want [bad]", parked)
+	}
+	if len(delivered) != 2 || delivered[0] != "a" || delivered[1] != "c" {
+		t.Fatalf("delivered = %v, want [a c] (the lane must advance past the unsendable event)", delivered)
+	}
+	if st.savedTok != "c" {
+		t.Fatalf("saved token = %q, want c (resume position past the parked event)", st.savedTok)
+	}
+}
+
+// TestNewRelayRejectsUnsendableClassifierWithoutPoisonHandler pins the
+// construction guard: without a PoisonHandler there is nowhere to park.
+func TestNewRelayRejectsUnsendableClassifierWithoutPoisonHandler(t *testing.T) {
+	st := &fakeStore{stream: &fakeStream{}}
+	_, err := stream.NewRelay("c", st, senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil }),
+		stream.WithUnsendableClassifier(func(error) bool { return true }))
+	if err == nil || !strings.Contains(err.Error(), "WithPoisonHandler") {
+		t.Fatalf("err = %v, want an error naming WithPoisonHandler", err)
 	}
 }
 

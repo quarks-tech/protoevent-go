@@ -124,9 +124,12 @@ func TestPBRTNonEmptyImmediatelyAfterWatch(t *testing.T) {
 	}
 	defer func() { _ = s.Close(context.Background()) }()
 
-	tok, ct := s.Checkpoint()
+	tok, ct, serverTime := s.Checkpoint()
 	if tok == "" {
 		t.Fatal("Checkpoint returned empty immediately after Watch (before any Next); the fresh-group baseline persist relies on this being non-empty")
+	}
+	if !serverTime {
+		t.Error("Checkpoint reported serverTime=false for a real postBatchResumeToken: the relay would refuse to calibrate its clock offset and fall back to the raw host clock")
 	}
 	if ct.IsZero() {
 		t.Fatal("Checkpoint returned a zero clusterTime immediately after Watch")
@@ -408,7 +411,7 @@ func TestPBRTAdvancesOnIdle(t *testing.T) {
 	if ok {
 		t.Fatal("unexpected event on an idle stream")
 	}
-	tok, _ := s.Checkpoint()
+	tok, _, _ := s.Checkpoint()
 	if tok == "" {
 		t.Fatal("Checkpoint returned empty on an empty window; a caught-up consumer would fall off the oplog")
 	}

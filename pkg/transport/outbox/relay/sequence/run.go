@@ -3,6 +3,7 @@ package sequence
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
@@ -171,29 +172,55 @@ func (r *Relay) sequence(ctx context.Context) error {
 }
 
 // drain forwards messages in Seq order, committing the offset only after a
-// successful send. A send failure ALWAYS stops the lane — the failed message
-// retries next tick, preserving both order and delivery. Only a poison row
-// (persisted metadata that fails to decode, *DecodeError) is ever parked via
-// the PoisonHandler: retrying it can never succeed. Loops while pages are full
+// successful send. A send failure stops the lane — the failed message retries
+// next tick, preserving both order and delivery — unless an
+// UnsendableClassifier calls it permanent for that message. Rows parked via the
+// PoisonHandler are those retrying can never fix: a poison row (persisted
+// metadata that fails to decode, *DecodeError) and a classified-unsendable
+// message. Loops while pages are full
 // (bounded by maxPagesPerTick so a sustained backlog cannot starve the sweep),
 // renewing the leader lease between pages so a long backlog cannot outlive
 // the lease — bounding stale-leader overlap to a single page.
 func (r *Relay) drain(ctx context.Context) error {
-	offset, err := r.store.Offset(ctx, r.name)
+	// One store-clock read per pass, not per page (see oldestAge).
+	r.passStoreNow = time.Time{}
+
+	offset, exists, err := r.store.Offset(ctx, r.name)
 	if err != nil {
 		return err
 	}
-	if offset == 0 && !r.options.StartFromBeginning && !r.offsetInitialized {
-		// A brand-new group starts at "latest" (parity with the stream
-		// runtime's start-at-now) unless the caller opted into a full replay.
-		// InitOffsetLatest is insert-if-absent, so re-running it against an
-		// existing row — even one committed at 0 — is harmless: an existing
-		// row is never modified. The latch below only saves the round-trip.
-		offset, err = r.store.InitOffsetLatest(ctx, r.name)
-		if err != nil {
-			return err
+	// Gated on the ROW's existence, not on a "primed this process" flag and not on
+	// offset == 0. Both alternatives are wrong in one direction each: a memory latch
+	// makes a deleted offset row (the documented DeleteOffset decommission, applied
+	// to a running group) replay the whole retained log, because the relay reads 0
+	// and skips the re-prime; keying on offset == 0 instead re-primes every tick for
+	// as long as a group legitimately sits at 0, which is three round trips per
+	// PollInterval — including a write, or an INSERT that fails on duplicate key and
+	// litters the database's error log. Existence answers the actual question.
+	if !exists {
+		if r.options.StartFromBeginning {
+			// A replaying group must still REGISTER its offset row before it
+			// reads anything: retention protection is derived from MIN(last_seq)
+			// across the existing offset rows, so until this group has a row of
+			// its own the sweep computes the cutoff from the other groups alone
+			// and can delete the very history this group was configured to
+			// replay. Committing 0 is the registration primitive — CommitOffset
+			// is an insert-if-absent monotone upsert, so it creates the row at 0
+			// and is a no-op against any existing row.
+			if err := r.store.CommitOffset(ctx, r.name, 0); err != nil {
+				return err
+			}
+		} else {
+			// A brand-new group starts at "latest" (parity with the stream
+			// runtime's start-at-now) unless the caller opted into a full replay.
+			// InitOffsetLatest is insert-if-absent, so re-running it against an
+			// existing row — even one committed at 0 — is harmless: an existing
+			// row is never modified.
+			offset, err = r.store.InitOffsetLatest(ctx, r.name)
+			if err != nil {
+				return err
+			}
 		}
-		r.offsetInitialized = true
 	}
 
 	for range maxPagesPerTick {
@@ -226,8 +253,31 @@ func (r *Relay) drain(ctx context.Context) error {
 					canceled = true
 					break
 				}
-				// A send failure ALWAYS stops the lane, PoisonHandler or not:
-				// it is downstream trouble (broker down, timeout), not a
+				// A message the caller's classifier calls PERMANENTLY unsendable
+				// is parked like a poison row: retrying it can never succeed, and
+				// leaving it at the head of the log would wedge every event behind
+				// it indefinitely. Only a confirmed park (nil) advances past it;
+				// an unconfirmed one stops the lane and retries the park next
+				// tick. Either way handleError has already reported this failure,
+				// so the stop path below must not report it a second time —
+				// double-counting OnError misrepresents the incident's size.
+				if r.options.Unsendable != nil && r.options.Unsendable(sendErr) {
+					parkErr := r.handleError(ctx, r.options.PoisonHandler, m, sendErr)
+					if parkErr == nil {
+						maxSeq = m.Seq
+						r.noteSendOK(m.Seq)
+						continue
+					}
+					// The message cannot be sent AND cannot be parked, so the lane
+					// is wedged here for as long as the DLQ stays broken — the
+					// escalation applies exactly as it does to a plain send
+					// failure.
+					r.noteStuck(m.Seq, m.ID, errors.Join(sendErr, parkErr))
+					stopped = true
+					break
+				}
+				// Any other send failure ALWAYS stops the lane, PoisonHandler or
+				// not: it is downstream trouble (broker down, timeout), not a
 				// message fault, and parking healthy messages during an
 				// outage would bulk-divert the entire backlog to the DLQ
 				// while permanently advancing the offset past it. The failed
@@ -235,11 +285,13 @@ func (r *Relay) drain(ctx context.Context) error {
 				// (The nil handler keeps it out of the DLQ; observe+log only.)
 				// nil handler: return is always nil (send failures are never parked).
 				_ = r.handleError(ctx, nil, m, sendErr)
+				r.noteStuck(m.Seq, m.ID, sendErr)
 				stopped = true
 				break // stop-the-lane: leave this seq for the next tick
 			}
 			maxSeq = m.Seq
 			sent++
+			r.noteSendOK(m.Seq)
 		}
 
 		// A poison row (persisted metadata failed to decode) sits right after
@@ -258,7 +310,11 @@ func (r *Relay) drain(ctx context.Context) error {
 			if parkErr = r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: poison.ID, Seq: poison.Seq}, poison); parkErr == nil {
 				maxSeq = max(maxSeq, poison.Seq)
 				parkedPoison = true
+				r.noteSendOK(poison.Seq)
 			}
+			// An unconfirmed park falls through to the terminal switch below, which
+			// is where the wedge is reported — the same place the no-handler case
+			// reaches, so the two share one escalation site.
 		}
 
 		if maxSeq > offset {
@@ -284,7 +340,7 @@ func (r *Relay) drain(ctx context.Context) error {
 			more := stopped || canceled || full || poison != nil
 			oldestAge := time.Duration(0)
 			if len(msgs) > 0 {
-				oldestAge = time.Since(msgs[0].CreateTime)
+				oldestAge = r.oldestAge(ctx, msgs[0].CreateTime)
 			}
 			notify.Drained(r.options.Observer, r.name, sent, oldestAge, more)
 		}
@@ -303,6 +359,15 @@ func (r *Relay) drain(ctx context.Context) error {
 			// committed; surface the decode failure — joined with the park
 			// failure, if any, so a broken DLQ is visible in the error chain,
 			// not just in telemetry — and stop the lane at the poison row.
+			//
+			// This is the DEFAULT wedge: retrying an undecodable row can never
+			// succeed, so with no handler configured the lane stops here forever.
+			// The escalation matters most in exactly this case, and the park branch
+			// above cannot report it (it is gated on PoisonHandler being set), so
+			// report it here — noteStuck is idempotent per position, so a
+			// double-report from the park path is not possible.
+			r.noteStuck(poison.Seq, poison.ID, errors.Join(listErr, parkErr))
+
 			return errors.Join(listErr, parkErr)
 		case !full && !parkedPoison:
 			return nil
@@ -327,6 +392,78 @@ func (r *Relay) drain(ctx context.Context) error {
 	return nil // maxPagesPerTick full pages: yield to the sweep; the next tick continues
 }
 
+// noteSendOK ends a stuck episode after the message AT seq was successfully
+// disposed of (sent, or parked with confirmation). Keyed on seq, not
+// unconditional: a pass that re-delivers a prefix ahead of a wedged row would
+// otherwise reset the escalation timer every tick — see notify.StuckTracker.
+//
+// This runs once per delivered message, so the seq is handed over as-is: the
+// tracker compares positions directly and nothing is formatted here.
+func (r *Relay) noteSendOK(seq int64) { r.stuck.Progress(seq) }
+
+// noteStuck escalates a lane that keeps stopping at the same seq (see
+// notify.StuckTracker). Must be called from EVERY path that stops the lane — a
+// send failure, an unsendable message whose park was not confirmed, and a poison
+// row that was not parked (whether because no handler is configured, the default,
+// or because the park failed) — since each of them wedges the log identically.
+//
+// The position label is built only when an escalation fires (at most once per
+// episode), keeping its allocation off the per-message path.
+func (r *Relay) noteStuck(seq int64, id string, err error) {
+	stuckFor, escalate := r.stuck.Stuck(seq)
+	if !escalate {
+		return
+	}
+
+	notify.StuckLane(r.options.Observer, r.options.Logger, "sequence", r.name,
+		"seq "+strconv.FormatInt(seq, 10), id, stuckFor, err)
+}
+
+// oldestAge reports the age of the oldest event in a drained page — the lag
+// value handed to OnDrained.
+//
+// createTime is stamped by the STORE (the DB's NOW at insert), so the age is
+// computed against the store's clock whenever the store offers one (see Clock):
+// subtracting a DB-stamped timestamp from the relay host's time.Now() folds any
+// NTP skew between the two into the metric, and on a pod whose clock trails the
+// database it reports a NEGATIVE age for a genuinely stale backlog — which any
+// gauge wired to OnDrained plots as ~0, so the lag alert never fires. Without
+// the capability (or if the clock read fails) it falls back to the host clock,
+// which is correct to within the skew.
+//
+// The store clock is read at most once per drain pass — a pass can walk many
+// pages — and only when an OnDrained observer will actually consume the value,
+// so an unobserved relay issues no extra query.
+func (r *Relay) oldestAge(ctx context.Context, createTime time.Time) time.Duration {
+	if r.options.Observer.OnDrained == nil {
+		return 0 // nobody consumes it: don't pay for a clock read
+	}
+
+	now := time.Now()
+	if r.clock != nil {
+		if r.passStoreNow.IsZero() {
+			storeNow, err := r.clock.StoreNow(ctx)
+			if err != nil {
+				// Lag is telemetry: a failed clock read must not fail the pass.
+				// Latch the host clock so the fallback is reported once per pass.
+				r.options.Logger.Warn("sequence relay: store clock read failed; reporting lag against the host clock",
+					"relay", r.name, "err", err)
+				storeNow = now
+			}
+			r.passStoreNow = storeNow
+		}
+		now = r.passStoreNow
+	}
+
+	age := now.Sub(createTime)
+	if age < 0 {
+		// Only reachable on the host-clock fallback (a store clock cannot predate
+		// its own insert). A negative lag is not a signal any gauge can use.
+		return 0
+	}
+	return age
+}
+
 // maybeSweep runs the retention sweep at most once per RetentionSweepInterval
 // of wall-clock time — decoupled from PollInterval, so retuning the tick does
 // not silently change sweep cadence. The first leader tick sweeps immediately
@@ -349,9 +486,14 @@ func (r *Relay) maybeSweep(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if n > 0 {
-			notify.Swept(r.options.Observer, r.name, n)
-		}
+		// Reported even for n == 0. A zero sweep is not always the healthy
+		// idle case: the cutoff is MIN(last_seq) across ALL groups, so one lagging
+		// or replaying group (a WithStartFromBeginning group registers at 0) pins it
+		// and blocks pruning store-wide for as long as it lags. Gating the signal on
+		// n > 0 made a blocked sweep and a healthy one both emit NOTHING, so the log
+		// could grow toward disk-full with no way to tell the two apart. The loop
+		// exits immediately on a short page, so an idle interval reports once.
+		notify.Swept(r.options.Observer, r.name, n)
 		if n < r.options.RetentionSweepBatch {
 			return nil // drained the deletable backlog
 		}

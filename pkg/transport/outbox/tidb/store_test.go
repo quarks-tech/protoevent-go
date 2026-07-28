@@ -72,8 +72,14 @@ func TestMain(m *testing.M) {
 			if os.Getenv("CI") != "" {
 				log.Fatalf("tidb integration tests require Docker in CI: %v", err)
 			}
-			fmt.Fprintf(os.Stderr, "skipping tidb integration tests: %v\n", err)
-			os.Exit(0)
+			// Run the binary anyway. Every DB-backed test in this package guards on
+			// `testDB == nil` and skips itself, while the pure-unit tests (prefix
+			// validation, error classification, the doc examples, the nil-store
+			// validation checks) need no database at all. Exiting 0 here skipped
+			// those too — and `go test` still printed "ok" for the module, so a
+			// regression in them was invisible to anyone without Docker.
+			fmt.Fprintf(os.Stderr, "no Docker: tidb integration tests will skip, unit tests still run: %v\n", err)
+			os.Exit(m.Run())
 		}
 		fmt.Fprintf(os.Stderr, "tidb integration setup: %v\n", err)
 		os.Exit(1) // real harness bug, not a missing Docker
@@ -249,7 +255,7 @@ func TestCommitOffsetIsMonotone(t *testing.T) {
 	if err := st.CommitOffset(ctx, "c", 5); err != nil { // must not rewind
 		t.Fatal(err)
 	}
-	off, err := st.Offset(ctx, "c")
+	off, _, err := st.Offset(ctx, "c")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -587,7 +593,7 @@ func TestDeleteOffsetUnpinsSweep(t *testing.T) {
 	if err := st.DeleteOffset(ctx, "retired"); err != nil {
 		t.Fatalf("delete offset: %v", err)
 	}
-	off, err := st.Offset(ctx, "retired")
+	off, _, err := st.Offset(ctx, "retired")
 	if err != nil {
 		t.Fatal(err)
 	}

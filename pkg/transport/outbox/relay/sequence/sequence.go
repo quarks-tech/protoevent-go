@@ -20,6 +20,7 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/leader"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/notify"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
@@ -39,6 +40,11 @@ func (e *DecodeError) Error() string {
 
 func (e *DecodeError) Unwrap() error { return e.Err }
 
+// StuckLaneError is relay.StuckLaneError, re-exported so callers of this package
+// need not import relay to match on it. See its doc for the contract; Position
+// carries "seq <n>" for this runtime.
+type StuckLaneError = relay.StuckLaneError
+
 // Store is the sequenced-log read/offset contract, implemented over a
 // non-transactional connection (e.g. *sql.DB).
 type Store interface {
@@ -49,11 +55,26 @@ type Store interface {
 	// identifying the poison row.
 	ListMessages(ctx context.Context, afterSeq int64, limit int) ([]*outbox.Message, error)
 
-	// Offset returns the last committed Seq for the named consumer (0 if none).
-	Offset(ctx context.Context, name string) (int64, error)
+	// Offset returns the last committed Seq for the named consumer, and whether an
+	// offset row exists at all.
+	//
+	// exists is not cosmetic: a group's committed offset is legitimately 0 (a fresh
+	// group, or one waiting on the sequencer), so a bare 0 cannot distinguish
+	// "registered here" from "no row". Collapsing the two forces the relay either to
+	// re-prime on every single tick — three round trips, one of them a write or a
+	// deliberate duplicate-key failure, once per PollInterval forever — or to cache
+	// "primed" in memory, which turns a deleted offset row (the documented
+	// DeleteOffset decommission, applied to a running group) into a full replay of
+	// the retained log. With exists the relay primes exactly when there is no row.
+	Offset(ctx context.Context, name string) (offset int64, exists bool, err error)
 
 	// CommitOffset advances the named consumer's watermark. Implementations MUST
 	// be monotone (GREATEST semantics): a lower seq never rewinds the offset.
+	// They MUST also be insert-if-absent: the relay registers a
+	// WithStartFromBeginning group by committing seq 0 before its first read, so
+	// that the retention sweep's MIN(last_seq) cutoff accounts for the group
+	// from the start. An UPDATE-only implementation would leave the group
+	// unregistered and let the sweep delete the history it is replaying.
 	CommitOffset(ctx context.Context, name string, seq int64) error
 
 	// InitOffsetLatest is called when the consumer group has no
@@ -75,6 +96,23 @@ type Store interface {
 // batch by (tx_start_ts, id). Returns the number of rows sequenced.
 type Sequencer interface {
 	SequenceMessages(ctx context.Context, limit int) (int, error)
+}
+
+// Clock is an optional store capability supplying the store's own current time.
+//
+// It exists for one reason: lag. Message.CreateTime is stamped by the STORE
+// (the DB's NOW at insert), so measuring its age against the relay host's
+// time.Now() folds any NTP skew between the relay pod and the database into the
+// reported lag — on a pod whose clock trails the DB, a genuinely stale backlog
+// reports a negative age, which a Prometheus gauge plots as ~0 and no alert ever
+// fires on. With this capability both operands come from the store's clock.
+//
+// A store that cannot cheaply answer it simply doesn't implement it: the relay
+// then falls back to the host clock (see Relay.oldestAge). The relay calls
+// StoreNow at most once per drain pass, and only when an Observer actually
+// consumes the value, so an unobserved relay issues no extra query.
+type Clock interface {
+	StoreNow(ctx context.Context) (time.Time, error)
 }
 
 // Sweeper prunes fully-consumed rows below every consumer's offset.
@@ -109,25 +147,54 @@ type options struct {
 	// group has a committed offset.
 	StartFromBeginning bool
 
-	RetentionConfigured    bool          // WithRetention was called (validates window > 0)
-	RetentionWindow        time.Duration // 0 disables the sweep
+	RetentionConfigured    bool          // WithRetention was called (validates window > 0, requires Sweeper)
+	RetentionDisabled      bool          // WithoutRetention was called (waives the default sweep)
+	RetentionWindow        time.Duration // defaults to defaultRetentionWindow; 0 disables the sweep
 	RetentionSweepInterval time.Duration // minimum time between sweeps
 	RetentionSweepBatch    int
 
 	Logger        *slog.Logger // defaults to a discard logger
 	Observer      relay.Observer
 	PoisonHandler relay.PoisonHandler
+	Unsendable    relay.UnsendableClassifier // nil: every send failure stops the lane
 }
+
+// Default retention. The sweep is ON by default because the v2 log is never
+// pruned on delivery — a delivered row stays so other consumer groups can still
+// read it — so a relay with no sweep grows outbox_messages until the cluster
+// runs out of disk, months after the omission and nowhere near it. Defaulting is
+// safe for DELIVERY: the sweep only ever deletes rows below EVERY group's
+// committed offset (MIN(last_seq)) that are also older than the window, so it
+// cannot touch an undelivered event however long the window is. The MongoDB store
+// makes the same choice with its 7-day TTL index; this matches it.
+//
+// SHARED STORES. The sweep is STORE-WIDE — its cutoff is MIN(last_seq) across all
+// consumer groups — while the window is per-relay, so on a store with several
+// relays the SHORTEST configured window wins for everyone: a relay carrying the
+// default 7 days will truncate a sibling's explicit 30-day window, and nothing in
+// either relay's telemetry explains why. A relay cannot detect its siblings, so
+// this is a rule the operator must hold: every relay over one store must agree on
+// the window, or exactly one of them should sweep and the rest pass
+// WithoutRetention. NewRelay logs the effective window and its store-wide scope at
+// construction so the disagreement is visible in the logs of both.
+const (
+	defaultRetentionWindow        = 7 * 24 * time.Hour
+	defaultRetentionSweepInterval = time.Hour
+	defaultRetentionSweepBatch    = 1000
+)
 
 // defaultOptions returns the default relay configuration. The zero
 // relay.Observer discards all signals.
 func defaultOptions() options {
 	return options{
-		BatchSize:         100,
-		SequenceBatchSize: 1000,
-		PollInterval:      time.Second,
-		LeaseTTL:          15 * time.Second,
-		Logger:            slog.New(slog.DiscardHandler),
+		BatchSize:              100,
+		SequenceBatchSize:      1000,
+		PollInterval:           time.Second,
+		LeaseTTL:               15 * time.Second,
+		RetentionWindow:        defaultRetentionWindow,
+		RetentionSweepInterval: defaultRetentionSweepInterval,
+		RetentionSweepBatch:    defaultRetentionSweepBatch,
+		Logger:                 slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -178,6 +245,12 @@ func WithLogger(l *slog.Logger) Option {
 // offset) replay the retained log from the start instead of the default
 // "latest" (future events only — parity with the stream runtime's
 // start-at-now). Has no effect once the group has a committed offset.
+//
+// The group registers its offset row at seq 0 before its first read, so the
+// retention sweep — whose cutoff is MIN(last_seq) across all groups — cannot
+// delete the history it is about to replay. The flip side is that it PINS that
+// cutoff at 0 store-wide until the group commits, so nothing is pruned while it
+// catches up; OnSwept reports 0 throughout, which is the signal to watch.
 func WithStartFromBeginning() Option {
 	return func(o *options) { o.StartFromBeginning = true }
 }
@@ -192,18 +265,49 @@ func WithObserver(obs relay.Observer) Option {
 // WithPoisonHandler installs the poison-parking hook: a row whose PERSISTED
 // METADATA fails to decode (*DecodeError) is handed to h and the relay
 // advances past it — retrying a poison row can never succeed, so parking it is
-// the only way to keep the lane moving. Send failures are NOT parked
-// regardless of this option: a send failure is downstream trouble, and the
-// lane always stops and retries the same message next tick (order and
-// delivery preserved). Without a PoisonHandler a poison row stops the lane.
+// the only way to keep the lane moving. Send failures are not parked by default:
+// a send failure is downstream trouble, and the lane stops and retries the same
+// message next tick (order and delivery preserved) — unless an
+// UnsendableClassifier claims it, see WithUnsendableClassifier. Without a
+// PoisonHandler a poison row stops the lane.
 func WithPoisonHandler(h relay.PoisonHandler) Option {
 	return func(o *options) { o.PoisonHandler = h }
 }
 
-// WithRetention enables the retention sweep on the leader: at most one sweep
+// WithUnsendableClassifier installs the escape hatch for a message the
+// downstream transport will never accept: when f reports a send failure
+// permanent for that specific message, it is parked through the PoisonHandler
+// and the lane advances past it instead of retrying it at the head of the log
+// forever. Every failure f does not claim still stops the lane. Requires
+// WithPoisonHandler. See relay.UnsendableClassifier for the (narrow) contract f
+// must honor.
+func WithUnsendableClassifier(f relay.UnsendableClassifier) Option {
+	return func(o *options) { o.Unsendable = f }
+}
+
+// WithoutRetention disables the retention sweep, which is otherwise ON with the
+// default window (see defaultRetentionWindow — the sequenced log is never pruned
+// on delivery, so an unswept log grows until the cluster runs out of disk).
+//
+// Use it when something else owns pruning: another relay over the same store
+// runs the sweep (it is store-wide, not per-group, so exactly one relay need own
+// it — the mirror of WithoutSequencer), the store prunes on its own, or an
+// out-of-band DBA job does. Mutually exclusive with WithRetention.
+//
+// On a shared store this is the option that keeps sibling relays from fighting over
+// the window: the shortest window in play wins store-wide, so either give every
+// relay the same WithRetention or give exactly one the sweep and the rest this.
+func WithoutRetention() Option { return func(o *options) { o.RetentionDisabled = true } }
+
+// WithRetention retunes the retention sweep on the leader: at most one sweep
 // per sweepInterval, deleting up to sweepBatch fully-consumed rows older than
 // window per sweep. sweepInterval is wall-clock time, decoupled from
 // PollInterval — retuning the tick does not silently change sweep cadence.
+//
+// The sweep is already on by default (defaultRetentionWindow); this overrides
+// those defaults and, unlike them, makes the Sweeper capability mandatory — an
+// explicitly configured sweep that silently never runs is a disk incident in
+// waiting. Use WithoutRetention to turn the sweep off instead.
 func WithRetention(window, sweepInterval time.Duration, sweepBatch int) Option {
 	return func(o *options) {
 		o.RetentionConfigured = true
@@ -227,20 +331,22 @@ type Relay struct {
 
 	sequencer Sequencer // nil if store lacks the capability or WithoutSequencer
 	retention Sweeper   // nil if store lacks the capability or retention not configured
+	clock     Clock     // nil if store lacks the capability (lag falls back to the host clock)
 
 	lastSweep time.Time // for retention cadence (see maybeSweep)
+
+	// passStoreNow caches the store's clock for the current drain pass, so a
+	// multi-page pass reads it once (see oldestAge). Reset at the top of drain.
+	passStoreNow time.Time
 
 	// wasLeader tracks the last observed leadership state so transitions —
 	// and only transitions — reach OnLeadership/the log (see trackLeadership).
 	wasLeader bool
 
-	// offsetInitialized latches once InitOffsetLatest has run for this Relay
-	// instance. With insert-if-absent semantics a re-run is harmless (an
-	// existing row is never modified), so the latch is only a round-trip
-	// optimization: it keeps a still-empty-log group (offset genuinely 0 with
-	// nothing to commit yet) from re-running InitOffsetLatest on every
-	// drain() tick.
-	offsetInitialized bool
+	// stuck escalates a lane that keeps stopping at the same seq into a single
+	// relay.StuckLaneError per episode. Keyed on the raw seq so the per-message
+	// Progress call allocates nothing. See noteStuck.
+	stuck notify.StuckTracker[int64]
 }
 
 // maxNameLen bounds the consumer-group and leader-lock names. The reference
@@ -268,12 +374,22 @@ const maxNameLen = 64
 //     twice per TTL or it expires between renewals and leadership silently
 //     flaps every tick (mirrors the stream runtime's DrainWindow guard);
 //   - RetentionWindow is set without a positive sweep interval and batch;
+//   - WithRetention and WithoutRetention are both given;
+//   - WithUnsendableClassifier is given without WithPoisonHandler: there would be
+//     nowhere to park an unsendable message, so the option would silently degrade
+//     back to stopping the lane forever;
+//   - store partially implements relay.LeaderStore (it carries one of the lock
+//     method names but does not satisfy the interface): that would otherwise
+//     degrade to always-leader and run dual leaders across replicas — see
+//     relay.CheckLeaderStore;
 //   - store lacks Sequencer and WithoutSequencer() was not given: without
 //     a sequencer nothing ever gets a seq and the relay silently delivers
 //     nothing — the legitimate someone-else-sequences topology has an explicit
 //     spelling;
 //   - WithRetention is set but store lacks Sweeper: a configured sweep
-//     that silently never runs grows the log unboundedly.
+//     that silently never runs grows the log unboundedly. (A store lacking
+//     Sweeper under the DEFAULT window is not an error — the sweep is disabled
+//     with an Info log, see WithoutRetention.)
 //
 // name identifies the consumer (its offset row) and is the default leader-lock
 // name. store reads the log and holds offsets; sender is the downstream
@@ -331,20 +447,34 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	// otherwise pass the window>0 gate below and silently disable the sweep —
 	// unbounded log growth presenting as a disk incident months later.
 	if options.RetentionConfigured && options.RetentionWindow <= 0 {
-		return nil, fmt.Errorf("sequence: WithRetention window must be > 0, got %v (omit WithRetention entirely to disable the sweep)", options.RetentionWindow)
+		return nil, fmt.Errorf("sequence: WithRetention window must be > 0, got %v (pass WithoutRetention() to disable the sweep)", options.RetentionWindow)
+	}
+	if options.RetentionConfigured && options.RetentionDisabled {
+		return nil, errors.New("sequence: WithRetention and WithoutRetention are mutually exclusive")
+	}
+	if options.Unsendable != nil && options.PoisonHandler == nil {
+		return nil, errors.New("sequence: WithUnsendableClassifier requires WithPoisonHandler (there is nowhere to park an unsendable message otherwise)")
+	}
+	if options.RetentionDisabled {
+		options.RetentionWindow = 0
 	}
 	if options.RetentionWindow > 0 && (options.RetentionSweepInterval <= 0 || options.RetentionSweepBatch <= 0) {
 		return nil, fmt.Errorf("sequence: RetentionWindow (%v) requires RetentionSweepInterval > 0 and RetentionSweepBatch > 0, got %v and %d",
 			options.RetentionWindow, options.RetentionSweepInterval, options.RetentionSweepBatch)
 	}
 
-	ls, hasLeaderStore := store.(relay.LeaderStore)
-	if !hasLeaderStore {
+	// A store implementing only PART of relay.LeaderStore is rejected outright
+	// (see relay.CheckLeaderStore): silently degrading a broken lock
+	// implementation to always-leader runs dual leaders across replicas.
+	ls, err := relay.CheckLeaderStore(store)
+	if err != nil {
+		return nil, fmt.Errorf("sequence: %w", err)
+	}
+	if ls == nil {
 		// Always-leader is a documented single-instance mode, not an error —
-		// but it must not be a silent one: a custom store that MEANT to
-		// implement relay.LeaderStore (wrong signature, broken refactor)
-		// would otherwise run dual leaders in a multi-replica deployment
-		// with no signal until duplicate delivery is noticed.
+		// but it must not be a silent one: a multi-replica deployment over such
+		// a store runs dual leaders with no signal until duplicate delivery is
+		// noticed.
 		options.Logger.Info("sequence relay: store has no relay.LeaderStore capability; running always-leader (single-instance mode)",
 			"relay", name)
 	}
@@ -378,10 +508,38 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	}
 	if options.RetentionWindow > 0 {
 		ret, ok := store.(Sweeper)
-		if !ok {
+		switch {
+		case ok:
+			r.retention = boundedRetention{inner: ret, ttl: options.LeaseTTL}
+			// Always logged, default or explicit. The sweep's cutoff is MIN(last_seq)
+			// across ALL consumer groups, so its window takes effect store-wide while
+			// being configured per-relay: on a shared store the shortest window wins
+			// for everyone. A relay cannot see its siblings, so this line is what makes
+			// a disagreement diagnosable — both relays state their window and an
+			// operator comparing the two logs sees which one is doing the truncating.
+			options.Logger.Info("sequence relay: retention sweep enabled (store-wide: its cutoff is MIN(last_seq) across all consumer groups, "+
+				"so every relay over this store must agree on the window, or only one should sweep and the rest pass WithoutRetention)",
+				"relay", name, "window", options.RetentionWindow, "sweep_interval", options.RetentionSweepInterval,
+				"sweep_batch", options.RetentionSweepBatch, "explicit", options.RetentionConfigured)
+		case options.RetentionConfigured:
+			// The caller ASKED for a sweep: a silently dead one grows the log
+			// unboundedly and surfaces as a disk incident long after the
+			// misconfiguration.
 			return nil, errors.New("sequence: WithRetention is set but store does not implement sequence.Sweeper")
+		default:
+			// Only the default window is in play and this store cannot sweep — a
+			// legitimate topology (the store prunes itself, or another relay owns
+			// the sweep), so not an error. Still say so: an operator who assumed
+			// the default was pruning would otherwise learn it from a full disk.
+			options.Logger.Info("sequence relay: store has no sequence.Sweeper capability; retention sweep disabled "+
+				"(pass WithoutRetention() to make this explicit, and ensure something else prunes the log)",
+				"relay", name)
 		}
-		r.retention = boundedRetention{inner: ret, ttl: options.LeaseTTL}
+	}
+	// Optional, and legitimately absent: without it lag is measured against the
+	// relay host's clock instead of the store's (see Clock).
+	if c, ok := store.(Clock); ok {
+		r.clock = boundedClock{inner: c, ttl: options.LeaseTTL}
 	}
 
 	return r, nil

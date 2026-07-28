@@ -33,7 +33,7 @@ func (s boundedStore) ListMessages(ctx context.Context, afterSeq int64, limit in
 	return s.inner.ListMessages(ctx, afterSeq, limit)
 }
 
-func (s boundedStore) Offset(ctx context.Context, name string) (int64, error) {
+func (s boundedStore) Offset(ctx context.Context, name string) (int64, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.ttl)
 	defer cancel()
 	return s.inner.Offset(ctx, name)
@@ -68,8 +68,8 @@ func (s boundedStore) CommitOffset(ctx context.Context, name string, seq int64) 
 	return s.inner.CommitOffset(ctx, name, seq)
 }
 
-// boundedSequencer and boundedRetention apply the same LeaseTTL bound to the
-// optional capabilities (see boundedStore).
+// boundedSequencer, boundedRetention and boundedClock apply the same LeaseTTL
+// bound to the optional capabilities (see boundedStore).
 type boundedSequencer struct {
 	inner Sequencer
 	ttl   time.Duration
@@ -90,4 +90,28 @@ func (s boundedRetention) SweepMessages(ctx context.Context, olderThan time.Dura
 	ctx, cancel := context.WithTimeout(ctx, s.ttl)
 	defer cancel()
 	return s.inner.SweepMessages(ctx, olderThan, limit)
+}
+
+type boundedClock struct {
+	inner Clock
+	ttl   time.Duration
+}
+
+// StoreNow is shutdown-detached like CommitOffset above, and for a related reason:
+// drain() reports its pass — and so reads the clock for the lag value — AFTER it has
+// already observed run-ctx cancellation. On the dead ctx a real store fails the query
+// immediately, so every planned shutdown would degrade the lag to the host-clock
+// fallback and log a warning about a clock that is fine. This is telemetry, so the
+// bound is the shorter shutdown budget rather than the lease TTL.
+func (s boundedClock) StoreNow(ctx context.Context) (time.Time, error) {
+	timeout := s.ttl
+	if ctx.Err() != nil {
+		ctx = context.WithoutCancel(ctx)
+		timeout = commitTimeout
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	return s.inner.StoreNow(ctx)
 }

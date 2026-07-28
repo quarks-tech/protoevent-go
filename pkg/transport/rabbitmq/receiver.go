@@ -6,13 +6,11 @@ import (
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/xid"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/quarks-tech/amqpx"
 	"github.com/quarks-tech/amqpx/connpool"
 
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/amqpxlifecycle"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
 )
 
@@ -159,91 +157,69 @@ func (r *Receiver) setupTopology(conn *connpool.Conn, infos []eventbus.ServiceIn
 	return nil
 }
 
-// Receive consumes via amqpx.Client.ProcessWithDrain (drain-on-cancel mode):
-// shutdownCtx cancellation stops connection acquisition, while a running
-// consume command keeps its connection, drains, and returns nil — so a clean
-// shutdown yields nil, not context.Canceled. The client's Config.DrainTimeout
-// bounds the drain; size it to the deployment's shutdown budget.
+// Receive consumes via amqpx.Client.ConsumeWithDrain (drain-on-cancel mode):
+// shutdownCtx cancellation cancels the consumer and drains in-flight and
+// prefetched deliveries before returning, so a clean shutdown yields nil, not
+// context.Canceled. The client's Config.DrainTimeout bounds the drain; size it to
+// the deployment's shutdown budget.
+//
+// amqpx owns the whole consumer lifecycle — QoS, Consume, the stop-reason
+// multiplexer (shutdown / handler failure / broker close), the drain, and
+// requeueing the prefetched deliveries the drain never hands over. This receiver
+// supplies only the per-delivery policy, which is the one thing it and the
+// parking-lot receiver do differently.
 func (r *Receiver) Receive(shutdownCtx context.Context, processor eventbus.Processor) error {
-	return r.client.ProcessWithDrain(shutdownCtx, func(commandCtx context.Context, conn *connpool.Conn) error {
-		return r.receive(commandCtx, conn, processor)
-	})
-}
-
-// The consume errgroup is deliberately detached from shutdownCtx: cancellation
-// stops the consumer while the amqpx command context and borrowed connection
-// remain alive until buffered and in-flight deliveries drain.
-func (r *Receiver) receive(
-	shutdownCtx context.Context,
-	conn *connpool.Conn,
-	processor eventbus.Processor,
-) error {
-	channel := conn.Channel()
-	if err := channel.Qos(r.options.prefetchCount, 0, false); err != nil {
-		return fmt.Errorf("set channel qos: %w", err)
+	if r.options.prefetchCount <= 0 {
+		// Caught here, in the caller's own terms. AMQP reads prefetch-count 0 as
+		// "no specified limit", and this receiver used to pass it straight to
+		// Channel.Qos, so WithPrefetchCount(0) was a working unlimited consumer.
+		// Drain mode cannot honor that: an unbounded prefetch means an unbounded
+		// number of buffered deliveries to finish inside DrainTimeout, so amqpx
+		// requires a positive bound — and its own error names ConsumeSpec, a type
+		// the caller never touched.
+		return fmt.Errorf("rabbitmq: WithPrefetchCount must be > 0, got %d "+
+			"(unlimited prefetch is unsupported under drain-on-cancel: the shutdown drain must be bounded)",
+			r.options.prefetchCount)
 	}
 
-	// ConsumeWithContext owns a goroutine that may call Channel.Cancel after the
-	// command returns. Cancellation is kept inside this joined command instead.
-	deliveries, err := channel.Consume(
-		r.options.incomingQueue,
-		r.options.consumerTag,
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return fmt.Errorf("consume queue %q: %w", r.options.incomingQueue, err)
+	spec := amqpx.ConsumeSpec{
+		Queue:       r.options.incomingQueue,
+		ConsumerTag: r.options.consumerTag,
+		Prefetch:    r.options.prefetchCount,
 	}
 
-	eg, egCtx := errgroup.WithContext(context.Background())
-	workerFailed := make(chan struct{})
-	workerDone := make(chan struct{})
-	notifyClose := channel.NotifyClose(make(chan *amqp.Error, 1))
-
-	eg.Go(func() error {
-		return amqpxlifecycle.WaitForConsumerStop(
-			shutdownCtx,
-			workerFailed,
-			workerDone,
-			func() error {
-				if cErr := channel.Cancel(r.options.consumerTag, false); cErr != nil {
-					return fmt.Errorf("cancel consumer %q: %w", r.options.consumerTag, cErr)
-				}
+	return r.client.ConsumeWithDrain(shutdownCtx, spec,
+		func(groupCtx context.Context, _ *connpool.Conn, delivery *amqp.Delivery) error {
+			dErr := r.processDelivery(delivery, processor)
+			if groupCtx.Err() != nil {
+				// The group is stopping, so this delivery's disposition cannot be
+				// trusted to land; requeue it rather than leaving it unacked on a
+				// channel that returns to the pool. amqpx only requeues deliveries it
+				// never handed to us — this one it did.
+				requeue(delivery)
 
 				return nil
-			},
-			notifyClose,
-		)
-	})
+			}
 
-	eg.Go(func() error {
-		defer close(workerDone)
+			if err := doAcknowledge(delivery, dErr, r.options.requeueOnError); err != nil {
+				// Our own disposition failed, so the delivery is still unacked and
+				// amqpx will not touch it (by contract, a delivery handed to the
+				// handler belongs to the handler).
+				requeue(delivery)
 
-		err := amqpxlifecycle.DrainDeliveries(
-			egCtx,
-			shutdownCtx,
-			deliveries,
-			workerFailed,
-			func(groupCtx context.Context, delivery *amqp.Delivery) error {
-				dErr := r.processDelivery(delivery, processor)
-				if groupCtx.Err() != nil {
-					return nil
-				}
+				return err
+			}
 
-				return doAcknowledge(delivery, dErr, r.options.requeueOnError)
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("drain deliveries: %w", err)
-		}
+			return nil
+		})
+}
 
-		return nil
-	})
-
-	return eg.Wait()
+// requeue hands a delivery back to the broker for immediate redelivery.
+//
+// Best-effort: the only reason Nack fails here is a channel that is already gone,
+// and a closed channel requeues every unacked delivery on it broker-side anyway.
+func requeue(delivery *amqp.Delivery) {
+	_ = delivery.Nack(false, true)
 }
 
 func (r *Receiver) processDelivery(delivery *amqp.Delivery, processor eventbus.Processor) error {
@@ -253,7 +229,7 @@ func (r *Receiver) processDelivery(delivery *amqp.Delivery, processor eventbus.P
 	}
 
 	if r.options.logger != nil {
-		r.options.logger.Errorf(fmt.Sprintf("unmarshaling event [%+v]: %s", delivery, err))
+		r.options.logger.Errorf("unmarshaling event [%+v]: %s", delivery, err)
 	}
 
 	return eventbus.NewUnprocessableEventError(err)

@@ -3,18 +3,18 @@ package parkinglot
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/xid"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/quarks-tech/amqpx"
 	"github.com/quarks-tech/amqpx/connpool"
 
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/amqpxlifecycle"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
 )
 
@@ -216,95 +216,59 @@ func (r *Receiver) setupBindings(conn *connpool.Conn, infos []eventbus.ServiceIn
 	return nil
 }
 
-// Receive consumes via amqpx.Client.ProcessWithDrain (drain-on-cancel mode):
-// shutdownCtx cancellation stops connection acquisition, while a running
-// consume command keeps its connection, drains, and returns nil — so a clean
-// shutdown yields nil, not context.Canceled. The client's Config.DrainTimeout
-// bounds the drain; size it to the deployment's shutdown budget.
+// Receive consumes via amqpx.Client.ConsumeWithDrain (drain-on-cancel mode):
+// shutdownCtx cancellation cancels the consumer and drains in-flight and
+// prefetched deliveries before returning, so a clean shutdown yields nil, not
+// context.Canceled. The client's Config.DrainTimeout bounds the drain; size it to
+// the deployment's shutdown budget.
+//
+// amqpx owns the whole consumer lifecycle — QoS, Consume, the stop-reason
+// multiplexer, the drain, and requeueing the prefetched deliveries the drain never
+// hands over. This receiver supplies only the per-delivery policy: a failed
+// delivery goes to the parking lot instead of being rejected.
 func (r *Receiver) Receive(shutdownCtx context.Context, processor eventbus.Processor) error {
-	return r.client.ProcessWithDrain(shutdownCtx, func(commandCtx context.Context, conn *connpool.Conn) error {
-		return r.receive(commandCtx, conn, processor)
-	})
-}
-
-// The consume errgroup is deliberately detached from shutdownCtx: cancellation
-// stops the consumer while the borrowed connection remains alive (amqpx drain
-// mode) until buffered and in-flight deliveries drain.
-func (r *Receiver) receive(
-	shutdownCtx context.Context,
-	conn *connpool.Conn,
-	processor eventbus.Processor,
-) error {
-	channel := conn.Channel()
-	if err := channel.Qos(r.options.prefetchCount, 0, false); err != nil {
-		return fmt.Errorf("set channel qos: %w", err)
+	if r.options.prefetchCount <= 0 {
+		// See the identical guard in rabbitmq.Receiver.Receive: prefetch-count 0 was
+		// AMQP's "no limit" and worked before drain mode, whose bounded shutdown
+		// requires a bounded prefetch.
+		return fmt.Errorf("parkinglot: WithPrefetchCount must be > 0, got %d "+
+			"(unlimited prefetch is unsupported under drain-on-cancel: the shutdown drain must be bounded)",
+			r.options.prefetchCount)
 	}
 
-	// ConsumeWithContext owns a goroutine that may call Channel.Cancel after the
-	// command returns. Cancellation is kept inside this joined command instead.
-	deliveries, err := channel.Consume(
-		r.options.incomingQueue,
-		r.options.consumerTag,
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		return fmt.Errorf("consume queue %q: %w", r.options.incomingQueue, err)
+	spec := amqpx.ConsumeSpec{
+		Queue:       r.options.incomingQueue,
+		ConsumerTag: r.options.consumerTag,
+		Prefetch:    r.options.prefetchCount,
 	}
 
-	eg, egCtx := errgroup.WithContext(context.Background())
-	workerFailed := make(chan struct{})
-	workerDone := make(chan struct{})
-	notifyClose := channel.NotifyClose(make(chan *amqp.Error, 1))
-
-	eg.Go(func() error {
-		return amqpxlifecycle.WaitForConsumerStop(
-			shutdownCtx,
-			workerFailed,
-			workerDone,
-			func() error {
-				if cErr := channel.Cancel(r.options.consumerTag, false); cErr != nil {
-					return fmt.Errorf("cancel consumer %q: %w", r.options.consumerTag, cErr)
-				}
+	return r.client.ConsumeWithDrain(shutdownCtx, spec,
+		func(groupCtx context.Context, conn *connpool.Conn, delivery *amqp.Delivery) error {
+			dErr := r.processDelivery(delivery, processor)
+			if groupCtx.Err() != nil {
+				// The group is stopping, so this delivery's disposition cannot be
+				// trusted to land; requeue it rather than leaving it unacked on a
+				// channel that returns to the pool. amqpx only requeues deliveries it
+				// never handed to us — this one it did.
+				requeue(delivery)
 
 				return nil
-			},
-			notifyClose,
-		)
-	})
+			}
 
-	eg.Go(func() error {
-		defer close(workerDone)
+			// shutdownCtx, not groupCtx: parking must still succeed during drain,
+			// when shutdownCtx is already canceled — putIntoParkingLot detaches for
+			// the broker op itself.
+			if ackErr := r.doAcknowledge(shutdownCtx, conn, delivery, dErr); ackErr != nil {
+				// Parking (or the ack/reject) failed, so the delivery is still unacked
+				// and amqpx will not touch it — a delivery handed to the handler
+				// belongs to the handler.
+				requeue(delivery)
 
-		err := amqpxlifecycle.DrainDeliveries(
-			egCtx,
-			shutdownCtx,
-			deliveries,
-			workerFailed,
-			func(groupCtx context.Context, delivery *amqp.Delivery) error {
-				dErr := r.processDelivery(delivery, processor)
-				if groupCtx.Err() != nil {
-					return nil
-				}
+				return fmt.Errorf("do acknowledge: %w", ackErr)
+			}
 
-				if ackErr := r.doAcknowledge(shutdownCtx, conn, delivery, dErr); ackErr != nil {
-					return fmt.Errorf("do acknowledge: %w", ackErr)
-				}
-
-				return nil
-			},
-		)
-		if err != nil {
-			return fmt.Errorf("drain deliveries: %w", err)
-		}
-
-		return nil
-	})
-
-	return eg.Wait()
+			return nil
+		})
 }
 
 func (r *Receiver) processDelivery(delivery *amqp.Delivery, processor eventbus.Processor) error {
@@ -314,7 +278,7 @@ func (r *Receiver) processDelivery(delivery *amqp.Delivery, processor eventbus.P
 	}
 
 	if r.options.logger != nil {
-		r.options.logger.Errorf(fmt.Sprintf("unmarshaling event [%+v]: %s", delivery, err))
+		r.options.logger.Errorf("unmarshaling event [%+v]: %s", delivery, err)
 	}
 
 	return eventbus.NewUnprocessableEventError(err)
@@ -326,7 +290,7 @@ func (r *Receiver) doAcknowledge(ctx context.Context, conn *connpool.Conn, d *am
 		if aErr := d.Ack(false); aErr != nil {
 			return fmt.Errorf("ack delivery: %w", aErr)
 		}
-	case eventbus.IsUnprocessableEventError(err), hasExceededRetryCount(d, r.options.maxRetries):
+	case eventbus.IsUnprocessableEventError(err), r.hasExceededRetryCount(d):
 		return r.putIntoParkingLot(ctx, conn, d)
 	default:
 		if rErr := d.Reject(false); rErr != nil {
@@ -363,9 +327,27 @@ func (r *Receiver) putIntoParkingLot(ctx context.Context, conn *connpool.Conn, d
 	return nil
 }
 
-func hasExceededRetryCount(d *amqp.Delivery, max int64) bool {
+// hasExceededRetryCount reports whether the delivery has used up its retry
+// budget and should be parked instead of dead-lettered for another lap.
+//
+// It is consulted for TRANSIENT handler failures only (an unprocessable event is
+// parked by the branch before it), so its bias matters: parking on a count it
+// cannot read would cut the retry budget to one lap, dead-lettering healthy
+// traffic to the parking lot during any downstream blip and requiring manual
+// reprocessing. An unreadable count therefore keeps retrying — but says so, so
+// that a broker re-encoding the header is diagnosable instead of silently
+// capping retries at infinity.
+func (r *Receiver) hasExceededRetryCount(d *amqp.Delivery) bool {
 	death, ok := d.Headers["x-death"].([]any)
 	if !ok {
+		return false
+	}
+
+	// An absent/unreadable first-death queue matches no entry: without this, the
+	// empty-string normalization below would make a malformed entry that also lacks
+	// a queue compare equal to it.
+	firstDeathQueue := headerString(d.Headers["x-first-death-queue"])
+	if firstDeathQueue == "" {
 		return false
 	}
 
@@ -375,12 +357,102 @@ func hasExceededRetryCount(d *amqp.Delivery, max int64) bool {
 			continue
 		}
 
-		if t["queue"] == d.Headers["x-first-death-queue"] {
-			count, ok := t["count"].(int64)
+		// Compared as normalized strings, never with interface ==: AMQP longstr
+		// fields decode as string OR []byte depending on the broker and any proxy
+		// in between, and comparing two []byte values through an interface panics
+		// with "comparing uncomparable type []uint8" — crashing the consumer on
+		// the retry path that is meant to be the safe one.
+		if headerString(t["queue"]) == firstDeathQueue {
+			count, ok := deathCount(t["count"])
+			if !ok {
+				if r.options.logger != nil {
+					r.options.logger.Errorf("parkinglot: unreadable x-death count %#v (%T) on delivery %q: "+
+						"retry budget cannot be evaluated, continuing to retry", t["count"], t["count"], d.MessageId)
+				}
 
-			return ok && count >= max
+				return false
+			}
+
+			return count >= r.options.maxRetries
 		}
 	}
 
 	return false
+}
+
+// requeue hands a delivery back to the broker for immediate redelivery.
+//
+// Best-effort: the only reason Nack fails here is a channel that is already gone,
+// and a closed channel requeues every unacked delivery on it broker-side anyway.
+func requeue(delivery *amqp.Delivery) {
+	_ = delivery.Nack(false, true)
+}
+
+// headerString normalizes an AMQP header field to a string for comparison. A
+// longstr arrives as string or []byte depending on the broker and the path;
+// anything else has no string identity and compares equal to nothing (the empty
+// string here would only match another absent field, which is why absent-vs-absent
+// is not treated as a match by the caller — an x-death entry always names a
+// queue).
+func headerString(v any) string {
+	switch s := v.(type) {
+	case string:
+		return s
+	case []byte:
+		return string(s)
+	default:
+		return ""
+	}
+}
+
+// deathCount normalizes the x-death `count` field. RabbitMQ encodes it as AMQP
+// `long` (int64), but proxies, shovels and federation links have been observed
+// re-encoding it — as a narrower or unsigned integer, as a float after a JSON
+// round-trip, or as a decimal string.
+func deathCount(v any) (int64, bool) {
+	switch c := v.(type) {
+	case int64:
+		return c, true
+	case int32:
+		return int64(c), true
+	case int16:
+		return int64(c), true
+	case int8:
+		return int64(c), true
+	case int:
+		return int64(c), true
+	case uint64:
+		if c > math.MaxInt64 {
+			return math.MaxInt64, true
+		}
+
+		return int64(c), true
+	case uint32:
+		return int64(c), true
+	case uint16:
+		return int64(c), true
+	case uint8:
+		return int64(c), true
+	case float64:
+		// A JSON round-trip turns the count into a float. Only an exact integral
+		// value is a count; anything else is not something to guess at.
+		if c != math.Trunc(c) || c < math.MinInt64 || c >= math.MaxInt64 {
+			return 0, false
+		}
+
+		return int64(c), true
+	case float32:
+		return deathCount(float64(c))
+	case string:
+		n, err := strconv.ParseInt(c, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+
+		return n, true
+	case []byte:
+		return deathCount(string(c))
+	default:
+		return 0, false
+	}
 }

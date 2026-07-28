@@ -19,6 +19,8 @@ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRI
 github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/quarks-tech/amqpx v0.3.3 h1:u8bAxl2atn82jEKZuR3OGgVu3or2F6MxEmDLkjrTfZQ=
 github.com/quarks-tech/amqpx v0.3.3/go.mod h1:dgiGI1OpLWg+dcqDsmCVPWUx6PQ5LHlOQDyOGFVvoYE=
+github.com/quarks-tech/amqpx v0.3.5 h1:5/qqJY6Dgq8ZWl/iURsCoMJNXSvNLHxkQHSzH3X+i3s=
+github.com/quarks-tech/amqpx v0.3.5/go.mod h1:dgiGI1OpLWg+dcqDsmCVPWUx6PQ5LHlOQDyOGFVvoYE=
 github.com/quarks-tech/protoevent-go v0.4.2 h1:kwwAeqOooXtIUaPknN5Hjv8sFCC3a/o4lsAvhOnwOF8=
 github.com/quarks-tech/protoevent-go v0.4.2/go.mod h1:axOhQ/Ydte1y33akfTgIMlQE8vRaaw670nLOaptTLuo=
 github.com/rabbitmq/amqp091-go v1.13.0 h1:L8NA1WtF76C6KA3LAoufjfLgbist/If1UQYcsOjtxXA=

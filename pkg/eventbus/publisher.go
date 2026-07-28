@@ -160,6 +160,20 @@ func (p *PublisherImpl) Publish(ctx context.Context, name string, e any, opts ..
 }
 
 func publish(ctx context.Context, name string, e any, p *PublisherImpl, opts ...PublishOption) error {
+	// Reject a malformed event type HERE, at the earliest point, because the
+	// alternative is not a failed publish but a wedged consumer. Generated code
+	// always emits "<service>.<Event>", but Publish is exported and callable with
+	// anything; a dot-less type sails through the codec and the transport, and the
+	// subscriber then rejects every such delivery as unprocessable. Worse over an
+	// outbox: the row commits with the caller's business transaction, and the relay
+	// can neither send it (the RabbitMQ sender needs the dot to split exchange from
+	// routing key) nor classify it as poison — so the lane stops on that row every
+	// tick forever and nothing behind it is delivered, recoverable only by editing
+	// offsets in a live database. Failing the publish is the cheap end of that.
+	if _, _, err := event.SplitType(name); err != nil {
+		return fmt.Errorf("eventbus: publish: %w", err)
+	}
+
 	md := event.NewMetadata(name)
 
 	for _, opt := range opts {
@@ -176,6 +190,19 @@ func publish(ctx context.Context, name string, e any, p *PublisherImpl, opts ...
 	}
 
 	completeMetadata(md)
+
+	// Reject a reserved extension name here for the same reason as the type check
+	// above: the alternative is not a failed publish but a wedged relay. The content
+	// marshalers refuse such an extension too, but they run at SEND time — over an
+	// outbox that is after the row has committed with the caller's business
+	// transaction, and a marshal failure is not a DecodeError, so the lane stops on
+	// that row every tick forever. Catching it at publish keeps the unsendable row
+	// from being written at all.
+	for k := range md.Extensions {
+		if event.ReservedExtensionName(k) {
+			return fmt.Errorf("eventbus: publish: extension %q collides with a core CloudEvents attribute; rename it", k)
+		}
+	}
 
 	contentSubtype, ok := event.ContentSubtype(md.DataContentType)
 	if !ok {

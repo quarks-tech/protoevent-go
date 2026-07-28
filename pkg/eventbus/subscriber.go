@@ -3,7 +3,6 @@ package eventbus
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
@@ -199,9 +198,12 @@ func (s *Subscriber) process(md *event.Metadata, data []byte) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pos := strings.LastIndex(md.Type, ".")
-	service := md.Type[:pos]
-	eventName := md.Type[pos+1:]
+	// md.Type arrives from the incoming message, so it is untrusted: a dot-less
+	// type must be rejected as unprocessable, never sliced (that panics).
+	service, eventName, err := event.SplitType(md.Type)
+	if err != nil {
+		return NewUnprocessableEventError(err)
+	}
 
 	srv, knownService := s.services[service]
 	if !knownService {

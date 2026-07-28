@@ -95,7 +95,46 @@ PK; the ID choice is about identity, not hotspot avoidance.) Pass
 `Metadata.ID`, which travels in the persisted metadata document under either
 generator. One fidelity caveat: stores persist metadata as JSON, so numeric
 extension values round-trip as `float64` (encode exact numeric types as
-strings).
+strings). `Metadata.DataSchema` is exempt — it crosses JSON as its URI text, not
+as a `url.URL` struct, whose `User` field would otherwise round-trip into a
+non-nil empty `Userinfo` and corrupt the URI.
+
+**TiDB requires UUID event ids under this default.** `event_id` is a
+`BINARY(16)` column, so the row ID must parse as a UUID — while CloudEvents
+allows any unique string in `Metadata.ID`. A service that publishes ids like
+`"order-42-created"` fails on its first write, and because the insert runs inside
+the caller's business transaction that failure rolls back the whole request, not
+just the publish. Either publish UUID ids (the eventbus default generator does),
+or decouple the row key with `WithRowIDGenerator(outbox.GenerateUUIDv4)`. The
+MongoDB store accepts any string.
+
+## Upgrading from v1 (the `outbox_pending` relay)
+
+**Do not upgrade a running v1 deployment in place.** v1 delivered by reading
+`outbox_pending` and deleting each row on success (`ListPendingMessages` /
+`CompletePendingMessages`); v2 reads only the sequenced `outbox_messages` log. The
+two share no table, so a v2 relay is blind to whatever is still sitting in
+`outbox_pending` — those rows are already committed, are never delivered, and
+nothing reports it. That is silent event loss at the version boundary.
+
+Cut over by draining, not by replacing:
+
+1. **Deploy the v2 schema** alongside v1's (`tidbmigrate.Apply` — it only creates
+   the four v2 tables and leaves `outbox_pending` untouched).
+2. **Switch publishers to v2** so new events land in `outbox_messages`. Keep the v1
+   relay running: it still owns everything already in `outbox_pending`.
+3. **Wait for `outbox_pending` to reach zero** — that is the drain. Both relays run
+   at once during this window; they read disjoint tables, so neither duplicates nor
+   skips the other's work.
+4. **Retire the v1 relay**, then drop `outbox_pending`.
+
+Option mapping while you are there:
+
+| v1 | v2 |
+| --- | --- |
+| `WithErrorHandler` (called per failed send, relay continued) | no equivalent by default — a send failure now stops the lane. Use `WithUnsendableClassifier` + `WithPoisonHandler` for the messages that can never succeed, and watch `relay.StuckLaneError` for the rest |
+| retention by deletion on delivery | `WithRetention` / `WithoutRetention` (on by default, 7-day window) |
+| single relay per store | still one **sequencer** and one **sweep** owner per store; extra consumer groups add `WithoutSequencer()` and `WithoutRetention()` |
 
 ## Schema (TiDB)
 
@@ -134,12 +173,17 @@ migrate tooling), the embedded FS is exported as `tidb.Migrations` /
    parameterized query).
 3. **Publish** — `tidb.NewStore(tx)` inside the business transaction
    (autocommit fails loudly by design).
-4. **Relay** — `sequence.NewRelay(name, tidb.NewRelayStore(db), sender, …)`;
-   configure `WithRetention` — **without it the log grows forever** (there is
-   deliberately no default sweep). Extra replicas of the same group need no
-   extra config (leader election is automatic); extra consumer *groups* add
-   `WithoutSequencer()` and should first start only after the sequencing
-   relay is caught up (see its godoc's start-order caveat).
+4. **Relay** — `sequence.NewRelay(name, tidb.NewRelayStore(db), sender, …)`.
+   The retention sweep is **on by default** (7-day window, hourly, 1000 rows a
+   pass): the log is never pruned on delivery, so an unswept one grows until the
+   cluster runs out of disk. Retune with `WithRetention`, or turn it off with
+   `WithoutRetention` when something else owns pruning — **on a store shared by
+   several relays the shortest window in play wins for everyone**, since the
+   sweep's cutoff is `MIN(last_seq)` across all groups, so either give every
+   relay the same window or let exactly one sweep. Extra replicas of the same
+   group need no extra config (leader election is automatic); extra consumer
+   *groups* add `WithoutSequencer()` and should first start only after the
+   sequencing relay is caught up (see its godoc's start-order caveat).
 5. **Downstream sender** — a RabbitMQ sender needs its topology declared
    once: `rabbitmq.NewSender(client)` + `sender.Setup(ctx, &pb.EventbusServiceDesc)`
    (see the root README) — skipping `Setup` fails every relay tick on a
@@ -188,10 +232,16 @@ must be renewable at least twice per TTL); if `name` (or an overridden
 columns — a relaxed `sql_mode` would silently truncate a longer name into
 another group's offset row and leader lock); if `WithRetention` is given a
 nonzero window without a strictly positive `sweepInterval` and `sweepBatch`;
-if the store lacks `sequence.Sequencer` without a `WithoutSequencer()`
-waiver (a missing sequencer is a permanent silent stall, not a mode); and if
-`WithRetention` is set on a store lacking `sequence.Sweeper` (a
-configured sweep that silently never runs would grow the log unboundedly). A
+if `WithRetention` and `WithoutRetention` are both given; if
+`WithUnsendableClassifier` is given without `WithPoisonHandler` (there would be
+nowhere to park); if the store partially implements `relay.LeaderStore` — it
+carries one of the lock method names but does not satisfy the interface, which
+would otherwise degrade to always-leader and run dual leaders; if the store lacks
+`sequence.Sequencer` without a `WithoutSequencer()` waiver (a missing sequencer is
+a permanent silent stall, not a mode); and if `WithRetention` is set on a store
+lacking `sequence.Sweeper` (a configured sweep that silently never runs would grow
+the log unboundedly — a store lacking `Sweeper` under the DEFAULT window is not an
+error, the sweep is disabled with an `Info` log). A
 `Relay` is not safe for concurrent use: call `Run` from a single goroutine.
 (`Run` is the production loop; `RunOnce` is exposed for tests and custom
 drivers that want to own the tick.)
@@ -236,20 +286,39 @@ the retained log instead; the option has no effect once the group has committed
 an offset.
 
 `sequence.WithObserver` wires a `relay.Observer` — a struct of nil-able
-callbacks (`OnDrained`, `OnError`, `OnSequenced`; set only what you need, the
-zero value discards everything) — to your metrics system, e.g. Prometheus, for
-lag and throughput; `OnDrained`'s count is successfully sent messages only
-(parked messages surface via `OnError`). `sequence.WithLogger` wires a
-`*log/slog.Logger` for pass-level errors. `sequence.WithPoisonHandler` installs
-the poison-parking hook: a row whose persisted metadata fails to decode
-(`sequence.DecodeError`) is handed to the `relay.PoisonHandler` and the relay
-advances past it — retrying a poison row can never succeed. Send failures are
-NEVER parked, handler or not: a send failure is downstream trouble (broker
-down, timeout), and the lane always stops and retries the same message next
-tick — order and delivery preserved, which is the point of an outbox. Without
-a handler a poison row stops the lane too. Shutdown cancellation is never
-routed to the handler: a canceled run context stops the lane instead of
-parking healthy messages.
+callbacks (`OnDrained`, `OnError`, `OnSequenced`, `OnSwept`, `OnLeadership`; set
+only what you need, the zero value discards everything) — to your metrics system,
+e.g. Prometheus, for lag and throughput; `OnDrained`'s count is successfully sent
+messages only (parked messages surface via `OnError`). `OnSwept` fires for a
+**zero** count too: the sweep's cutoff is `MIN(last_seq)` across all groups, so one
+lagging group blocks pruning store-wide, and a blocked sweep would otherwise be
+indistinguishable from a healthy idle one. `sequence.WithLogger` wires a
+`*log/slog.Logger` for pass-level errors.
+
+`sequence.WithPoisonHandler` installs the poison-parking hook: a row whose
+persisted metadata fails to decode (`sequence.DecodeError`) is handed to the
+`relay.PoisonHandler` and the relay advances past it — retrying a poison row can
+never succeed. Send failures are not parked by default, handler or not: a send
+failure is downstream trouble (broker down, timeout), and the lane stops and
+retries the same message next tick — order and delivery preserved, which is the
+point of an outbox. Without a handler a poison row stops the lane too. Shutdown
+cancellation is never routed to the handler: a canceled run context stops the lane
+instead of parking healthy messages.
+
+Stopping the lane is right for an outage but, tick by tick, indistinguishable from
+a message the broker will **never** accept — and in that case every event behind it
+stops being delivered indefinitely. Two mechanisms address it:
+
+- `sequence.WithUnsendableClassifier(f)` (requires `WithPoisonHandler`) — when `f`
+  reports a send failure permanent for that specific message, the message is parked
+  and the lane advances past it. Everything `f` does not claim keeps stopping the
+  lane. Errors are broker-specific, so there is no safe default; a classifier that
+  claims transient errors bulk-diverts the backlog to the DLQ during an outage.
+- Regardless of configuration, a lane stopped at one position for more than 15
+  minutes escalates **once per episode** to a `relay.StuckLaneError` on `OnError`
+  (plus an `Error` log naming the position and the remedy), so an alert can tell a
+  bad minute from a wedge that needs a human. Every stop path reports it: a send
+  failure, an unsendable message whose park failed, an unconfirmed poison park.
 
 ## Ordering guarantee
 
@@ -407,11 +476,18 @@ for stream-level errors; `stream.WithPoisonHandler` installs the poison-parking
 hook: an event whose payload fails to decode (`stream.DecodeError`, which
 carries the event's resume position) is handed to the callback and the relay
 resumes past it — retrying a poison event can never succeed. Send failures are
-NEVER parked, handler or not: the lane always stops (closes the cursor,
+not parked by default, handler or not: the lane stops (closes the cursor,
 persists the sent prefix, and reopens at the failed event after a backoff) —
 order and delivery preserved. Without a handler a poison event stops the lane
 too. Shutdown cancellation is never routed to the handler — a canceled run
 context stops the lane instead of parking healthy messages.
+
+This runtime has the same two wedge mechanisms as the sequenced-log one:
+`stream.WithUnsendableClassifier(f)` (requires `WithPoisonHandler`) parks an event
+`f` reports permanently unsendable so the lane can advance past it, and a lane
+stopped at one resume token for more than 15 minutes escalates once per episode to
+a `relay.StuckLaneError` on `OnError`. See the sequence-runtime section above for
+the reasoning and the caveats on writing `f`.
 
 ### Ordering, replay, and dedup
 

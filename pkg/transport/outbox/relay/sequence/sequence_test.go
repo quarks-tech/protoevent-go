@@ -117,14 +117,20 @@ type fakeStore struct {
 	offsetErr     error
 	initOffsetErr error
 	commitErr     error
+	// commitErrAboveSeq scopes commitErr to seq > n (0 = every commit fails), so a
+	// test can fail watermark advances while letting the seq-0 registration commit
+	// through. See failCommitsAbove.
+	commitErrAboveSeq int64
 
 	// poisonSeq, when non-zero, marks that row as undecodable: ListMessages
 	// returns the decoded prefix before it plus a *sequence.DecodeError, per
 	// the Store contract.
 	poisonSeq int64
 
-	seqCalls  int // number of SequenceMessages invocations, for loop-count assertions
-	listCalls int // number of ListMessages invocations, for did-drain-run assertions
+	seqCalls    int // number of SequenceMessages invocations, for loop-count assertions
+	listCalls   int // number of ListMessages invocations, for did-drain-run assertions
+	initCalls   int // number of InitOffsetLatest invocations (priming churn assertions)
+	commitCalls int // number of CommitOffset invocations (priming churn assertions)
 
 	// Recorded by CommitOffset, so tests can assert the final commit on a
 	// shutdown path goes through a fresh bounded context (deadline set, not
@@ -192,27 +198,55 @@ func (s *fakeStore) ListMessages(_ context.Context, afterSeq int64, limit int) (
 	return out, nil
 }
 
-func (s *fakeStore) Offset(_ context.Context, name string) (int64, error) {
+func (s *fakeStore) Offset(_ context.Context, name string) (int64, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.offsetErr != nil {
-		return 0, s.offsetErr
+		return 0, false, s.offsetErr
 	}
-	return s.offsets[name], nil
+	off, exists := s.offsets[name]
+	return off, exists, nil
 }
 
+// CommitOffset mirrors the SQL store's INSERT ... ON DUPLICATE KEY UPDATE
+// last_seq = GREATEST(...): monotone, and insert-if-absent. The insert half
+// matters — the relay REGISTERS a WithStartFromBeginning group by committing 0,
+// so that the sweep's MIN(last_seq) cutoff accounts for it before it has
+// delivered anything. A fake that only wrote on seq > current would model an
+// UPDATE-only store and hide that.
 func (s *fakeStore) CommitOffset(ctx context.Context, name string, seq int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.commitCalls++
 	_, s.commitHadDeadline = ctx.Deadline()
 	s.commitCtxErr = ctx.Err()
-	if s.commitErr != nil {
+	if s.commitErr != nil && seq > s.commitErrAboveSeq {
 		return s.commitErr
 	}
-	if seq > s.offsets[name] { // GREATEST
+	cur, exists := s.offsets[name]
+	if !exists || seq > cur { // insert-if-absent, then GREATEST
 		s.offsets[name] = seq
 	}
 	return nil
+}
+
+// failCommitsAbove makes CommitOffset fail only for seq > n, so a test can let the
+// WithStartFromBeginning registration commit (seq 0) succeed while every real
+// watermark advance fails.
+func (s *fakeStore) failCommitsAbove(n int64, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.commitErr = err
+	s.commitErrAboveSeq = n
+}
+
+// hasOffsetRow reports whether the named group has an offset row at all — the
+// thing the retention sweep's MIN(last_seq) is computed over.
+func (s *fakeStore) hasOffsetRow(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.offsets[name]
+	return ok
 }
 
 // InitOffsetLatest mirrors the SQL store's insert-if-absent: create name's
@@ -222,6 +256,7 @@ func (s *fakeStore) CommitOffset(ctx context.Context, name string, seq int64) er
 func (s *fakeStore) InitOffsetLatest(_ context.Context, name string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.initCalls++
 	if s.initOffsetErr != nil {
 		return 0, s.initOffsetErr
 	}
@@ -257,6 +292,20 @@ func (s *fakeStore) snapshotSweep() (calls int, olderThan time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.sweepCalls, s.lastSweepOlder
+}
+
+// snapshotInitCalls reads the InitOffsetLatest invocation count under mu.
+func (s *fakeStore) snapshotInitCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.initCalls
+}
+
+// snapshotCommitCalls reads the CommitOffset invocation count under mu.
+func (s *fakeStore) snapshotCommitCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.commitCalls
 }
 
 // snapshotSeqCalls reads the SequenceMessages invocation count under mu.
@@ -563,7 +612,7 @@ func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 	for range 3 {
 		st.append(msg())
 	}
-	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
+	if _, err := st.SequenceMessages(t.Context(), 100); err != nil {
 		t.Fatalf("seed sequence: %v", err)
 	}
 
@@ -597,6 +646,825 @@ func TestNewGroupStartsAtLatestByDefault(t *testing.T) {
 	}
 }
 
+// TestStartFromBeginningRegistersOffsetRow pins the retention-protection half of
+// WithStartFromBeginning. Sweep protection is derived from MIN(last_seq) over the
+// EXISTING offset rows, so a replaying group that has no row of its own is
+// invisible to the cutoff: the sweep computes it from the other groups alone and
+// can delete the very history this group was configured to replay. Skipping
+// InitOffsetLatest (correct — it would jump the group to latest) must therefore
+// still register the row, by committing 0.
+//
+// The downstream sender fails here on purpose: that is the dangerous case, since
+// nothing is ever committed through the normal path, so the row can only exist if
+// registration is explicit.
+func TestStartFromBeginningRegistersOffsetRow(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg())
+	st.append(msg())
+	if _, err := st.SequenceMessages(t.Context(), 10); err != nil {
+		t.Fatalf("seed SequenceMessages: %v", err)
+	}
+
+	// A pre-existing group sitting above the replay range: without a row for the
+	// replaying group, MIN(last_seq) would be computed from this one alone.
+	st.offsets["established"] = 2
+
+	sendErr := errors.New("broker down")
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return sendErr })
+
+	r, err := sequence.NewRelay("replayer", st, sender, sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if !st.hasOffsetRow("replayer") {
+		t.Fatal("no offset row for the StartFromBeginning group: the retention sweep's MIN(last_seq) cannot see it and may delete the log it is replaying")
+	}
+	if off := st.offsets["replayer"]; off != 0 {
+		t.Fatalf("offset = %d, want 0 (registration must not skip any of the retained log)", off)
+	}
+}
+
+// TestStartFromBeginningStillReplaysWholeLog pins that the registration commit
+// above did not cost the group any history.
+func TestStartFromBeginningStillReplaysWholeLog(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg())
+	st.append(msg())
+	st.append(msg())
+	if _, err := st.SequenceMessages(t.Context(), 10); err != nil {
+		t.Fatalf("seed SequenceMessages: %v", err)
+	}
+
+	var got []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		got = append(got, mdSeq(md))
+		return nil
+	})
+
+	r, err := sequence.NewRelay("replayer", st, sender, sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(got) != 3 || got[0] != 1 || got[2] != 3 {
+		t.Fatalf("delivered = %v, want [1 2 3] (the whole retained log)", got)
+	}
+}
+
+// TestUnsendableClassifierParksAndAdvances pins the escape hatch for a message
+// the broker will never accept. Stopping the lane on every send failure is right
+// for an outage but a trap for a permanently-unsendable row: it sits at the head
+// of the log and every event behind it stops being delivered indefinitely,
+// recoverable only by hand-editing offsets in a live database (v1's
+// WithErrorHandler moved past such a row).
+func TestUnsendableClassifierParksAndAdvances(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg())
+	st.append(msg())
+	st.append(msg())
+
+	unsendable := errors.New("body exceeds frame_max")
+	var delivered []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if mdSeq(md) == 2 {
+			return unsendable
+		}
+		delivered = append(delivered, mdSeq(md))
+		return nil
+	})
+
+	var parked []string
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithStartFromBeginning(),
+		sequence.WithPoisonHandler(func(_ context.Context, m *outbox.Message, _ error) error {
+			parked = append(parked, m.Metadata.ID)
+			return nil
+		}),
+		sequence.WithUnsendableClassifier(func(err error) bool { return errors.Is(err, unsendable) }),
+	)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(parked) != 1 || parked[0] != "2" {
+		t.Fatalf("parked = %v, want [2]", parked)
+	}
+	if len(delivered) != 2 || delivered[0] != 1 || delivered[1] != 3 {
+		t.Fatalf("delivered = %v, want [1 3] (the lane must advance past the unsendable row)", delivered)
+	}
+	if off := st.offsets["c"]; off != 3 {
+		t.Fatalf("offset = %d, want 3 (committed past the parked row)", off)
+	}
+}
+
+// TestUnsendableClassifierStopsLaneOnUnconfirmedPark pins that advancing past an
+// unsendable row requires a CONFIRMED park: committing the offset past it is
+// irreversible, so an unconfirmed DLQ write must leave the row for the next tick
+// rather than skip the event forever.
+func TestUnsendableClassifierStopsLaneOnUnconfirmedPark(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg())
+	st.append(msg())
+
+	unsendable := errors.New("body exceeds frame_max")
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if mdSeq(md) == 1 {
+			return unsendable
+		}
+		return nil
+	})
+
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithStartFromBeginning(),
+		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) error {
+			return errors.New("dlq unavailable")
+		}),
+		sequence.WithUnsendableClassifier(func(err error) bool { return errors.Is(err, unsendable) }),
+	)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if off := st.offsets["c"]; off != 0 {
+		t.Fatalf("offset = %d, want 0 (an unconfirmed park must not advance past the row)", off)
+	}
+}
+
+// TestUnsendableClassifierLeavesOtherFailuresStoppingTheLane pins the narrowness
+// of the hatch: a failure the classifier does not claim (an outage) still stops
+// the lane, so a broker blip cannot bulk-divert the backlog to the DLQ.
+func TestUnsendableClassifierLeavesOtherFailuresStoppingTheLane(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg())
+	st.append(msg())
+
+	unsendable := errors.New("body exceeds frame_max")
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+		return errors.New("connection reset")
+	})
+
+	var parked int
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithStartFromBeginning(),
+		sequence.WithPoisonHandler(func(context.Context, *outbox.Message, error) error {
+			parked++
+			return nil
+		}),
+		sequence.WithUnsendableClassifier(func(err error) bool { return errors.Is(err, unsendable) }),
+	)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if parked != 0 {
+		t.Fatalf("parked = %d during an outage, want 0 (only classified-unsendable messages are parked)", parked)
+	}
+	if off := st.offsets["c"]; off != 0 {
+		t.Fatalf("offset = %d, want 0 (the lane must stop on an unclassified failure)", off)
+	}
+}
+
+// TestStuckLaneEscalatesAfterThreshold pins the wedge alarm. Stopping the lane on
+// a send failure is right for an outage, but tick by tick it is indistinguishable
+// from a message the broker will NEVER accept — and in the latter case every event
+// behind it stops being delivered indefinitely, recoverable only by editing
+// offsets in a live database. The per-tick OnError says only "a send failed", the
+// same thing it says during a two-minute blip, so a distinct once-per-episode
+// signal is what makes the wedge actionable.
+func TestStuckLaneEscalatesAfterThreshold(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		st.append(msg())
+		st.append(msg())
+
+		sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+			return errors.New("broker refuses this message")
+		})
+
+		var stuck []*sequence.StuckLaneError
+		obs := relay.Observer{OnError: func(_ string, err error) {
+			if sl, ok := errors.AsType[*sequence.StuckLaneError](err); ok {
+				stuck = append(stuck, sl)
+			}
+		}}
+
+		r, err := sequence.NewRelay("c", st, sender,
+			sequence.WithStartFromBeginning(), sequence.WithObserver(obs))
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+
+		// Well inside the threshold: a transient outage must not escalate.
+		for range 3 {
+			if err := r.RunOnce(t.Context()); err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+		}
+		if len(stuck) != 0 {
+			t.Fatalf("escalated %d times during a short outage, want 0", len(stuck))
+		}
+
+		// Past the threshold, still stuck on the same seq.
+		time.Sleep(20 * time.Minute)
+		synctest.Wait()
+
+		for range 3 {
+			if err := r.RunOnce(t.Context()); err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+		}
+
+		if len(stuck) != 1 {
+			t.Fatalf("escalated %d times, want exactly 1 (once per episode, not once per tick)", len(stuck))
+		}
+		if stuck[0].Position != "seq 1" {
+			t.Fatalf("StuckLaneError.Position = %q, want \"seq 1\"", stuck[0].Position)
+		}
+		if stuck[0].StuckFor < 20*time.Minute {
+			t.Fatalf("StuckLaneError.StuckFor = %v, want >= 20m", stuck[0].StuckFor)
+		}
+	})
+}
+
+// TestStuckLaneEscalatesOnUnconfirmedParks pins that EVERY path which wedges the
+// lane escalates, not just the plain send failure. A message that can neither be
+// sent nor parked (an unsendable body plus a broken DLQ), and a poison row that
+// cannot be parked, stop the lane exactly as hard — and each of those paths breaks
+// out of the loop separately, so each needs its own report. A path that stops
+// without reporting leaves the wedge with nothing but the generic per-tick error,
+// which is the gap the escalation exists to close.
+func TestStuckLaneEscalatesOnUnconfirmedParks(t *testing.T) {
+	dlqDown := func(context.Context, *outbox.Message, error) error {
+		return errors.New("dlq unavailable")
+	}
+
+	cases := map[string]struct {
+		setup []sequence.Option
+		store func() *fakeStore
+	}{
+		"unsendable message, park fails": {
+			setup: []sequence.Option{
+				sequence.WithPoisonHandler(dlqDown),
+				sequence.WithUnsendableClassifier(func(error) bool { return true }),
+			},
+			store: func() *fakeStore {
+				st := newFakeStore()
+				st.append(msg())
+				return st
+			},
+		},
+		"poison row, park fails": {
+			setup: []sequence.Option{sequence.WithPoisonHandler(dlqDown)},
+			store: func() *fakeStore {
+				st := newFakeStore()
+				st.append(msg())
+				st.append(msg())
+				return st
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				st := tc.store()
+				if name == "poison row, park fails" {
+					if _, err := st.SequenceMessages(t.Context(), 10); err != nil {
+						t.Fatalf("seed: %v", err)
+					}
+					st.poisonSeq = 1
+				}
+
+				sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+					return errors.New("broker refuses this message")
+				})
+
+				var stuck []*sequence.StuckLaneError
+				opts := append([]sequence.Option{
+					sequence.WithStartFromBeginning(),
+					sequence.WithObserver(relay.Observer{OnError: func(_ string, err error) {
+						if sl, ok := errors.AsType[*sequence.StuckLaneError](err); ok {
+							stuck = append(stuck, sl)
+						}
+					}}),
+				}, tc.setup...)
+
+				r, err := sequence.NewRelay("c", st, sender, opts...)
+				if err != nil {
+					t.Fatalf("NewRelay: %v", err)
+				}
+
+				// One pass to arm the tracking, then past the threshold.
+				_ = r.RunOnce(t.Context())
+				time.Sleep(20 * time.Minute)
+				synctest.Wait()
+				_ = r.RunOnce(t.Context())
+				_ = r.RunOnce(t.Context())
+
+				if len(stuck) != 1 {
+					t.Fatalf("escalated %d times, want exactly 1 (this stop path must report the wedge, once per episode)", len(stuck))
+				}
+				if stuck[0].StuckFor < 20*time.Minute {
+					t.Fatalf("StuckLaneError.StuckFor = %v, want >= 20m", stuck[0].StuckFor)
+				}
+			})
+		})
+	}
+}
+
+// TestStuckLaneEscalatesDefaultPoisonWedge pins the escalation for the wedge that
+// needs it most: a poison row with NO PoisonHandler, which is the default
+// configuration. Retrying an undecodable row can never succeed, so the lane stops
+// there permanently and nothing behind it is ever delivered — yet the only
+// telemetry used to be the same per-tick decode error a transient condition
+// produces. The park branch cannot report this case (it is gated on a handler
+// being configured), so the terminal stop path has to.
+func TestStuckLaneEscalatesDefaultPoisonWedge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		st.append(msg())
+		st.append(msg())
+		if _, err := st.SequenceMessages(t.Context(), 10); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		st.poisonSeq = 1 // the head row is undecodable
+
+		var stuck []*sequence.StuckLaneError
+		obs := relay.Observer{OnError: func(_ string, err error) {
+			if sl, ok := errors.AsType[*sequence.StuckLaneError](err); ok {
+				stuck = append(stuck, sl)
+			}
+		}}
+
+		// No WithPoisonHandler: the documented default.
+		r, err := sequence.NewRelay("c", st, noopSender,
+			sequence.WithStartFromBeginning(), sequence.WithObserver(obs))
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+
+		_ = r.RunOnce(t.Context())
+		if len(stuck) != 0 {
+			t.Fatalf("escalated %d times immediately, want 0", len(stuck))
+		}
+
+		time.Sleep(20 * time.Minute)
+		synctest.Wait()
+		_ = r.RunOnce(t.Context())
+		_ = r.RunOnce(t.Context())
+
+		if len(stuck) != 1 {
+			t.Fatalf("escalated %d times, want exactly 1 (the default poison wedge must escalate, once per episode)", len(stuck))
+		}
+		if stuck[0].Position != "seq 1" {
+			t.Fatalf("StuckLaneError.Position = %q, want \"seq 1\"", stuck[0].Position)
+		}
+	})
+}
+
+// TestStuckLaneEscalatesDespiteRedeliveredPrefix pins that progress on OTHER
+// messages cannot reset the escalation timer.
+//
+// Whenever the offset commit fails, a pass re-delivers the prefix ahead of the
+// wedged row before hitting it again. A tracker cleared by any successful disposal
+// therefore restarts its timer on every single pass, and a permanently wedged lane
+// never reaches the threshold — the escalation would be dead exactly in the
+// scenario where a commit problem and a delivery problem coincide.
+func TestStuckLaneEscalatesDespiteRedeliveredPrefix(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		st.append(msg())
+		st.append(msg())
+		if _, err := st.SequenceMessages(t.Context(), 10); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		// Watermark advances never land (the seq-0 registration commit still does),
+		// so every pass re-reads from offset 0 and re-delivers seq 1 successfully
+		// before wedging again on seq 2.
+		st.failCommitsAbove(0, errors.New("commit unavailable"))
+
+		sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+			if mdSeq(md) == 2 {
+				return errors.New("broker refuses this message")
+			}
+			return nil
+		})
+
+		var stuck []*sequence.StuckLaneError
+		obs := relay.Observer{OnError: func(_ string, err error) {
+			if sl, ok := errors.AsType[*sequence.StuckLaneError](err); ok {
+				stuck = append(stuck, sl)
+			}
+		}}
+
+		r, err := sequence.NewRelay("c", st, sender,
+			sequence.WithStartFromBeginning(), sequence.WithObserver(obs))
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+
+		// Many passes, each re-delivering seq 1 successfully before wedging on 2.
+		for range 5 {
+			_ = r.RunOnce(t.Context())
+		}
+		time.Sleep(20 * time.Minute)
+		synctest.Wait()
+		for range 5 {
+			_ = r.RunOnce(t.Context())
+		}
+
+		if len(stuck) == 0 {
+			t.Fatal("never escalated: a re-delivered prefix reset the stuck-lane timer every pass, so a permanent wedge stays invisible")
+		}
+		if stuck[0].Position != "seq 2" {
+			t.Fatalf("StuckLaneError.Position = %q, want \"seq 2\"", stuck[0].Position)
+		}
+	})
+}
+
+// TestStuckLaneTrackingResetsOnProgress pins that the escalation follows a stuck
+// LANE, not a cumulative failure count: once the relay makes progress the clock
+// starts over, so a flaky downstream never accumulates its way to a false alarm.
+func TestStuckLaneTrackingResetsOnProgress(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		st.append(msg())
+		st.append(msg())
+
+		fail := true
+		sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+			if fail {
+				return errors.New("transient")
+			}
+			return nil
+		})
+
+		var stuck int
+		obs := relay.Observer{OnError: func(_ string, err error) {
+			if _, ok := errors.AsType[*sequence.StuckLaneError](err); ok {
+				stuck++
+			}
+		}}
+
+		r, err := sequence.NewRelay("c", st, sender,
+			sequence.WithStartFromBeginning(), sequence.WithObserver(obs))
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+
+		// Recover, then let far more than the threshold elapse.
+		fail = false
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+
+		if stuck != 0 {
+			t.Fatalf("escalated %d times after the lane recovered, want 0", stuck)
+		}
+	})
+}
+
+// TestRetentionDefaultsOnAndIsWaivable pins the retention decision surface.
+//
+// Default-ON: the v2 log is never pruned on delivery, so a relay with no sweep
+// grows outbox_messages until the cluster runs out of disk — months after the
+// omission and nowhere near it. Defaulting cannot lose an event, since the sweep
+// only deletes rows below EVERY group's committed offset.
+//
+// Waivable: the sweep's window takes effect store-wide (cutoff MIN(last_seq)
+// across all groups) while being configured per-relay, so on a shared store the
+// shortest window wins for everyone. A relay cannot see its siblings, so the
+// escape is explicit — WithoutRetention on every relay but the one that owns the
+// sweep. NewRelay logs the effective window and its store-wide scope so a
+// disagreement is diagnosable from the two relays' logs.
+func TestRetentionDefaultsOnAndIsWaivable(t *testing.T) {
+	t.Run("on by default", func(t *testing.T) {
+		st := newFakeStore()
+		r, err := sequence.NewRelay("c", st, noopSender)
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		calls, window := st.snapshotSweep()
+		if calls == 0 {
+			t.Fatal("sweepCalls = 0 with default options, want the default sweep to run (an unswept log grows to disk-full)")
+		}
+		if window != 7*24*time.Hour {
+			t.Fatalf("sweep window = %v, want the 7-day default", window)
+		}
+	})
+
+	t.Run("WithoutRetention waives it", func(t *testing.T) {
+		st := newFakeStore()
+		r, err := sequence.NewRelay("c", st, noopSender, sequence.WithoutRetention())
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		if calls, _ := st.snapshotSweep(); calls != 0 {
+			t.Fatalf("sweepCalls = %d after WithoutRetention, want 0", calls)
+		}
+	})
+
+	t.Run("WithRetention overrides the window", func(t *testing.T) {
+		st := newFakeStore()
+		r, err := sequence.NewRelay("c", st, noopSender,
+			sequence.WithRetention(30*24*time.Hour, time.Minute, 100))
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("RunOnce: %v", err)
+		}
+		calls, window := st.snapshotSweep()
+		if calls == 0 {
+			t.Fatal("sweepCalls = 0 despite an explicit WithRetention")
+		}
+		if window != 30*24*time.Hour {
+			t.Fatalf("sweep window = %v, want the configured 30 days", window)
+		}
+	})
+
+	t.Run("WithRetention and WithoutRetention conflict", func(t *testing.T) {
+		_, err := sequence.NewRelay("c", newFakeStore(), noopSender,
+			sequence.WithRetention(time.Hour, time.Minute, 100), sequence.WithoutRetention())
+		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Fatalf("err = %v, want a mutually-exclusive error", err)
+		}
+	})
+
+	t.Run("default window on a store without Sweeper is not an error", func(t *testing.T) {
+		// A legitimate topology: the store prunes itself, or another relay owns the
+		// sweep. Only an EXPLICIT WithRetention makes the capability mandatory.
+		if _, err := sequence.NewRelay("c", storeWithoutSweeper{inner: newFakeStore()}, noopSender); err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+	})
+}
+
+// TestSweepReportsZeroCounts pins that a blocked sweep is observable. The cutoff is
+// MIN(last_seq) across ALL groups, so one lagging or replaying group pins it and
+// blocks pruning store-wide. Gating OnSwept on n > 0 made a blocked sweep and a
+// healthy idle one emit NOTHING alike, so the log could grow toward disk-full with
+// no way to tell them apart.
+func TestSweepReportsZeroCounts(t *testing.T) {
+	st := newFakeStore() // sweepBacklog 0: nothing deletable
+	var swept []int
+	obs := relay.Observer{OnSwept: func(_ string, n int) { swept = append(swept, n) }}
+
+	r, err := sequence.NewRelay("c", st, noopSender,
+		sequence.WithRetention(time.Hour, time.Minute, 100), sequence.WithObserver(obs))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(swept) != 1 || swept[0] != 0 {
+		t.Fatalf("OnSwept counts = %v, want exactly [0] (a sweep that deleted nothing must still report)", swept)
+	}
+}
+
+// TestNewRelayRejectsUnsendableClassifierWithoutPoisonHandler pins the
+// construction guard: there is nowhere to park an unsendable message without a
+// PoisonHandler, so the combination would silently degrade back to
+// stop-the-lane-forever.
+func TestNewRelayRejectsUnsendableClassifierWithoutPoisonHandler(t *testing.T) {
+	_, err := sequence.NewRelay("c", newFakeStore(), noopSender,
+		sequence.WithUnsendableClassifier(func(error) bool { return true }))
+	if err == nil || !strings.Contains(err.Error(), "WithPoisonHandler") {
+		t.Fatalf("err = %v, want an error naming WithPoisonHandler", err)
+	}
+}
+
+// clockStore decorates the fake with sequence.Clock, reporting a store clock the
+// test controls independently of the host clock.
+type clockStore struct {
+	*fakeStore
+	now  time.Time
+	err  error
+	call int
+}
+
+func (s *clockStore) StoreNow(context.Context) (time.Time, error) {
+	s.call++
+	if s.err != nil {
+		return time.Time{}, s.err
+	}
+	return s.now, nil
+}
+
+// TestOldestAgeUsesStoreClock pins the lag metric's clock domain. CreateTime is
+// stamped by the STORE, so measuring its age against the relay host's clock folds
+// NTP skew between the two hosts into the metric — and on a pod whose clock
+// trails the database it reports a NEGATIVE age for a genuinely stale backlog,
+// which a gauge plots as ~0 so the lag alert never fires. Here the host clock is
+// far ahead of the store's; the reported age must follow the store.
+func TestOldestAgeUsesStoreClock(t *testing.T) {
+	st := &clockStore{fakeStore: newFakeStore()}
+	m := msg()
+	m.CreateTime = time.Now().Add(-90 * time.Minute) // "store" insert time
+	st.append(m)
+	st.now = m.CreateTime.Add(30 * time.Minute) // store clock: 30m of real lag
+
+	var ages []time.Duration
+	obs := relay.Observer{OnDrained: func(_ string, _ int, oldestAge time.Duration, _ bool) {
+		ages = append(ages, oldestAge)
+	}}
+
+	r, err := sequence.NewRelay("c", st, noopSender,
+		sequence.WithStartFromBeginning(), sequence.WithObserver(obs))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(ages) != 1 {
+		t.Fatalf("OnDrained fired %d times, want 1", len(ages))
+	}
+	if ages[0] != 30*time.Minute {
+		t.Fatalf("oldestAge = %v, want 30m (measured against the store clock, not the host's ~90m)", ages[0])
+	}
+}
+
+// TestOldestAgeSkipsStoreClockWithoutObserver pins the cost guard: the store
+// clock is only worth a round trip when something consumes the value.
+func TestOldestAgeSkipsStoreClockWithoutObserver(t *testing.T) {
+	st := &clockStore{fakeStore: newFakeStore()}
+	st.now = time.Now()
+	st.append(msg())
+
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if st.call != 0 {
+		t.Fatalf("StoreNow called %d times with no OnDrained observer, want 0", st.call)
+	}
+}
+
+// TestOldestAgeFallsBackWhenStoreClockFails pins that lag is telemetry: a failed
+// clock read degrades to the host clock instead of failing the pass.
+func TestOldestAgeFallsBackWhenStoreClockFails(t *testing.T) {
+	st := &clockStore{fakeStore: newFakeStore(), err: errors.New("clock unavailable")}
+	m := msg()
+	m.CreateTime = time.Now().Add(-time.Hour)
+	st.append(m)
+
+	var ages []time.Duration
+	obs := relay.Observer{OnDrained: func(_ string, _ int, oldestAge time.Duration, _ bool) {
+		ages = append(ages, oldestAge)
+	}}
+
+	r, err := sequence.NewRelay("c", st, noopSender,
+		sequence.WithStartFromBeginning(), sequence.WithObserver(obs))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(ages) != 1 || ages[0] < 59*time.Minute {
+		t.Fatalf("oldestAge = %v, want ~1h from the host-clock fallback", ages)
+	}
+}
+
+// TestDeletedOffsetRowRePrimesAtLatest pins that losing the offset row does not
+// turn into a full replay.
+//
+// DeleteOffset is the documented way to decommission a retired group and unpin the
+// retention sweep, and it can land on a group whose relay is still running (wrong
+// name, or a decommission before the pod drained). The relay then reads offset 0
+// again. Re-priming at latest makes that harmless; caching "already initialized"
+// in the process instead makes it replay every retained row — seven days of events
+// by default — to the downstream broker.
+func TestDeletedOffsetRowRePrimesAtLatest(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg())
+	st.append(msg())
+	st.append(msg())
+
+	var got []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		got = append(got, mdSeq(md))
+		return nil
+	})
+
+	r, err := sequence.NewRelay("c", st, sender) // default: start at latest
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	// First pass primes at latest and delivers nothing from the existing log.
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("delivered %v on the priming pass, want nothing", got)
+	}
+
+	// The offset row is deleted underneath the running relay.
+	delete(st.offsets, "c")
+
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce after the row was deleted: %v", err)
+	}
+
+	if len(got) != 0 {
+		t.Fatalf("delivered %v after the offset row was deleted, want nothing: "+
+			"the relay must re-prime at latest, not replay the retained log", got)
+	}
+	if !st.hasOffsetRow("c") {
+		t.Fatal("offset row was not recreated after deletion")
+	}
+}
+
+// TestOffsetPrimingHappensOnceWhileTheRowExists pins that priming is keyed on the
+// offset ROW, not on the offset VALUE.
+//
+// A group legitimately sits at offset 0 — freshly primed on an empty log, or waiting
+// for the sequencer — and keying the priming branch on `offset == 0` re-primes it on
+// every tick: for a default group that is an InitOffsetLatest whose INSERT fails on
+// duplicate key (logged server-side by the database, so an idle relay manufactures a
+// stream of errors that look like a bug), and for a WithStartFromBeginning group it
+// is a real write per tick.
+func TestOffsetPrimingHappensOnceWhileTheRowExists(t *testing.T) {
+	t.Run("latest group", func(t *testing.T) {
+		st := newFakeStore() // empty log: the primed offset is legitimately 0
+		r, err := sequence.NewRelay("c", st, noopSender)
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+
+		for range 5 {
+			if err := r.RunOnce(t.Context()); err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+		}
+
+		if st.snapshotInitCalls() != 1 {
+			t.Fatalf("InitOffsetLatest called %d times over 5 ticks, want 1 "+
+				"(a group sitting at 0 must not be re-primed every tick)", st.snapshotInitCalls())
+		}
+	})
+
+	t.Run("start-from-beginning group", func(t *testing.T) {
+		st := newFakeStore()
+		r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning())
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+
+		for range 5 {
+			if err := r.RunOnce(t.Context()); err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+		}
+
+		if got := st.snapshotCommitCalls(); got != 1 {
+			t.Fatalf("CommitOffset called %d times over 5 idle ticks, want 1 "+
+				"(the seq-0 registration is a WRITE; repeating it every tick is pure churn)", got)
+		}
+	})
+}
+
 // TestRunTicksThenReleasesOnCancel exercises Run's fake-clock lifecycle end to
 // end: the ticker drives repeated drains of a pending message, and canceling
 // releases the leader lock so a planned shutdown fails over quickly. Uses
@@ -619,7 +1487,7 @@ func TestRunTicksThenReleasesOnCancel(t *testing.T) {
 			t.Fatalf("NewRelay: %v", err)
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		go func() { _ = r.Run(ctx) }()
 
 		time.Sleep(1500 * time.Millisecond)
@@ -678,7 +1546,7 @@ func (s storeWithoutSweeper) ListMessages(ctx context.Context, afterSeq int64, l
 	return s.inner.ListMessages(ctx, afterSeq, limit)
 }
 
-func (s storeWithoutSweeper) Offset(ctx context.Context, name string) (int64, error) {
+func (s storeWithoutSweeper) Offset(ctx context.Context, name string) (int64, bool, error) {
 	return s.inner.Offset(ctx, name)
 }
 
@@ -721,7 +1589,7 @@ func TestMaybeSweepRunsOnInterval(t *testing.T) {
 
 		// First tick sweeps immediately; two more inside the interval skip.
 		for i := range 3 {
-			if err := r.RunOnce(context.Background()); err != nil {
+			if err := r.RunOnce(t.Context()); err != nil {
 				t.Fatalf("RunOnce[%d]: %v", i, err)
 			}
 		}
@@ -733,7 +1601,7 @@ func TestMaybeSweepRunsOnInterval(t *testing.T) {
 
 		// After the interval elapses, the next tick sweeps again.
 		time.Sleep(interval + time.Second)
-		if err := r.RunOnce(context.Background()); err != nil {
+		if err := r.RunOnce(t.Context()); err != nil {
 			t.Fatalf("RunOnce[after interval]: %v", err)
 		}
 		if calls, _ := st.snapshotSweep(); calls != 2 {
@@ -766,7 +1634,7 @@ func (s storeWithoutSequencer) ListMessages(ctx context.Context, afterSeq int64,
 	return s.inner.ListMessages(ctx, afterSeq, limit)
 }
 
-func (s storeWithoutSequencer) Offset(ctx context.Context, name string) (int64, error) {
+func (s storeWithoutSequencer) Offset(ctx context.Context, name string) (int64, bool, error) {
 	return s.inner.Offset(ctx, name)
 }
 
@@ -882,7 +1750,7 @@ func TestSequenceStopsOnCtxCancellationMidLoop(t *testing.T) {
 		t.Fatalf("NewRelay: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	runErr := r.RunOnce(ctx)
@@ -1006,7 +1874,7 @@ func TestDrainStopsImmediatelyOnPreCanceledCtx(t *testing.T) {
 	for range 4 {
 		st.append(msg())
 	}
-	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
+	if _, err := st.SequenceMessages(t.Context(), 100); err != nil {
 		t.Fatalf("seed sequence: %v", err)
 	}
 	var sent int
@@ -1017,7 +1885,7 @@ func TestDrainStopsImmediatelyOnPreCanceledCtx(t *testing.T) {
 		t.Fatalf("NewRelay: %v", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
 	runErr := r.RunOnce(ctx)
