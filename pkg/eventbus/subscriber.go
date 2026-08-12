@@ -29,7 +29,15 @@ type Setuper interface {
 // Processor consumes one raw incoming event (CloudEvents metadata + encoded
 // payload). A non-nil error tells the transport the event was not handled,
 // and transport-specific redelivery/parking semantics apply.
-type Processor func(md *event.Metadata, data []byte) error
+//
+// ctx is the per-delivery context and becomes the handler's own: the transport
+// supplies the narrowest context that still covers this delivery, so a handler
+// can observe shutdown and stop work the transport is about to abandon. A
+// drain-capable transport (the rabbitmq receivers) passes the consumer group's
+// context — canceled when the drain budget is spent or the connection dies, NOT
+// at the first shutdown signal, so in-flight handlers still get their drain
+// window.
+type Processor func(ctx context.Context, md *event.Metadata, data []byte) error
 
 // EventHandler handles a single event. The handler implementation is captured
 // in the closure, so no any-typed value is passed at runtime.
@@ -194,10 +202,13 @@ func (s *Subscriber) Subscribe(ctx context.Context, r Receiver) error {
 	return nil
 }
 
-func (s *Subscriber) process(md *event.Metadata, data []byte) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+// process is the Processor the transport drives. ctx comes FROM the transport
+// (see Processor): deriving it from context.Background() instead — which this
+// used to do — left handlers with no way to observe shutdown at all, so under a
+// drain-capable receiver a slow handler ran past the drain budget, the
+// connection was force-closed under it, and the unacked delivery was redelivered
+// after restart — running any non-idempotent side effect twice.
+func (s *Subscriber) process(ctx context.Context, md *event.Metadata, data []byte) error {
 	// md.Type arrives from the incoming message, so it is untrusted: a dot-less
 	// type must be rejected as unprocessable, never sliced (that panics).
 	service, eventName, err := event.SplitType(md.Type)

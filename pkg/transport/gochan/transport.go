@@ -34,14 +34,35 @@ type message struct {
 	data []byte
 }
 
+// Option configures a SendReceiver.
+type Option func(*SendReceiver)
+
+// WithErrorHandler installs a sink for handler failures.
+//
+// This transport has no redelivery and no dead-letter queue, so an event whose
+// handler returns an error is dropped and delivery continues (ending the
+// subscription instead would silently stop every event behind it). Without a
+// handler that drop is invisible, which is why installing one is recommended for
+// anything beyond a test: h is called on the receive goroutine, so it must not
+// block.
+func WithErrorHandler(h func(md *event.Metadata, err error)) Option {
+	return func(sr *SendReceiver) { sr.receiver.onErr = h }
+}
+
 // New builds a SendReceiver over a fresh channel (buffer depth 20).
-func New() *SendReceiver {
+func New(opts ...Option) *SendReceiver {
 	ch := make(chan message, defaultChanDepth)
 
-	return &SendReceiver{
+	sr := &SendReceiver{
 		sender:   ch,
-		receiver: ch,
+		receiver: receiver{ch: ch},
 	}
+
+	for _, opt := range opts {
+		opt(sr)
+	}
+
+	return sr
 }
 
 // Setup implements eventbus.Setuper. It is a no-op: an in-memory channel has

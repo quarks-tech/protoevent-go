@@ -6,16 +6,9 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/notify"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/bound"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/lane"
 )
-
-// shutdownTimeout bounds shutdown-path store I/O (closeStream's Stream.Close,
-// saveToken's final persist) on a fresh context.Background(): those paths run
-// where the run ctx may already be canceled, and a killCursors or token save
-// on a dead context would never be delivered — mirroring internal/leader's
-// releaseTimeout pattern.
-const shutdownTimeout = 5 * time.Second
 
 // ErrLaneStopped is returned by RunOnce when drainWindow stopped the lane (a
 // send failure, or a poison event without a parking path) and closed the
@@ -31,16 +24,7 @@ var ErrLaneStopped = errors.New("stream: lane stopped; will reopen and redeliver
 // Releases leadership on exit so a planned shutdown fails over quickly.
 func (r *Relay) Run(ctx context.Context) error {
 	defer r.closeStream()
-	defer func() {
-		// Informational only: failover falls back to TTL expiry, and a store
-		// outage also surfaces on the successor's TryAcquire (see Release doc).
-		if err := r.leader.Release(); err != nil {
-			r.options.Logger.Warn("stream relay: release leader lock", "relay", r.name, "err", err)
-		}
-		// Graceful release ends this instance's leadership: emit the
-		// transition so telemetry does not leave a dead instance marked leader.
-		r.trackLeadership(false)
-	}()
+	defer r.reporter.ReleaseLeadership(r.leader)
 
 	for {
 		if ctx.Err() != nil {
@@ -55,12 +39,13 @@ func (r *Relay) Run(ctx context.Context) error {
 		case errors.Is(err, ErrLaneStopped):
 			// Stream already closed by drainWindow; back off, then reopen and
 			// redeliver next iteration. A send failure was already observed
-			// via handleError, so don't re-observe here.
+			// by the lane, so don't re-observe here.
 			r.sleep(ctx)
 		case errors.Is(err, ErrInvalidated), errors.Is(err, ErrHistoryLost):
 			// Fatal: report and stop. The deferred closeStream releases the cursor.
-			notify.Error(r.options.Observer, r.name, err)
+			r.reporter.Error(err)
 			r.options.Logger.Error("stream relay: fatal stream error", "relay", r.name, "err", err)
+
 			return err
 		case ctx.Err() != nil:
 			// Planned shutdown (ctx is genuinely done): the ctx.Err() check at
@@ -73,8 +58,7 @@ func (r *Relay) Run(ctx context.Context) error {
 			r.sleep(ctx)
 		default:
 			// transient (leadership, reopen, send/save): report, drop the stream, retry
-			notify.Error(r.options.Observer, r.name, err)
-			r.options.Logger.Error("stream relay: pass failed", "relay", r.name, "err", err)
+			r.reporter.PassFailed(err)
 			r.closeStream()
 			r.sleep(ctx)
 		}
@@ -92,7 +76,7 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	r.trackLeadership(isLeader)
+	r.reporter.Leadership(isLeader)
 	if !isLeader {
 		r.closeStream()
 		r.sleep(ctx) // avoid busy-spinning TryAcquireLeaderLock while not leader
@@ -155,31 +139,26 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		e, ok, err := r.stream.Next(ctx)
 		if err != nil {
 			de, isPoison := errors.AsType[*DecodeError](err)
-			if isPoison && de.ResumeToken != "" && r.options.PoisonHandler != nil && ctx.Err() == nil {
-				// Advance past the poison event ONLY on a confirmed park
-				// (handler returned nil): persisting the token past it is
-				// irreversible, and an unconfirmed DLQ write would silently
-				// skip the event forever. Parking requires the event's resume
-				// token: extraction is best-effort, and an empty one is
-				// non-parkable — advancing with it would later persist "" and
-				// erase the group's position (restart "at now", silently
-				// skipping events).
-				parkErr := r.handleError(ctx, r.options.PoisonHandler, &outbox.Message{ID: de.ID}, err)
+			if isPoison && de.ResumeToken != "" && de.ID != "" && r.options.PoisonHandler != nil && ctx.Err() == nil {
+				// lane.Park owns the confirmed-park rule (advance only on nil).
+				// The GATE above it is this runtime's own: parking needs BOTH the
+				// resume token and the id, and both extractions are best-effort. An
+				// empty TOKEN would later persist "" and erase the group's position;
+				// an empty ID leaves the parked stub unanswerable, since the stub is
+				// all the handler receives and fetching the row by ID is its
+				// documented recovery. Either way, stopping the lane is loud and
+				// recoverable where advancing past it is neither.
+				parkErr := r.lane.Park(ctx, stuckKey(de.ResumeToken, de.ID), &outbox.Message{ID: de.ID}, err)
 				if parkErr == nil {
-					// Poison event parked: resume past it, keeping the lane
-					// moving. CommitTime extraction is best-effort too: a
-					// zero one would (a) be swallowed by the store's monotone
-					// guard, freezing the persisted position at the
-					// pre-poison token forever (the lane reopens onto the
-					// poison every window), and (b) zero committedCT,
-					// silencing committedTokenAge()'s cliff alarm exactly
-					// during a poison episode. Floor, never rewind: a poison
-					// event must not drag lastCT below a commitTime an
-					// earlier event in THIS window already advanced it to
-					// (that would persist a stale anchor and inflate the
-					// cliff metric); with nothing advanced yet, anchor on the
-					// last committed commitTime — equal passes the monotone
-					// $lte filter, so the token still advances.
+					// Poison event parked: resume past it. CommitTime
+					// extraction is best-effort too, so lastCT FLOORS and never
+					// rewinds — a zero or older commitTime would either be
+					// swallowed by the store's monotone guard (freezing the
+					// position at the pre-poison token, so the lane reopens onto
+					// the poison every window) or persist a stale anchor and
+					// inflate the cliff metric. With nothing advanced yet, anchor
+					// on the last committed commitTime: equal still passes the
+					// monotone guard, so the token advances.
 					lastTok = de.ResumeToken
 					switch {
 					case de.CommitTime.After(lastCT):
@@ -189,13 +168,13 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 					}
 					advanced = true
 					handled++
-					r.noteSendOK(de.ResumeToken, de.ID)
+
 					continue
 				}
 				// Unconfirmed park: fall through below and stop the lane at
 				// the poison — same as having no handler or no token — and
 				// retry the park on reopen. Join the park failure into the
-				// error chain: telemetry alone (handleError observed and
+				// error chain: telemetry alone (lane.Park already observed and
 				// logged it) would leave Run's returned error blind to the
 				// broken DLQ.
 				err = errors.Join(err, parkErr)
@@ -209,7 +188,7 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 			// errors are stream-level, not stuck at a position, so they are left to
 			// Run's reopen/backoff.
 			if isPoison {
-				r.noteStuck(de.ResumeToken, de.ID, err)
+				r.lane.Stuck(stuckKey(de.ResumeToken, de.ID), de.ID, err)
 			}
 			// Non-parkable Next error: persist the sent prefix's position
 			// first (the same save the send-failure stop path gets via
@@ -240,54 +219,29 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 			// than panic the relay goroutine.
 			return errors.New("stream: Next returned ok with a nil event or message")
 		}
-		if sendErr := r.sender.Send(ctx, e.Message.Metadata, e.Message.Data); sendErr != nil {
-			if ctx.Err() != nil {
-				// The send failed because the run context was canceled (planned
-				// shutdown), not because the event is bad: stop the lane without
-				// parking it or advancing past it — it redelivers on restart.
-				stopped = true
-				break
-			}
-			// An event the caller's classifier calls PERMANENTLY unsendable is
-			// parked like a poison event: redelivering it on every reopen can
-			// never succeed, and it would wedge every event behind it. Only a
-			// confirmed park (nil) advances the resume position past it; an
-			// unconfirmed one stops the lane and retries the park on reopen.
-			// Either way handleError has already reported this failure, so the
-			// stop path below must not report it a second time — double-counting
-			// OnError misrepresents the incident's size.
-			if r.options.Unsendable != nil && r.options.Unsendable(sendErr) {
-				parkErr := r.handleError(ctx, r.options.PoisonHandler, e.Message, sendErr)
-				if parkErr == nil {
-					lastTok, lastCT = e.ResumeToken, e.CommitTime
-					advanced = true
-					handled++
-					r.noteSendOK(e.ResumeToken, e.Message.ID)
-					continue
-				}
-				// Unsendable AND unparkable: the lane reopens onto this event
-				// every window until the DLQ recovers, so the wedge escalates.
-				r.noteStuck(e.ResumeToken, e.Message.ID, errors.Join(sendErr, parkErr))
-				stopped = true
-				break
-			}
-			// Any other send failure stops the lane, PoisonHandler or not: it is
-			// downstream trouble (broker down, timeout), not an event fault,
-			// and parking healthy events during an outage would bulk-divert
-			// the backlog to the DLQ while advancing the persisted position
-			// past it. The lane reopens at this event — order and delivery
-			// preserved. (The nil handler keeps it out of the DLQ.)
-			// nil handler: return is always nil (send failures are never parked).
-			_ = r.handleError(ctx, nil, e.Message, sendErr)
-			r.noteStuck(e.ResumeToken, e.Message.ID, sendErr)
+		// The shared per-message policy (internal/lane) decides send/park/stop;
+		// what is left here is this runtime's own bookkeeping — which resume
+		// position a disposed event advances to. A stopped lane redelivers the
+		// event on reopen, so order and delivery are preserved either way.
+		switch r.lane.Send(ctx, stuckKey(e.ResumeToken, e.Message.ID), e.Message) {
+		case lane.Sent:
+			sent++
+			lastTok, lastCT = e.ResumeToken, e.CommitTime
+			advanced = true
+			handled++
+		case lane.Parked:
+			lastTok, lastCT = e.ResumeToken, e.CommitTime
+			advanced = true
+			handled++
+		case lane.Stopped, lane.Canceled:
+			// Canceled is a planned shutdown rather than an event fault, but
+			// this runtime treats both the same way: stop the window without
+			// advancing, and let the reopen redeliver from the persisted token.
 			stopped = true
+		}
+		if stopped {
 			break
 		}
-		sent++
-		r.noteSendOK(e.ResumeToken, e.Message.ID)
-		lastTok, lastCT = e.ResumeToken, e.CommitTime
-		advanced = true
-		handled++
 	}
 
 	// Calibrate the clock offset on EVERY caught-up window, not only the
@@ -340,7 +294,7 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 	}
 
 	more := stopped || handled == r.options.TokenBatchSize
-	notify.Drained(r.options.Observer, r.name, sent, r.committedTokenAge(), more)
+	r.reporter.Drained(sent, r.committedTokenAge(), more)
 
 	if stopped {
 		// A change-stream cursor cannot rewind, so to actually redeliver the
@@ -378,15 +332,16 @@ func (r *Relay) saveToken(ctx context.Context, tok string, ct time.Time) error {
 }
 
 // stuckKey is the stuck-lane tracking key for one event: an existing string, never
-// a newly built one, because Progress runs once per delivered event.
+// a newly built one, because it is computed once per delivered event.
 //
 // The resume token identifies the position, but a poison event's token extraction
 // is best-effort and can come back empty — and an empty token is exactly the case
-// that wedges the lane hardest, since it is non-parkable. Keying every untokened
-// event on the same value would make them indistinguishable: once one such episode
-// escalated, the tracker would treat a LATER untokened poison event as the same
-// still-unresolved one and never escalate again. Fall back to the event id, which is
-// extracted independently.
+// that wedges the lane hardest, since it is non-parkable. Fall back to the event
+// id, which is extracted independently.
+//
+// When BOTH come back empty the key is "" — nothing about the event can be
+// observed. The tracker is told so (see identified below), which is what keeps a
+// later unidentifiable wedge from being mistaken for the same unresolved one.
 func stuckKey(resumeToken, id string) string {
 	switch {
 	case resumeToken != "":
@@ -398,42 +353,26 @@ func stuckKey(resumeToken, id string) string {
 	}
 }
 
-// stuckLabel renders a key for the operator. Built only on escalation, so its
-// allocation stays off the per-event path.
-func stuckLabel(resumeToken, id string) string {
-	switch {
-	case resumeToken != "":
-		return "resume token " + resumeToken
-	case id != "":
+// identified reports whether a stuck key says anything about the event at all.
+// See notify.StuckTracker.Stuck.
+func identified(key string) bool { return key != "" }
+
+// stuckLabel renders a key for the operator. Built only on escalation (see
+// lane.Lane.Label), so its allocation stays off the per-event path.
+//
+// The key is the resume token when there was one and the id otherwise, so the two
+// are told apart by comparing against the id. A resume token that happened to
+// equal the event id would be labeled as the id; tokens are opaque server-side
+// blobs, and the consequence is a wording difference in one escalation log line.
+func stuckLabel(key, id string) string {
+	switch key {
+	case "":
+		return "unidentifiable event"
+	case id:
 		return "event " + id
 	default:
-		return "unidentifiable event"
+		return "resume token " + key
 	}
-}
-
-// noteSendOK ends a stuck episode after the event AT resumeToken was successfully
-// disposed of (sent, or parked with confirmation). Keyed on the token, not
-// unconditional: a window that re-delivers a prefix ahead of a wedged event —
-// which is what a reopen does whenever the token save is being rejected by the
-// store's monotone guard — would otherwise reset the escalation timer every
-// window. See notify.StuckTracker.
-func (r *Relay) noteSendOK(resumeToken, id string) {
-	r.stuck.Progress(stuckKey(resumeToken, id))
-}
-
-// noteStuck escalates a lane that keeps stopping at the same resume token (see
-// notify.StuckTracker). Must be called from EVERY path that stops the lane — a
-// send failure, an unsendable event whose park was not confirmed, an unconfirmed
-// poison park — since each of them wedges the stream identically: the cursor
-// reopens onto the same event every window.
-func (r *Relay) noteStuck(resumeToken, id string, err error) {
-	stuckFor, escalate := r.stuck.Stuck(stuckKey(resumeToken, id))
-	if !escalate {
-		return
-	}
-
-	notify.StuckLane(r.options.Observer, r.options.Logger, "stream", r.name,
-		stuckLabel(resumeToken, id), id, stuckFor, err)
 }
 
 // calibrateClock records the offset between the MongoDB server clock and this
@@ -472,25 +411,14 @@ func (r *Relay) serverNow() (time.Time, bool) {
 // committedTokenAge is the cliff proxy: how far the committed token trails the
 // PRESENT — the resume-token-cliff early-warning signal. Cheap — no query.
 //
-// It must be measured against now, not against anything the relay has read.
-// Anchoring it to the newest clusterTime seen from the cursor looks right and is
-// exactly backwards: a relay six hours behind reads six-hour-old events, so that
-// anchor equals the committed position and the gauge reads ~0 for the entire
-// incident — silent in precisely the case the alarm exists for. A stop-the-lane
-// outage has the same shape: the same failed event every window, nothing
-// advancing.
+// The anchor is the estimated server clock (serverNow), never anything read from
+// the cursor: a relay six hours behind reads six-hour-old events, so a
+// cursor-derived anchor equals the committed position and the gauge reads ~0 for
+// the whole incident — silent in exactly the case the alarm exists for. Before the
+// first calibration it degrades to the raw host clock, right to within the skew.
 //
-// So: estimate the server's current time from a host clock corrected by an offset
-// calibrated whenever the relay is caught up (calibrateClock), and subtract the
-// committed clusterTime from that. The offset makes it skew-free — subtracting a
-// server clusterTime from a raw host clock reports NEGATIVE ages on a pod whose
-// clock trails the primary, which any gauge plots as ~0 — while the host clock
-// supplies the passage of time that the stream itself stops providing during a
-// backlog or an outage. Before the first calibration (a relay that has never
-// caught up) it degrades to the raw host clock, which is right to within the skew.
-//
-// Because a clusterTime is truncated to whole seconds, sub-second lag reads as 0:
-// the signal is a cliff warning measured in minutes, not a latency histogram.
+// Because a commitTime is truncated to whole seconds, sub-second lag reads as 0:
+// this is a cliff warning measured in minutes, not a latency histogram.
 func (r *Relay) committedTokenAge() time.Duration {
 	if r.committedCT.IsZero() {
 		return 0
@@ -523,23 +451,12 @@ func (r *Relay) closeStream() {
 	if r.stream == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	ctx, cancel := bound.Fresh()
 	defer cancel()
 	if err := r.stream.Close(ctx); err != nil {
 		r.options.Logger.Warn("stream relay: close stream", "relay", r.name, "err", err)
 	}
 	r.stream = nil
-}
-
-// trackLeadership fires the OnLeadership signal + Info log on transitions
-// only: without it a standby takeover or a stale leader resuming after a
-// wedge leaves no trace in either instance's telemetry.
-func (r *Relay) trackLeadership(isLeader bool) {
-	if isLeader == r.wasLeader {
-		return
-	}
-	r.wasLeader = isLeader
-	notify.Leadership(r.options.Observer, r.options.Logger, "stream", r.name, isLeader)
 }
 
 func (r *Relay) sleep(ctx context.Context) {
@@ -549,13 +466,4 @@ func (r *Relay) sleep(ctx context.Context) {
 	case <-ctx.Done():
 	case <-t.C:
 	}
-}
-
-// handleError routes a genuine per-message failure to the shared relay error
-// policy. h is the configured PoisonHandler for parkable poison events and nil
-// for stop-the-lane send failures (observe+log only — the event will be
-// redelivered, not parked). Returns the handler's park confirmation error
-// (nil when h is nil).
-func (r *Relay) handleError(ctx context.Context, h relay.PoisonHandler, msg *outbox.Message, err error) error {
-	return notify.MessageFailure(ctx, h, r.options.Observer, r.options.Logger, "stream", r.name, msg, err)
 }

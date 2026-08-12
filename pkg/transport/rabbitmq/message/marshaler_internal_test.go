@@ -19,6 +19,13 @@ func TestIsStructured(t *testing.T) {
 		// RFC 2045 §5.1 makes media types case-insensitive.
 		"Application/CloudEvents+JSON",
 		"APPLICATION/CLOUDEVENTS+JSON; CHARSET=UTF-8",
+		// The ';' spelling event.ParseContentType explicitly accepts, and which the
+		// publisher's codec lookup already resolves to the JSON codec. Routing it to
+		// the binary unmarshaler dead-lettered every event from such a publisher.
+		"application/cloudevents;json",
+		"application/cloudevents; json",
+		"application/cloudevents;json; charset=utf-8",
+		"Application/CloudEvents;JSON",
 	}
 	for _, ct := range structured {
 		if !isStructured(ct) {
@@ -34,6 +41,11 @@ func TestIsStructured(t *testing.T) {
 		"application/cloudevents-json",
 		// Not a parameter boundary: a longer subtype is a different media type.
 		"application/cloudevents+jsonx",
+		// Structured mode but no subtype at all, and structured mode whose ';' slot
+		// holds an ordinary media-type parameter instead of a subtype — neither names
+		// the JSON envelope this marshaler writes.
+		"application/cloudevents",
+		"application/cloudevents; charset=utf-8",
 	}
 	for _, ct := range binary {
 		if isStructured(ct) {

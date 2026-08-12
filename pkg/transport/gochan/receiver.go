@@ -3,10 +3,14 @@ package gochan
 import (
 	"context"
 
+	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 )
 
-type receiver <-chan message
+type receiver struct {
+	ch    <-chan message
+	onErr func(md *event.Metadata, err error)
+}
 
 func (r receiver) Receive(ctx context.Context, processor eventbus.Processor) error {
 	if ctx == nil {
@@ -32,7 +36,7 @@ func (r receiver) Receive(ctx context.Context, processor eventbus.Processor) err
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case m, ok := <-r:
+		case m, ok := <-r.ch:
 			if !ok {
 				return nil
 			}
@@ -41,8 +45,20 @@ func (r receiver) Receive(ctx context.Context, processor eventbus.Processor) err
 			// message then would lose it outright, which is strictly worse for an
 			// at-least-once bus than running one extra handler call after a
 			// cancellation the pre-check will catch on the next iteration.
-			if err := processor(m.meta, m.data); err != nil {
-				return err
+			//
+			// A handler failure does NOT end the subscription. Returning the error —
+			// which this used to do — killed the whole subscriber goroutine on the
+			// first unhandled event: every message still buffered, and everything
+			// published afterwards, was silently never processed, while Send kept
+			// succeeding until the buffer filled and publishers blocked forever. One
+			// bad event is not a broken transport, and the documented contract is to
+			// deliver until the channel closes or ctx is canceled.
+			//
+			// There is nowhere to put the failed message back — this transport has no
+			// redelivery and no dead-letter queue — so it is dropped, and reported to
+			// the error handler if one was installed (see WithErrorHandler).
+			if err := processor(ctx, m.meta, m.data); err != nil && r.onErr != nil {
+				r.onErr(m.meta, err)
 			}
 		}
 	}

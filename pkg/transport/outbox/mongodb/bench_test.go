@@ -73,7 +73,7 @@ func BenchmarkWatchDrainRead(b *testing.B) {
 	}
 }
 
-// BenchmarkSaveToken measures Store.SaveToken with a realistic ~100-byte
+// BenchmarkSaveToken measures RelayStore.SaveToken with a realistic ~100-byte
 // resume token, the write every drain window's leader pays to persist its
 // change-stream position.
 func BenchmarkSaveToken(b *testing.B) {
@@ -83,7 +83,7 @@ func BenchmarkSaveToken(b *testing.B) {
 	b.ReportAllocs()
 	reset(b)
 	ctx := context.Background()
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 
 	// A real KeyString-shaped token ({"_data": <hex>}, ~100 hex chars like a
 	// production resume token) so SaveToken takes the fine-grained token_key
@@ -113,7 +113,7 @@ func BenchmarkTryAcquireLeaderLock(b *testing.B) {
 	b.ReportAllocs()
 	reset(b)
 	ctx := context.Background()
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 
 	if _, err := st.TryAcquireLeaderLock(ctx, "bench", "holder", 30*time.Second); err != nil {
 		b.Fatalf("initial acquire: %v", err)

@@ -103,6 +103,29 @@ func TestTokenKeyFromStringOrdersSameSecondTokens(t *testing.T) {
 	}
 }
 
+// TestTokenKeyHexValidationMatchesStdlib pins the accept/reject set of the
+// in-place hex check against hex.DecodeString, which it replaced: the decoded
+// bytes were never used (only the hex string is stored and compared), so
+// decoding allocated and discarded a buffer on every token save. Validating in
+// place is only safe while it accepts EXACTLY what decoding accepted — a
+// narrower check would silently drop real tokens to the coarse cluster_time
+// guard, a wider one would let a non-hex payload through ToLower, which is
+// order-preserving only over hex digits.
+func TestTokenKeyHexValidationMatchesStdlib(t *testing.T) {
+	for _, s := range []string{
+		"00", "0123456789abcdef", "ABCDEF", "aBcDeF", "82ABCDEF01234567",
+		"0", "000", "82ABC", // odd length
+		"0g", "zz", "0x00", " 00", "00 ", "82-ab", "８２", // non-hex bytes
+	} {
+		_, decErr := hex.DecodeString(s)
+		want := decErr == nil
+		_, ok := tokenKeyFromString(string(rawToken(t, s)))
+		if ok != want {
+			t.Errorf("tokenKeyFromString(_data=%q) ok = %v, want %v (hex.DecodeString err = %v)", s, ok, want, decErr)
+		}
+	}
+}
+
 // TestTokenKeyFromStringBestEffort proves key extraction fails soft (ok=false)
 // on every non-token shape, so SaveToken falls back to the coarse clusterTime
 // guard instead of erroring.

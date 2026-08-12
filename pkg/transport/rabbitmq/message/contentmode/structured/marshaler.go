@@ -15,21 +15,6 @@ import (
 
 type Marshaler struct{}
 
-// coreAttributes are the CloudEvents attribute names this envelope owns. In
-// structured mode extensions live in the same flat JSON object, so an extension
-// using any of these names would overwrite the attribute rather than sit beside it.
-var coreAttributes = map[string]struct{}{
-	"specversion":     {},
-	"id":              {},
-	"type":            {},
-	"source":          {},
-	"data":            {},
-	"datacontenttype": {},
-	"dataschema":      {},
-	"subject":         {},
-	"time":            {},
-}
-
 func (m Marshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, error) {
 	dto := map[string]any{
 		"specversion": md.SpecVersion,
@@ -65,11 +50,18 @@ func (m Marshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, er
 	// nothing in the resulting error naming the extension. CloudEvents forbids
 	// extension names that collide with core attributes, so this is a publish-time
 	// contract violation.
+	//
+	// The name check is event.ReservedExtensionName, the union over content modes, so
+	// it also rejects a "cloudEvents:"-prefixed extension here even though this
+	// envelope alone would survive it: a publisher does not choose the mode its
+	// consumers use, and over an outbox the metadata is persisted and may be relayed
+	// by a transport the publisher never saw. See its doc.
 	for k, v := range md.Extensions {
-		if _, isCore := coreAttributes[k]; isCore {
+		if event.ReservedExtensionName(k) {
 			return amqp.Publishing{}, fmt.Errorf(
-				"extension %q collides with the core CloudEvents attribute of the same name; rename the extension", k)
+				"extension %q is a reserved CloudEvents attribute name and would overwrite a core attribute; rename the extension", k)
 		}
+
 		dto[k] = v
 	}
 
@@ -129,6 +121,72 @@ func decodeString(raw json.RawMessage) (string, error) {
 	}
 }
 
+// decoder reads attributes out of a decoded CloudEvents envelope, consuming each
+// one it reads so that whatever is left in dto is exactly the extension set.
+type decoder struct {
+	dto map[string]json.RawMessage
+}
+
+// require extracts (and consumes) a mandatory envelope attribute.
+//
+// A missing attribute, and one carrying no string at all (null, an object, an
+// array), are errors. A present-but-EMPTY string is not: the quote-trimming path
+// this replaced accepted it, and binary mode's own `require` still does, so
+// rejecting it here dead-lettered 100% of the traffic from any publisher that
+// emits every field unconditionally — generated serializers in other languages
+// do — from the moment the consumer was upgraded, with nothing surfacing on the
+// publisher side. An empty required attribute is the publisher's problem and
+// travels visibly in the metadata either way; the two content modes disagreeing
+// about identical input is this library's problem.
+func (d decoder) require(key string) (string, error) {
+	raw, ok := d.dto[key]
+	if !ok {
+		return "", fmt.Errorf("required attribute '%s' is missing", key)
+	}
+	delete(d.dto, key)
+
+	value, err := decodeString(raw)
+	if err != nil {
+		return "", fmt.Errorf("required attribute '%s': %w", key, err)
+	}
+
+	return value, nil
+}
+
+// optional extracts (and consumes) an OPTIONAL string-valued attribute
+// through the same decoder, so every attribute in the envelope is parsed one
+// way. The old quote-trimming path left here interpreted no escapes (a
+// subject of "a\"b" arrived as a\"b) and silently "unquoted" objects and
+// arrays into their raw JSON text.
+//
+// An OPTIONAL attribute must never fail the delivery on account of being
+// absent-shaped: JSON `null` and an empty string both mean "not set" and are
+// reported as absent, exactly as the quote-trimming path effectively did. A
+// publisher that emits `"subject": null` — common in generated serializers that
+// always write every field — would otherwise have every one of its events
+// dead-lettered. A non-scalar value (object/array) is still an error: there is
+// no string in it to use, and silently accepting its raw JSON text is what
+// produced garbage metadata before.
+func (d decoder) optional(key string) (string, bool, error) {
+	raw, ok := d.dto[key]
+	if !ok {
+		return "", false, nil
+	}
+	delete(d.dto, key)
+
+	value, err := decodeString(raw)
+	switch {
+	case errors.Is(err, errNotAString):
+		return "", false, nil // null: absent, not malformed
+	case err != nil:
+		return "", false, fmt.Errorf("attribute '%s': %w", key, err)
+	case value == "":
+		return "", false, nil
+	}
+
+	return value, true, nil
+}
+
 func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) {
 	dto := make(map[string]json.RawMessage)
 
@@ -138,72 +196,26 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 
 	md := new(event.Metadata)
 
+	// The leftover dto entries become extensions below, so every read below goes
+	// through dec, which consumes what it reads.
+	dec := decoder{dto: dto}
+
 	var err error
 
-	// require extracts (and consumes) a mandatory envelope attribute; the
-	// leftover dto entries become extensions below.
-	require := func(key string) (string, error) {
-		raw, ok := dto[key]
-		if !ok {
-			return "", fmt.Errorf("required attribute '%s' is missing", key)
-		}
-		delete(dto, key)
-
-		value, err := decodeString(raw)
-		if err != nil || value == "" {
-			return "", fmt.Errorf("required attribute '%s' must be a non-empty string", key)
-		}
-		return value, nil
-	}
-
-	// optional extracts (and consumes) an OPTIONAL string-valued attribute
-	// through the same decoder, so every attribute in the envelope is parsed one
-	// way. The old quote-trimming path left here interpreted no escapes (a
-	// subject of "a\"b" arrived as a\"b) and silently "unquoted" objects and
-	// arrays into their raw JSON text.
-	//
-	// An OPTIONAL attribute must never fail the delivery on account of being
-	// absent-shaped: JSON `null` and an empty string both mean "not set" and are
-	// reported as absent, exactly as the quote-trimming path effectively did. A
-	// publisher that emits `"subject": null` — common in generated serializers that
-	// always write every field — would otherwise have every one of its events
-	// dead-lettered. A non-scalar value (object/array) is still an error: there is
-	// no string in it to use, and silently accepting its raw JSON text is what
-	// produced garbage metadata before.
-	optional := func(key string) (string, bool, error) {
-		raw, ok := dto[key]
-		if !ok {
-			return "", false, nil
-		}
-		delete(dto, key)
-
-		value, err := decodeString(raw)
-		switch {
-		case errors.Is(err, errNotAString):
-			return "", false, nil // null: absent, not malformed
-		case err != nil:
-			return "", false, fmt.Errorf("attribute '%s': %w", key, err)
-		case value == "":
-			return "", false, nil
-		}
-
-		return value, true, nil
-	}
-
-	if md.SpecVersion, err = require("specversion"); err != nil {
+	if md.SpecVersion, err = dec.require("specversion"); err != nil {
 		return nil, nil, err
 	}
-	if md.Type, err = require("type"); err != nil {
+	if md.Type, err = dec.require("type"); err != nil {
 		return nil, nil, err
 	}
-	if md.ID, err = require("id"); err != nil {
+	if md.ID, err = dec.require("id"); err != nil {
 		return nil, nil, err
 	}
-	if md.Source, err = require("source"); err != nil {
+	if md.Source, err = dec.require("source"); err != nil {
 		return nil, nil, err
 	}
 
-	subject, ok, err := optional("subject")
+	subject, ok, err := dec.optional("subject")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -233,7 +245,7 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 		}
 	}
 
-	dataSchema, ok, err := optional("dataschema")
+	dataSchema, ok, err := dec.optional("dataschema")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -243,7 +255,7 @@ func (m Marshaler) Unmarshal(d *amqp.Delivery) (*event.Metadata, []byte, error) 
 		}
 	}
 
-	dataContentType, ok, err := optional("datacontenttype")
+	dataContentType, ok, err := dec.optional("datacontenttype")
 	if err != nil {
 		return nil, nil, err
 	}

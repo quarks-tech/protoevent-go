@@ -10,12 +10,29 @@ const (
 	cloudeventsContentType = "application/cloudevents"
 )
 
-// ContentSubtype extracts the codec-selecting subtype from a content type:
-// "application/cloudevents+proto", "application/cloudevents;proto", and
-// "application/proto" all yield ("proto", true). Returns ok=false for content
-// types outside the application/ family, for a bare
-// "application"/"application/cloudevents" with no subtype, and for
-// non-"application/"-delimited lookalikes ("applicationfoo").
+// ContentMode is the CloudEvents content mode a content type selects: whether the
+// envelope travels as one self-describing document (structured) or as transport
+// metadata alongside a bare payload (binary).
+type ContentMode int
+
+const (
+	// BinaryMode carries the CloudEvents attributes in transport metadata —
+	// AMQP headers, HTTP headers — with the payload as the message body.
+	BinaryMode ContentMode = iota
+	// StructuredMode carries attributes and payload together in one
+	// "application/cloudevents"-family document.
+	StructuredMode
+)
+
+// ParseContentType is the ONE definition of what a content type means here: which
+// content mode it selects, and which codec-selecting subtype it names.
+//
+// "application/proto" yields (BinaryMode, "proto", true);
+// "application/cloudevents+json" and "application/cloudevents;json" both yield
+// (StructuredMode, "json", true). ok=false for content types outside the
+// application/ family, for a bare "application"/"application/cloudevents" with no
+// subtype, and for non-"application/"-delimited lookalikes ("applicationfoo"); the
+// mode is meaningless when ok is false.
 //
 // RFC 2045 media-type parameters are stripped, so
 // "application/cloudevents+json; charset=utf-8" also yields ("json", true) — a
@@ -31,40 +48,52 @@ const (
 // The content type arrives from the INCOMING message's metadata, so this must
 // never panic on malformed input: the subscriber maps ok=false to an
 // unprocessable-event error instead.
-func ContentSubtype(contentType string) (string, bool) {
+func ParseContentType(contentType string) (mode ContentMode, subtype string, ok bool) {
 	// Normalize once, up front: every prefix comparison below is then
 	// case-insensitive, and the subtype comes out in the registry's canonical form.
 	contentType = strings.ToLower(contentType)
 
-	if !strings.HasPrefix(contentType, cloudeventsContentType) {
+	rest, isCloudevents := strings.CutPrefix(contentType, cloudeventsContentType)
+	if !isCloudevents {
 		subtype, ok := strings.CutPrefix(contentType, baseContentType+"/")
 		if !ok {
-			return "", false
+			return BinaryMode, "", false
 		}
-		return trimMediaTypeParams(subtype)
+		s, ok := trimMediaTypeParams(subtype)
+
+		return BinaryMode, s, ok
 	}
 
-	// Has the cloudevents prefix; an exact match carries no subtype, and
-	// indexing past it without the length check would panic on it.
-	if len(contentType) == len(cloudeventsContentType) {
-		return "", false
+	// Has the cloudevents prefix; an exact match carries no subtype.
+	if rest == "" {
+		return StructuredMode, "", false
 	}
-	switch contentType[len(cloudeventsContentType)] {
-	case '+':
-		return trimMediaTypeParams(contentType[len(cloudeventsContentType)+1:])
-	case ';':
-		// The structured-mode spelling "application/cloudevents;json" puts the
-		// subtype where a media-type parameter would normally sit, so the FIRST
-		// ';'-separated field can be the subtype here. But it can equally be an
-		// ordinary parameter — "application/cloudevents; charset=utf-8" — and
-		// returning "charset=utf-8" as a codec name resolves to no codec while
-		// reporting ok=true, so the caller gets an unprocessable-event error instead
-		// of the honest "this content type names no subtype". trimMediaTypeParams
-		// rejects it: a parameter carries '=', which the token grammar excludes.
-		return trimMediaTypeParams(contentType[len(cloudeventsContentType)+1:])
+
+	// '+' is the canonical delimiter. ';' is the structured-mode spelling
+	// "application/cloudevents;json", which puts the subtype where a media-type
+	// parameter would normally sit — but that slot can equally hold an ordinary
+	// parameter ("application/cloudevents; charset=utf-8"), and returning
+	// "charset=utf-8" as a codec name would report ok=true for a content type that
+	// names no subtype. trimMediaTypeParams rejects it either way: a parameter
+	// carries '=', which the token grammar excludes. So both delimiters take the
+	// same path.
+	switch rest[0] {
+	case '+', ';':
+		s, ok := trimMediaTypeParams(rest[1:])
+
+		return StructuredMode, s, ok
 	default:
-		return "", false
+		// "application/cloudeventsfoo" — a lookalike, not the cloudevents family.
+		return BinaryMode, "", false
 	}
+}
+
+// ContentSubtype extracts the codec-selecting subtype from a content type,
+// discarding the content mode. See ParseContentType.
+func ContentSubtype(contentType string) (string, bool) {
+	_, subtype, ok := ParseContentType(contentType)
+
+	return subtype, ok
 }
 
 // trimMediaTypeParams cuts RFC 2045 parameters (";" onwards) off a subtype, trims

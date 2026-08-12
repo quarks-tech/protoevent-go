@@ -130,6 +130,17 @@ func WithDefaultPublishOptions(pos ...PublishOption) PublisherOption {
 type PublisherImpl struct {
 	sender  Sender
 	options publisherOptions
+
+	// defaultContentType and defaultCodec memoize the codec this publisher's own
+	// configuration resolves to. Every publish otherwise re-parses the same content
+	// type — a lower-casing scan, the prefix checks, the subtype token loop — and
+	// re-hashes the result into the codec registry, for a value that has not changed
+	// since NewPublisher. A per-event WithEventContentType override still takes the
+	// full path. Both fields are written once here and only read afterwards, so
+	// concurrent Publish calls need no synchronization; RegisterCodec is documented
+	// as init-time only, so the memoized codec cannot go stale under us.
+	defaultContentType string
+	defaultCodec       encoding.Codec
 }
 
 func NewPublisher(sender Sender, opts ...PublisherOption) *PublisherImpl {
@@ -144,9 +155,55 @@ func NewPublisher(sender Sender, opts ...PublisherOption) *PublisherImpl {
 		options: options,
 	}
 
+	p.defaultContentType, p.defaultCodec = resolveDefaultCodec(options.publishOptions)
+
 	chainPublisherInterceptors(p)
 
 	return p
+}
+
+// resolveDefaultCodec replays the publisher's default publish options onto a
+// scratch envelope to find the content type its events will carry, and resolves the
+// codec for it. An unresolvable one is not an error here — NewPublisher has no way
+// to report it — so it leaves the memo empty and publish reports it per event,
+// exactly as it did before.
+func resolveDefaultCodec(opts []PublishOption) (string, encoding.Codec) {
+	var md event.Metadata
+	for _, opt := range opts {
+		opt(&md)
+	}
+	completeMetadata(&md)
+
+	subtype, ok := event.ContentSubtype(md.DataContentType)
+	if !ok {
+		return "", nil
+	}
+	codec, err := encoding.GetCodec(subtype)
+	if err != nil {
+		return "", nil
+	}
+
+	return md.DataContentType, codec
+}
+
+// codecFor resolves the codec for one event's content type, taking the memoized
+// answer when the event carries the publisher's configured content type.
+func (p *PublisherImpl) codecFor(contentType string) (encoding.Codec, error) {
+	if p.defaultCodec != nil && contentType == p.defaultContentType {
+		return p.defaultCodec, nil
+	}
+
+	contentSubtype, ok := event.ContentSubtype(contentType)
+	if !ok {
+		return nil, fmt.Errorf("unsupported content type: %s", contentType)
+	}
+
+	codec, err := encoding.GetCodec(contentSubtype)
+	if err != nil {
+		return nil, fmt.Errorf("eventbus: publish: %w", err)
+	}
+
+	return codec, nil
 }
 
 func (p *PublisherImpl) Publish(ctx context.Context, name string, e any, opts ...PublishOption) error {
@@ -191,27 +248,39 @@ func publish(ctx context.Context, name string, e any, p *PublisherImpl, opts ...
 
 	completeMetadata(md)
 
-	// Reject a reserved extension name here for the same reason as the type check
+	// A schema whose URI is empty is no schema. `schema, _ := url.Parse(cfg.URL)`
+	// on an empty config value yields a NON-nil &url.URL{}, and carrying that
+	// forward makes the event's dataschema differ from the one every reader
+	// reconstructs (the decoders map an empty URI back to nil). Normalize once,
+	// here, so the in-process and post-store values agree.
+	if md.DataSchema != nil && md.DataSchema.String() == "" {
+		md.DataSchema = nil
+	}
+
+	// Reject an unusable extension here for the same reason as the type check
 	// above: the alternative is not a failed publish but a wedged relay. The content
 	// marshalers refuse such an extension too, but they run at SEND time — over an
 	// outbox that is after the row has committed with the caller's business
 	// transaction, and a marshal failure is not a DecodeError, so the lane stops on
 	// that row every tick forever. Catching it at publish keeps the unsendable row
 	// from being written at all.
-	for k := range md.Extensions {
+	//
+	// Both halves matter. A reserved NAME overwrites a core attribute in whichever
+	// mode shares its namespace; a nested VALUE (map/struct/slice) is rejected by
+	// the AMQP field encoder outright, which is the same wedge arriving through the
+	// other half of the pair.
+	for k, v := range md.Extensions {
 		if event.ReservedExtensionName(k) {
 			return fmt.Errorf("eventbus: publish: extension %q collides with a core CloudEvents attribute; rename it", k)
 		}
+		if err := event.ValidExtensionValue(v); err != nil {
+			return fmt.Errorf("eventbus: publish: extension %q: %w", k, err)
+		}
 	}
 
-	contentSubtype, ok := event.ContentSubtype(md.DataContentType)
-	if !ok {
-		return fmt.Errorf("unsupported content type: %s", md.DataContentType)
-	}
-
-	codec, err := encoding.GetCodec(contentSubtype)
+	codec, err := p.codecFor(md.DataContentType)
 	if err != nil {
-		return fmt.Errorf("eventbus: publish: %w", err)
+		return err
 	}
 
 	data, err := codec.Marshal(e)

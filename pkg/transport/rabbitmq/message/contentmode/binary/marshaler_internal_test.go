@@ -36,6 +36,57 @@ func TestMarshalRejectsReservedPrefixExtension(t *testing.T) {
 	}
 }
 
+// TestMarshalRejectsCoreAttributeNameExtension pins the UNION half of the name
+// check: a bare "source" is rejected here too, even though binary mode namespaces
+// its own core attributes and would survive it.
+//
+// A publisher does not choose the content mode its consumers use, and over an
+// outbox the metadata is persisted and may be relayed by a transport the publisher
+// never saw — so a name that is unsafe in EITHER mode has to fail in both, at
+// publish time. See event.ReservedExtensionName.
+func TestMarshalRejectsCoreAttributeNameExtension(t *testing.T) {
+	for _, name := range []string{"source", "id", "type", "data", "subject", "time"} {
+		t.Run(name, func(t *testing.T) {
+			md := event.NewMetadata("books.v1.BookCreated")
+			md.ID = "real-id"
+			md.Source = "/svc"
+			md.Extensions = map[string]any{name: "hijacked"}
+
+			if _, err := (Marshaler{}).Marshal(md, []byte("x")); err == nil {
+				t.Fatalf("Marshal() error = nil for extension %q, want a reserved-name rejection", name)
+			}
+		})
+	}
+}
+
+// TestMarshalRejectsUnencodableExtensionValue pins that a value AMQP cannot carry
+// fails at MARSHAL time, not at send time.
+//
+// amqp091-go's field encoder matches only the defined AMQP field types, so a nested
+// value fails inside the publish — over an outbox that is after the row committed
+// with the caller's business transaction, as a non-DecodeError no classifier claims,
+// and the lane then stops on that row every tick forever.
+func TestMarshalRejectsUnencodableExtensionValue(t *testing.T) {
+	values := map[string]any{
+		"map":   map[string]any{"a": 1},
+		"slice": []string{"a"},
+		"nil":   nil,
+	}
+
+	for name, v := range values {
+		t.Run(name, func(t *testing.T) {
+			md := event.NewMetadata("books.v1.BookCreated")
+			md.ID = "real-id"
+			md.Source = "/svc"
+			md.Extensions = map[string]any{"nested": v}
+
+			if _, err := (Marshaler{}).Marshal(md, []byte("x")); err == nil {
+				t.Fatal("Marshal() error = nil, want the unencodable extension value rejected at publish")
+			}
+		})
+	}
+}
+
 // TestMarshalAcceptsOrdinaryExtensions pins that un-prefixed extensions still pass
 // through and survive a round trip.
 func TestMarshalAcceptsOrdinaryExtensions(t *testing.T) {
@@ -169,5 +220,46 @@ func TestRoundTripPreservesDataSchemaAndTime(t *testing.T) {
 	}
 	if !got.Time.Equal(md.Time) {
 		t.Fatalf("Time = %v, want %v", got.Time, md.Time)
+	}
+}
+
+// TestUnmarshalAcceptsByteArrayHeaders pins that a core attribute delivered as an
+// AMQP byte-array field is read, not reported as missing.
+//
+// A longstr decodes as string OR []byte depending on the broker and on anything
+// between it and this consumer — a shovel, a federation link, a proxy. The bare
+// `.(string)` assertion this replaced reported such a header as MISSING, so
+// processDelivery wrapped it as an UnprocessableEventError and every delivery from
+// that publisher was silently dead-lettered (or parked) with its attributes
+// sitting right there, readable. The parking-lot receiver already normalizes
+// x-death headers this way for exactly the same reason.
+func TestUnmarshalAcceptsByteArrayHeaders(t *testing.T) {
+	d := &amqp.Delivery{
+		Type: "books.v1.BookCreated",
+		Headers: amqp.Table{
+			event.BinaryAttrPrefix + "specversion": []byte("1.0"),
+			event.BinaryAttrPrefix + "id":          []byte("id-1"),
+			event.BinaryAttrPrefix + "source":      []byte("/books"),
+			event.BinaryAttrPrefix + "subject":     []byte("book-7"),
+			event.BinaryAttrPrefix + "time":        []byte("2026-01-02T15:04:05Z"),
+			event.BinaryAttrPrefix + "dataschema":  []byte("https://example.com/s.json"),
+		},
+	}
+
+	md, _, err := Marshaler{}.Unmarshal(d)
+	if err != nil {
+		t.Fatalf("Unmarshal() error = %v, want byte-array headers accepted", err)
+	}
+	if md.SpecVersion != "1.0" || md.ID != "id-1" || md.Source != "/books" {
+		t.Fatalf("required attributes = (%q, %q, %q), want (1.0, id-1, /books)", md.SpecVersion, md.ID, md.Source)
+	}
+	if md.Subject != "book-7" {
+		t.Fatalf("Subject = %q, want book-7", md.Subject)
+	}
+	if md.Time.IsZero() {
+		t.Fatal("Time is zero, want the byte-array timestamp parsed")
+	}
+	if md.DataSchema == nil || md.DataSchema.String() != "https://example.com/s.json" {
+		t.Fatalf("DataSchema = %v, want the byte-array URI parsed", md.DataSchema)
 	}
 }

@@ -15,11 +15,11 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/consume"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
 )
 
 const (
-	dlxSuffix        = ".dlx"
 	waitSuffix       = ".wait"
 	parkingLotSuffix = ".pl"
 )
@@ -42,7 +42,7 @@ type receiverOptions struct {
 func defaultReceiverOptions() receiverOptions {
 	return receiverOptions{
 		marshaler:       message.Marshaler{},
-		prefetchCount:   3,
+		prefetchCount:   consume.DefaultPrefetchCount,
 		maxRetries:      3,
 		minRetryBackoff: time.Second * 15,
 	}
@@ -124,7 +124,7 @@ func (r *Receiver) Setup(ctx context.Context, consumerName string, infos ...even
 		r.options.incomingQueue = consumerName
 	}
 
-	r.options.dlxExchange = r.options.incomingQueue + dlxSuffix
+	r.options.dlxExchange = r.options.incomingQueue + consume.DLXSuffix
 	r.options.waitQueue = r.options.incomingQueue + waitSuffix
 	r.options.parkingLotQueue = r.options.incomingQueue + parkingLotSuffix
 
@@ -227,61 +227,28 @@ func (r *Receiver) setupBindings(conn *connpool.Conn, infos []eventbus.ServiceIn
 // hands over. This receiver supplies only the per-delivery policy: a failed
 // delivery goes to the parking lot instead of being rejected.
 func (r *Receiver) Receive(shutdownCtx context.Context, processor eventbus.Processor) error {
-	if r.options.prefetchCount <= 0 {
-		// See the identical guard in rabbitmq.Receiver.Receive: prefetch-count 0 was
-		// AMQP's "no limit" and worked before drain mode, whose bounded shutdown
-		// requires a bounded prefetch.
-		return fmt.Errorf("parkinglot: WithPrefetchCount must be > 0, got %d "+
-			"(unlimited prefetch is unsupported under drain-on-cancel: the shutdown drain must be bounded)",
-			r.options.prefetchCount)
-	}
-
-	spec := amqpx.ConsumeSpec{
+	// A non-positive prefetch fails the subscription — see
+	// rabbitmq.WithPrefetchCount for why.
+	spec := consume.Spec{
+		Runtime:     "parkinglot",
 		Queue:       r.options.incomingQueue,
 		ConsumerTag: r.options.consumerTag,
 		Prefetch:    r.options.prefetchCount,
+		Marshaler:   r.options.marshaler,
+		Logger:      r.options.logger,
 	}
 
-	return r.client.ConsumeWithDrain(shutdownCtx, spec,
-		func(groupCtx context.Context, conn *connpool.Conn, delivery *amqp.Delivery) error {
-			dErr := r.processDelivery(delivery, processor)
-			if groupCtx.Err() != nil {
-				// The group is stopping, so this delivery's disposition cannot be
-				// trusted to land; requeue it rather than leaving it unacked on a
-				// channel that returns to the pool. amqpx only requeues deliveries it
-				// never handed to us — this one it did.
-				requeue(delivery)
-
-				return nil
-			}
-
-			// shutdownCtx, not groupCtx: parking must still succeed during drain,
-			// when shutdownCtx is already canceled — putIntoParkingLot detaches for
-			// the broker op itself.
-			if ackErr := r.doAcknowledge(shutdownCtx, conn, delivery, dErr); ackErr != nil {
-				// Parking (or the ack/reject) failed, so the delivery is still unacked
-				// and amqpx will not touch it — a delivery handed to the handler
-				// belongs to the handler.
-				requeue(delivery)
-
+	// ctx here is the SHUTDOWN context: parking must still succeed during drain,
+	// when it is already canceled — putIntoParkingLot detaches for the broker op
+	// itself.
+	return consume.Run(shutdownCtx, r.client, spec, processor,
+		func(ctx context.Context, conn *connpool.Conn, delivery *amqp.Delivery, dErr error) error {
+			if ackErr := r.doAcknowledge(ctx, conn, delivery, dErr); ackErr != nil {
 				return fmt.Errorf("do acknowledge: %w", ackErr)
 			}
 
 			return nil
 		})
-}
-
-func (r *Receiver) processDelivery(delivery *amqp.Delivery, processor eventbus.Processor) error {
-	md, data, err := r.options.marshaler.Unmarshal(delivery)
-	if err == nil {
-		return processor(md, data)
-	}
-
-	if r.options.logger != nil {
-		r.options.logger.Errorf("unmarshaling event [%+v]: %s", delivery, err)
-	}
-
-	return eventbus.NewUnprocessableEventError(err)
 }
 
 func (r *Receiver) doAcknowledge(ctx context.Context, conn *connpool.Conn, d *amqp.Delivery, err error) error {
@@ -346,7 +313,7 @@ func (r *Receiver) hasExceededRetryCount(d *amqp.Delivery) bool {
 	// An absent/unreadable first-death queue matches no entry: without this, the
 	// empty-string normalization below would make a malformed entry that also lacks
 	// a queue compare equal to it.
-	firstDeathQueue := headerString(d.Headers["x-first-death-queue"])
+	firstDeathQueue, _ := consume.HeaderString(d.Headers["x-first-death-queue"])
 	if firstDeathQueue == "" {
 		return false
 	}
@@ -362,7 +329,7 @@ func (r *Receiver) hasExceededRetryCount(d *amqp.Delivery) bool {
 		// in between, and comparing two []byte values through an interface panics
 		// with "comparing uncomparable type []uint8" — crashing the consumer on
 		// the retry path that is meant to be the safe one.
-		if headerString(t["queue"]) == firstDeathQueue {
+		if queue, _ := consume.HeaderString(t["queue"]); queue == firstDeathQueue {
 			count, ok := deathCount(t["count"])
 			if !ok {
 				if r.options.logger != nil {
@@ -378,31 +345,6 @@ func (r *Receiver) hasExceededRetryCount(d *amqp.Delivery) bool {
 	}
 
 	return false
-}
-
-// requeue hands a delivery back to the broker for immediate redelivery.
-//
-// Best-effort: the only reason Nack fails here is a channel that is already gone,
-// and a closed channel requeues every unacked delivery on it broker-side anyway.
-func requeue(delivery *amqp.Delivery) {
-	_ = delivery.Nack(false, true)
-}
-
-// headerString normalizes an AMQP header field to a string for comparison. A
-// longstr arrives as string or []byte depending on the broker and the path;
-// anything else has no string identity and compares equal to nothing (the empty
-// string here would only match another absent field, which is why absent-vs-absent
-// is not treated as a match by the caller — an x-death entry always names a
-// queue).
-func headerString(v any) string {
-	switch s := v.(type) {
-	case string:
-		return s
-	case []byte:
-		return string(s)
-	default:
-		return ""
-	}
 }
 
 // deathCount normalizes the x-death `count` field. RabbitMQ encodes it as AMQP

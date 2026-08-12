@@ -13,7 +13,6 @@ require (
 	github.com/quarks-tech/protoevent-go v0.4.2
 	github.com/rabbitmq/amqp091-go v1.13.0
 	github.com/rs/xid v1.6.0
-	golang.org/x/sync v0.22.0
 )
 
 require (

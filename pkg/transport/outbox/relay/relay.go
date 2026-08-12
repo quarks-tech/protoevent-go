@@ -4,10 +4,7 @@ package relay
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"reflect"
-	"strings"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
@@ -170,81 +167,14 @@ func (e *StuckLaneError) Error() string {
 
 func (e *StuckLaneError) Unwrap() error { return e.Err }
 
-// ErrPartialLeaderStore reports a store that implements SOME of LeaderStore but
-// not all of it. Both runtimes discover leadership support with a runtime type
-// assertion whose miss is a documented single-instance mode (always-leader), so
-// a store that MEANT to be a LeaderStore — one method renamed, a signature
-// drifted, a method added to the interface after the store was written — would
-// otherwise degrade to always-leader silently and run dual leaders across
-// replicas. A half-implemented capability is a bug, not a mode: it is rejected
-// at construction.
-var ErrPartialLeaderStore = errors.New("relay: store partially implements relay.LeaderStore")
-
-// CheckLeaderStore resolves a store's leadership capability. It returns the
-// LeaderStore when the store implements the whole interface, (nil, nil) when it
-// has no trace of it (always-leader single-instance mode), and an error wrapping
-// ErrPartialLeaderStore when it looks like a LeaderStore but is not one.
+// Leadership discovery is a plain type assertion in each runtime's NewRelay, and
+// a store that does not satisfy LeaderStore is a construction ERROR unless the
+// caller waives election with WithoutLeaderElection.
 //
-// The probe is by method NAME, via reflection, deliberately. Probing with narrower
-// interfaces catches only the store that lost exactly one method: one where BOTH
-// signatures drifted — a refactor to a config-struct parameter, a rename, or the
-// interface itself growing — matches no probe at all and falls straight through to
-// the always-leader mode this check exists to prevent. A type carrying either
-// method name has clearly been written to be a LeaderStore, so failing to satisfy
-// the interface is a bug in it, not a request for single-instance mode.
-func CheckLeaderStore(store any) (LeaderStore, error) {
-	if ls, ok := store.(LeaderStore); ok {
-		return ls, nil
-	}
-
-	present := leaderMethodNames(store)
-	if len(present) == 0 {
-		return nil, nil // no trace of the capability: single-instance mode
-	}
-
-	return nil, fmt.Errorf("%w: has %s but does not satisfy relay.LeaderStore"+
-		" — check the method set against"+
-		" TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) and"+
-		" ReleaseLeaderLock(ctx context.Context, name, holderID string) error"+
-		" (a store that cannot conditionally delete an owner-checked lock row may implement Release as a no-op returning nil)",
-		ErrPartialLeaderStore, strings.Join(present, " and "))
-}
-
-// leaderMethodNames returns the LeaderStore method names the store defines,
-// whatever their signatures.
-//
-// It checks the POINTER type's method set as well as the value's. A value type's
-// method set excludes pointer-receiver methods, so a store passed by value whose
-// lock methods take a pointer receiver would satisfy neither the interface nor a
-// value-only name probe — and fall through to always-leader, which is the outcome
-// this whole check exists to prevent. (Such a store cannot work as a LeaderStore
-// either way; the point is that it must fail loudly rather than silently.)
-func leaderMethodNames(store any) []string {
-	if store == nil {
-		return nil
-	}
-
-	t := reflect.TypeOf(store)
-
-	has := func(name string) bool {
-		if _, ok := t.MethodByName(name); ok {
-			return true
-		}
-		if t.Kind() != reflect.Pointer {
-			if _, ok := reflect.PointerTo(t).MethodByName(name); ok {
-				return true
-			}
-		}
-
-		return false
-	}
-
-	var present []string
-	for _, name := range []string{"TryAcquireLeaderLock", "ReleaseLeaderLock"} {
-		if has(name) {
-			present = append(present, name)
-		}
-	}
-
-	return present
-}
+// It used to be a soft check — a miss meant always-leader single-instance mode —
+// backed by a reflective probe for the two method NAMES, so that a store which
+// meant to elect but had drifted would fail loudly instead of silently running
+// dual leaders. That probe could not see a drift that kept both names (the likely
+// one: a signature change), so it did not close the hole it was written for. An
+// explicit waiver does close it: absence is now either declared or an error, and
+// no store can be silently downgraded to always-leader.

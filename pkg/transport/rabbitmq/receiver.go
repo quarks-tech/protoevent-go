@@ -11,10 +11,9 @@ import (
 	"github.com/quarks-tech/amqpx/connpool"
 
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/consume"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
 )
-
-const dlxSuffix = ".dlx"
 
 type receiverOptions struct {
 	marshaler      Marshaler
@@ -30,7 +29,7 @@ type receiverOptions struct {
 func defaultReceiverOptions() receiverOptions {
 	return receiverOptions{
 		marshaler:     message.Marshaler{},
-		prefetchCount: 3,
+		prefetchCount: consume.DefaultPrefetchCount,
 	}
 }
 
@@ -60,6 +59,15 @@ func WithDLX() ReceiverOption {
 	}
 }
 
+// WithPrefetchCount sets the channel's QoS prefetch count (default 3).
+//
+// A non-positive c makes Receive fail. AMQP reads prefetch-count 0 as "no
+// specified limit", and this receiver used to pass it straight to Channel.Qos, so
+// WithPrefetchCount(0) was a working unlimited consumer. Drain-on-cancel cannot
+// honor that — an unbounded prefetch means an unbounded number of buffered
+// deliveries to finish inside DrainTimeout — so it is rejected in the caller's own
+// terms rather than through amqpx's error, which names a ConsumeSpec the caller
+// never touched. The parking-lot receiver rejects it identically.
 func WithPrefetchCount(c int) ReceiverOption {
 	return func(o *receiverOptions) {
 		o.prefetchCount = c
@@ -119,8 +127,8 @@ func (r *Receiver) setupTopology(conn *connpool.Conn, infos []eventbus.ServiceIn
 	var queueDeclareArgs amqp.Table
 
 	if r.options.enableDLX {
-		dlxExchange := r.options.incomingQueue + dlxSuffix
-		dlxQueue := r.options.incomingQueue + dlxSuffix
+		dlxExchange := r.options.incomingQueue + consume.DLXSuffix
+		dlxQueue := r.options.incomingQueue + consume.DLXSuffix
 
 		queueDeclareArgs = amqp.Table{
 			"x-dead-letter-exchange": dlxExchange,
@@ -169,70 +177,19 @@ func (r *Receiver) setupTopology(conn *connpool.Conn, infos []eventbus.ServiceIn
 // supplies only the per-delivery policy, which is the one thing it and the
 // parking-lot receiver do differently.
 func (r *Receiver) Receive(shutdownCtx context.Context, processor eventbus.Processor) error {
-	if r.options.prefetchCount <= 0 {
-		// Caught here, in the caller's own terms. AMQP reads prefetch-count 0 as
-		// "no specified limit", and this receiver used to pass it straight to
-		// Channel.Qos, so WithPrefetchCount(0) was a working unlimited consumer.
-		// Drain mode cannot honor that: an unbounded prefetch means an unbounded
-		// number of buffered deliveries to finish inside DrainTimeout, so amqpx
-		// requires a positive bound — and its own error names ConsumeSpec, a type
-		// the caller never touched.
-		return fmt.Errorf("rabbitmq: WithPrefetchCount must be > 0, got %d "+
-			"(unlimited prefetch is unsupported under drain-on-cancel: the shutdown drain must be bounded)",
-			r.options.prefetchCount)
-	}
-
-	spec := amqpx.ConsumeSpec{
+	spec := consume.Spec{
+		Runtime:     "rabbitmq",
 		Queue:       r.options.incomingQueue,
 		ConsumerTag: r.options.consumerTag,
 		Prefetch:    r.options.prefetchCount,
+		Marshaler:   r.options.marshaler,
+		Logger:      r.options.logger,
 	}
 
-	return r.client.ConsumeWithDrain(shutdownCtx, spec,
-		func(groupCtx context.Context, _ *connpool.Conn, delivery *amqp.Delivery) error {
-			dErr := r.processDelivery(delivery, processor)
-			if groupCtx.Err() != nil {
-				// The group is stopping, so this delivery's disposition cannot be
-				// trusted to land; requeue it rather than leaving it unacked on a
-				// channel that returns to the pool. amqpx only requeues deliveries it
-				// never handed to us — this one it did.
-				requeue(delivery)
-
-				return nil
-			}
-
-			if err := doAcknowledge(delivery, dErr, r.options.requeueOnError); err != nil {
-				// Our own disposition failed, so the delivery is still unacked and
-				// amqpx will not touch it (by contract, a delivery handed to the
-				// handler belongs to the handler).
-				requeue(delivery)
-
-				return err
-			}
-
-			return nil
+	return consume.Run(shutdownCtx, r.client, spec, processor,
+		func(_ context.Context, _ *connpool.Conn, delivery *amqp.Delivery, dErr error) error {
+			return doAcknowledge(delivery, dErr, r.options.requeueOnError)
 		})
-}
-
-// requeue hands a delivery back to the broker for immediate redelivery.
-//
-// Best-effort: the only reason Nack fails here is a channel that is already gone,
-// and a closed channel requeues every unacked delivery on it broker-side anyway.
-func requeue(delivery *amqp.Delivery) {
-	_ = delivery.Nack(false, true)
-}
-
-func (r *Receiver) processDelivery(delivery *amqp.Delivery, processor eventbus.Processor) error {
-	md, data, err := r.options.marshaler.Unmarshal(delivery)
-	if err == nil {
-		return processor(md, data)
-	}
-
-	if r.options.logger != nil {
-		r.options.logger.Errorf("unmarshaling event [%+v]: %s", delivery, err)
-	}
-
-	return eventbus.NewUnprocessableEventError(err)
 }
 
 func doAcknowledge(m *amqp.Delivery, err error, requeueOnError bool) error {

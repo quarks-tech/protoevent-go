@@ -5,7 +5,7 @@
 // the resume token crosses the Store boundary as opaque string.
 //
 // Two audiences use this package. END USERS construct a Relay (NewRelay +
-// With* options, typically over mongodb.NewStore) and call Run; RunOnce
+// With* options, typically over mongodb.NewRelayStore) and call Run; RunOnce
 // exists for tests and custom drivers (it returns ErrLaneStopped as the
 // back-off-and-retry signal). STORE AUTHORS implement the Store / Stream
 // contracts (plus relay.LeaderStore) for a new backend — the mongodb module
@@ -19,12 +19,12 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/google/uuid"
-
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/lane"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/leader"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/notify"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/relaycfg"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
 
@@ -144,29 +144,28 @@ type Event struct {
 // alongside ...Option would make invalid states representable and force
 // defensive re-defaulting in NewRelay.
 type options struct {
+	// Lease and Hooks are what both runtimes configure the same way; the With*
+	// constructors below are one-liners over their promoted fields.
+	relaycfg.Lease
+	relaycfg.Hooks
+
 	// DrainWindow is the single latency knob: it is both the relay loop tick
 	// (the idle/backoff sleep between passes) and the change stream's
 	// maxAwaitTime — passed to Store.Watch as maxAwait, bounding how long a
 	// single Next call may block server-side waiting for events.
 	DrainWindow    time.Duration
-	LeaseTTL       time.Duration
-	LeaderLockName string // defaults to the relay name
-	TokenBatchSize int    // max events processed before a forced token persist
-
-	Logger        *slog.Logger // defaults to a discard logger
-	Observer      relay.Observer
-	PoisonHandler relay.PoisonHandler
-	Unsendable    relay.UnsendableClassifier // nil: every send failure stops the lane
+	TokenBatchSize int // max events processed before a forced token persist
 }
 
-// defaultOptions returns the default stream relay configuration. The zero
-// relay.Observer discards all signals.
+// defaultOptions returns the default stream relay configuration. The shared
+// defaults come from relaycfg — see DefaultHooks for why the default logger is
+// slog.Default() and not a discard handler.
 func defaultOptions() options {
 	return options{
+		Lease:          relaycfg.DefaultLease(),
+		Hooks:          relaycfg.DefaultHooks(),
 		DrainWindow:    time.Second,
-		LeaseTTL:       15 * time.Second,
 		TokenBatchSize: 100,
-		Logger:         slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -182,6 +181,19 @@ func WithLeaseTTL(d time.Duration) Option { return func(o *options) { o.LeaseTTL
 
 // WithLeaderLockName overrides the leader-lock name (defaults to the relay name).
 func WithLeaderLockName(s string) Option { return func(o *options) { o.LeaderLockName = s } }
+
+// WithoutLeaderElection declares a single-instance deployment: the relay always
+// considers itself leader and never touches the store's lock, whether or not the
+// store could elect.
+//
+// Without it, a store that does not implement relay.LeaderStore is a construction
+// error. That is deliberate — leadership is the one capability whose silent
+// absence is not a degraded mode but duplicate delivery, since every replica would
+// forward the entire stream. Run more than one replica with this option and you
+// get exactly that.
+func WithoutLeaderElection() Option {
+	return func(o *options) { o.LeaderElectionDisabled = true }
+}
 
 // WithTokenBatchSize sets the max events processed before a forced token persist.
 func WithTokenBatchSize(n int) Option { return func(o *options) { o.TokenBatchSize = n } }
@@ -230,9 +242,14 @@ func WithUnsendableClassifier(f relay.UnsendableClassifier) Option {
 type Relay struct {
 	name    string
 	store   Store
-	sender  eventbus.Sender
 	options options
 	leader  *leader.Elector
+
+	// reporter dispatches every observer/log signal; lane owns the per-message
+	// send/park/stop policy and the stuck-lane escalation, both shared with the
+	// sequence runtime (internal/notify, internal/lane).
+	reporter *notify.Reporter
+	lane     *lane.Lane[string]
 
 	// Runtime state, populated by Run/RunOnce (pkg/.../stream/run.go).
 	stream       Stream
@@ -250,15 +267,6 @@ type Relay struct {
 	// calibratedHead is the head the current offset was derived from, so a stream
 	// sitting at an unchanged position cannot recalibrate the estimate backwards.
 	calibratedHead time.Time
-
-	// wasLeader tracks the last observed leadership state so transitions —
-	// and only transitions — reach OnLeadership/the log (see trackLeadership).
-	wasLeader bool
-
-	// stuck escalates a lane that keeps stopping at the same resume token into a
-	// single relay.StuckLaneError per episode. Keyed on the raw token so the
-	// per-event Progress call allocates nothing. See noteStuck.
-	stuck notify.StuckTracker[string]
 }
 
 // StuckLaneError is relay.StuckLaneError, re-exported so callers of this package
@@ -287,62 +295,57 @@ type StuckLaneError = relay.StuckLaneError
 // Operators should size TokenBatchSize x worst-case Sender.Send latency <
 // LeaseTTL to keep a window inside one lease term.
 func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) (*Relay, error) {
-	if name == "" {
-		return nil, errors.New("stream: name must not be empty (it keys the offset/token row and is the default leader-lock name)")
+	if err := relaycfg.ValidateName("stream", name); err != nil {
+		return nil, err
 	}
-	if store == nil {
-		return nil, errors.New("stream: store must not be nil")
-	}
-	if sender == nil {
-		return nil, errors.New("stream: sender must not be nil")
+	if err := relaycfg.ValidateDeps("stream", store, sender); err != nil {
+		return nil, err
 	}
 
 	options := defaultOptions()
 	for _, opt := range opts {
 		opt(&options)
 	}
-	if options.LeaderLockName == "" {
-		options.LeaderLockName = name
-	}
 	if options.DrainWindow <= 0 {
 		return nil, fmt.Errorf("stream: DrainWindow must be > 0, got %v", options.DrainWindow)
-	}
-	if options.LeaseTTL <= 0 {
-		return nil, fmt.Errorf("stream: LeaseTTL must be > 0, got %v", options.LeaseTTL)
 	}
 	if options.TokenBatchSize <= 0 {
 		return nil, fmt.Errorf("stream: TokenBatchSize must be > 0, got %d", options.TokenBatchSize)
 	}
-	if options.DrainWindow >= options.LeaseTTL/2 {
-		return nil, fmt.Errorf("stream: DrainWindow (%v) must be < LeaseTTL/2 (%v)", options.DrainWindow, options.LeaseTTL/2)
+	if err := options.Lease.Validate("stream", name, "DrainWindow", options.DrainWindow); err != nil {
+		return nil, err
 	}
-	if options.Unsendable != nil && options.PoisonHandler == nil {
-		return nil, errors.New("stream: WithUnsendableClassifier requires WithPoisonHandler (there is nowhere to park an unsendable event otherwise)")
+	if err := options.Hooks.Validate("stream"); err != nil {
+		return nil, err
 	}
 
-	// A store implementing only PART of relay.LeaderStore is rejected outright
-	// (see relay.CheckLeaderStore): silently degrading a broken lock
-	// implementation to always-leader runs dual leaders across replicas.
-	ls, err := relay.CheckLeaderStore(store)
+	// Leadership is discovered by type assertion and its absence must be declared
+	// (WithoutLeaderElection), never inferred: a silently unelected relay run on
+	// several replicas delivers the whole stream from every one of them.
+	elector, err := options.Elector("stream", store)
 	if err != nil {
-		return nil, fmt.Errorf("stream: %w", err)
+		return nil, err
 	}
-	if ls == nil {
-		// Always-leader is a documented single-instance mode, not an error —
-		// but it must not be a silent one: a multi-replica deployment over such
-		// a store runs dual leaders with no signal until duplicate delivery is
-		// noticed.
-		options.Logger.Info("stream relay: store has no relay.LeaderStore capability; running always-leader (single-instance mode)",
-			"relay", name)
-	}
+
+	reporter := options.Reporter("stream", name)
 
 	return &Relay{
 		name: name,
 		// Every store operation is decorated with its bound at construction —
 		// see boundedStore (bounded.go).
-		store:   boundedStore{inner: store, ttl: options.LeaseTTL},
-		sender:  sender,
-		options: options,
-		leader:  leader.NewElector(ls, options.LeaderLockName, uuid.NewString(), options.LeaseTTL),
+		store:    boundedStore{inner: store, ttl: options.LeaseTTL},
+		options:  options,
+		leader:   elector,
+		reporter: reporter,
+		lane: &lane.Lane[string]{
+			Reporter:   reporter,
+			Sender:     sender,
+			Poison:     options.PoisonHandler,
+			Unsendable: options.Unsendable,
+			Label:      stuckLabel,
+			// A poison event's token and id are both best-effort extractions, so
+			// a key can be empty — an episode nothing can be said about.
+			Identified: identified,
+		},
 	}, nil
 }

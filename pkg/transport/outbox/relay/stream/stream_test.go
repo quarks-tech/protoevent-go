@@ -1648,3 +1648,40 @@ func TestDrainWindowSaveTokenErrorOnEmptyWindowPropagates(t *testing.T) {
 		t.Fatalf("RunOnce err = %v, want %v", runErr, sentinel)
 	}
 }
+
+// TestDecodeErrorWithEmptyIDIsNotParkable proves an empty DecodeError.ID makes a
+// poison event non-parkable, for the same reason an empty ResumeToken does.
+//
+// The stub handed to the PoisonHandler is ALL it ever receives — no metadata, no
+// payload — so the id is the only thing that makes the parked record answerable,
+// and the handler's documented recovery is to fetch the row by ID from the store.
+// Parking an anonymous stub and then irreversibly advancing past the event (the
+// token save is what authorizes that) drops it permanently with no way to learn
+// which event it was. Stopping the lane is loud, recoverable, and loses nothing.
+func TestDecodeErrorWithEmptyIDIsNotParkable(t *testing.T) {
+	de := &stream.DecodeError{ID: "", ResumeToken: "ptok", CommitTime: time.Now(), Err: errors.New("bad bson")}
+	fs := &fakeStream{
+		events: []*stream.Event{ev("a"), nil},
+		errs:   map[int]error{1: de},
+	}
+	st := &fakeStore{stream: fs, loadTok: "existing"}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+
+	var parked []string
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) error {
+		parked = append(parked, msg.ID)
+		return nil
+	}))
+
+	runErr := r.RunOnce(t.Context())
+
+	if _, ok := errors.AsType[*stream.DecodeError](runErr); !ok {
+		t.Fatalf("RunOnce err = %v, want a *DecodeError (lane must stop)", runErr)
+	}
+	if len(parked) != 0 {
+		t.Fatalf("parked %v, want none (an unidentifiable poison event is non-parkable)", parked)
+	}
+	if st.savedTok == "ptok" {
+		t.Fatal("resume token advanced past an unparked poison event: the event is now permanently skipped")
+	}
+}

@@ -5,13 +5,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/bound"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
-
-// releaseTimeout bounds ReleaseLeaderLock on a fresh context.Background(),
-// since Release is typically called from a deferred shutdown path where the
-// caller's ctx may already be canceled.
-const releaseTimeout = 5 * time.Second
 
 // Elector wraps a store's optional LeaderStore capability with
 // acquire/renew and graceful-release. A store that does not implement
@@ -36,26 +32,14 @@ type Elector struct {
 	isLeader atomic.Bool
 }
 
-// nopLeaderStore is the null LeaderStore: every acquire is granted and
-// release is a no-op. NewElector substitutes it for a nil ls — it is
-// the EXPLICIT single-instance mode, not an implementation of the LeaderStore
-// contract: it provides no mutual exclusion and consults no clock. Do not use
-// it as a reference implementation.
-type nopLeaderStore struct{}
-
-func (nopLeaderStore) TryAcquireLeaderLock(context.Context, string, string, time.Duration) (bool, error) {
-	return true, nil
-}
-
-func (nopLeaderStore) ReleaseLeaderLock(context.Context, string, string) error { return nil }
-
-// NewElector builds a Elector over ls. ls may be nil: a nil
-// LeaderStore means no election — a nopLeaderStore is substituted and the
-// elector always reports leadership (single-instance deployments).
+// NewElector builds an Elector over ls. ls may be nil: a nil LeaderStore means
+// no election at all — the elector always reports leadership, which is the
+// documented single-instance mode. That is a branch here rather than a null
+// LeaderStore implementation on purpose: a type that grants every acquire while
+// providing no mutual exclusion and consulting no clock is not an implementation
+// of the contract, and one sitting in this package invites being read as a
+// reference for it.
 func NewElector(ls relay.LeaderStore, lockName, holderID string, ttl time.Duration) *Elector {
-	if ls == nil {
-		ls = nopLeaderStore{}
-	}
 	return &Elector{ls: ls, lockName: lockName, holderID: holderID, ttl: ttl}
 }
 
@@ -68,7 +52,13 @@ func NewElector(ls relay.LeaderStore, lockName, holderID string, ttl time.Durati
 // lease — the silent-stale-leader hazard both runtimes guard every store
 // operation against.
 func (e *Elector) TryAcquire(ctx context.Context) (bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, e.ttl)
+	if e.ls == nil {
+		e.isLeader.Store(true)
+
+		return true, nil // single-instance mode: always leader
+	}
+
+	ctx, cancel := bound.Call(ctx, e.ttl)
 	defer cancel()
 	held, err := e.ls.TryAcquireLeaderLock(ctx, e.lockName, e.holderID, e.ttl)
 	if err != nil {
@@ -93,10 +83,11 @@ func (e *Elector) TryAcquire(ctx context.Context) (bool, error) {
 // TryAcquire every tick. Callers on a shutdown path should log it and move on
 // (the relay runtimes do), not fail shutdown over it.
 func (e *Elector) Release() error {
-	if !e.isLeader.Swap(false) {
+	if !e.isLeader.Swap(false) || e.ls == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
+	ctx, cancel := bound.Fresh()
 	defer cancel()
+
 	return e.ls.ReleaseLeaderLock(ctx, e.lockName, e.holderID)
 }

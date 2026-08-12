@@ -6,6 +6,8 @@ import (
 	"io/fs"
 	"strings"
 	"testing/fstest"
+
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 )
 
 // Migrations holds the outbox schema migrations (golang-migrate iofs source)
@@ -29,7 +31,7 @@ var Migrations embed.FS
 //	    MigrationsTable: "orders_schema_migrations", // prefix + "schema_migrations"
 //	})
 func PrefixedMigrations(prefix string) (fs.FS, error) {
-	if err := validateTablePrefix(prefix); err != nil {
+	if err := outbox.ValidateInstancePrefix("table prefix", prefix); err != nil {
 		return nil, err
 	}
 	replacer := strings.NewReplacer(

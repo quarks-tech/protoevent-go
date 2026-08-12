@@ -42,7 +42,7 @@ func TestOptionsApply(t *testing.T) {
 		WithBatchSize(50),
 		WithSequenceBatchSize(500),
 		WithoutSequencer(),
-		WithRetention(7*24*time.Hour, 5*time.Minute, 5000),
+		WithRetention(5*time.Minute, 5000),
 	} {
 		opt(&o)
 	}
@@ -52,8 +52,10 @@ func TestOptionsApply(t *testing.T) {
 	if !o.SequencerDisabled {
 		t.Fatal("WithoutSequencer did not set SequencerDisabled")
 	}
-	if o.RetentionWindow != 7*24*time.Hour || o.RetentionSweepInterval != 5*time.Minute || o.RetentionSweepBatch != 5000 {
-		t.Fatalf("retention not applied: %+v", o)
+	// WithRetention tunes CADENCE only — there is no per-relay window option
+	// any more; how much history survives is the store's (see Sweeper).
+	if !o.RetentionConfigured || o.RetentionSweepInterval != 5*time.Minute || o.RetentionSweepBatch != 5000 {
+		t.Fatalf("retention cadence not applied: %+v", o)
 	}
 }
 

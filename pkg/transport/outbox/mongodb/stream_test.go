@@ -24,7 +24,7 @@ func TestWatchDeliversInsertsInOrder(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -61,7 +61,7 @@ func TestWatchResumesFromToken(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -109,7 +109,7 @@ func TestPBRTNonEmptyImmediatelyAfterWatch(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -146,7 +146,7 @@ func TestMetadataFullFidelityRoundTrip(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -225,7 +225,7 @@ func TestWatchSurfacesInvalidateOnDrop(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -269,7 +269,7 @@ func TestWatchJSONNullMetadataIsPoison(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	strm, err := mongodbstore.NewStore(testDB).Watch(ctx, "", testMaxAwait)
+	strm, err := mongodbstore.NewRelayStore(testDB).Watch(ctx, "", testMaxAwait)
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestWatchPoisonEventReturnsDecodeError(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -393,7 +393,7 @@ func TestPBRTAdvancesOnIdle(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 

@@ -69,13 +69,22 @@ func TestNewRelayRejectsZeroLeaseTTL(t *testing.T) {
 	}
 }
 
-func TestNewRelayRejectsRetentionWindowWithoutSweepCadence(t *testing.T) {
-	// A positive RetentionWindow with a zero sweep cadence/batch would make
-	// retention silently non-functional (maybeSweep's `<= 0` guard always
-	// skips it), so it must be rejected at construction time.
-	_, err := sequence.NewRelay("c", newFakeStore(), noopSender, sequence.WithRetention(24*time.Hour, 0, 0))
-	if err == nil || !strings.Contains(err.Error(), "RetentionWindow") {
-		t.Fatalf("err = %v, want the RetentionWindow sweep-cadence validation error", err)
+// TestNewRelayRejectsZeroSweepCadence pins that an explicitly configured sweep
+// must be able to run: a zero interval or batch makes retention silently
+// non-functional (maybeSweep's `<= 0` guard always skips it), so it is rejected
+// at construction time. WithoutRetention() is the spelling for "no sweep here".
+//
+// (This is what remains of the old window-plus-cadence validation. The window
+// half moved to the store — see the TiDB store's WithRetentionWindow, which
+// rejects a non-positive window the same way.)
+func TestNewRelayRejectsZeroSweepCadence(t *testing.T) {
+	_, err := sequence.NewRelay("c", newFakeStore(), noopSender, sequence.WithRetention(0, 0))
+	if err == nil || !strings.Contains(err.Error(), "RetentionSweepInterval") {
+		t.Fatalf("err = %v, want the sweep-cadence validation error", err)
+	}
+	// The remedy the message names must actually work.
+	if _, err := sequence.NewRelay("c", newFakeStore(), noopSender, sequence.WithoutRetention()); err != nil {
+		t.Fatalf("NewRelay with WithoutRetention: %v", err)
 	}
 }
 
@@ -138,9 +147,14 @@ type fakeStore struct {
 	commitHadDeadline bool
 	commitCtxErr      error
 
-	sweepErr       error
-	sweepCalls     int
-	lastSweepOlder time.Duration
+	sweepErr   error
+	sweepCalls int
+	// lastSweepLimit is the page bound the relay asked for. It replaced a
+	// recorded `olderThan` window: the retention WINDOW is now the store's own
+	// property (see sequence.Sweeper), so the only sweep parameter the relay
+	// still contributes — and therefore the only one a relay test can pin — is
+	// the cadence's batch size.
+	lastSweepLimit int
 	sweepBacklog   int // rows the fake pretends are deletable; each pass drains up to limit
 }
 
@@ -271,14 +285,20 @@ func (s *fakeStore) InitOffsetLatest(_ context.Context, name string) (int64, err
 	return maxSeq, nil
 }
 
-// SweepMessages implements sequence.Sweeper: it records invocation
-// count and the `olderThan` cutoff, and drains a scripted deletable backlog
-// up to `limit` per pass (for the loop-while-full assertions).
-func (s *fakeStore) SweepMessages(_ context.Context, olderThan time.Duration, limit int) (int, error) {
+// SweepMessages implements sequence.Sweeper: it records invocation count and
+// the page bound, and drains a scripted deletable backlog up to `limit` per
+// pass (for the loop-while-full assertions).
+//
+// There is no cutoff parameter to record: the retention WINDOW is the store's
+// own property now, because the sweep's cutoff is MIN(last_seq) across all
+// consumer groups and therefore store-wide, while a relay is per-group. A fake
+// that still took a window would be modeling a contract the runtime no longer
+// has.
+func (s *fakeStore) SweepMessages(_ context.Context, limit int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sweepCalls++
-	s.lastSweepOlder = olderThan
+	s.lastSweepLimit = limit
 	if s.sweepErr != nil {
 		return 0, s.sweepErr
 	}
@@ -288,10 +308,10 @@ func (s *fakeStore) SweepMessages(_ context.Context, olderThan time.Duration, li
 }
 
 // snapshotSweep reads the sweep counters under mu.
-func (s *fakeStore) snapshotSweep() (calls int, olderThan time.Duration) {
+func (s *fakeStore) snapshotSweep() (calls, limit int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.sweepCalls, s.lastSweepOlder
+	return s.sweepCalls, s.lastSweepLimit
 }
 
 // snapshotInitCalls reads the InitOffsetLatest invocation count under mu.
@@ -1156,12 +1176,12 @@ func TestStuckLaneTrackingResetsOnProgress(t *testing.T) {
 // omission and nowhere near it. Defaulting cannot lose an event, since the sweep
 // only deletes rows below EVERY group's committed offset.
 //
-// Waivable: the sweep's window takes effect store-wide (cutoff MIN(last_seq)
-// across all groups) while being configured per-relay, so on a shared store the
-// shortest window wins for everyone. A relay cannot see its siblings, so the
-// escape is explicit — WithoutRetention on every relay but the one that owns the
-// sweep. NewRelay logs the effective window and its store-wide scope so a
-// disagreement is diagnosable from the two relays' logs.
+// Waivable: the sweep's effect is store-wide (cutoff MIN(last_seq) across all
+// groups) while a relay is per-group, so several relays sweeping one store is
+// redundant rather than wrong — the extra passes just find less to do. A relay
+// cannot see its siblings, so the escape is explicit: WithoutRetention on every
+// relay but the one that owns the sweep. (How much history survives is no
+// longer part of this decision at all — the window belongs to the store.)
 func TestRetentionDefaultsOnAndIsWaivable(t *testing.T) {
 	t.Run("on by default", func(t *testing.T) {
 		st := newFakeStore()
@@ -1172,12 +1192,12 @@ func TestRetentionDefaultsOnAndIsWaivable(t *testing.T) {
 		if err := r.RunOnce(t.Context()); err != nil {
 			t.Fatalf("RunOnce: %v", err)
 		}
-		calls, window := st.snapshotSweep()
+		calls, limit := st.snapshotSweep()
 		if calls == 0 {
 			t.Fatal("sweepCalls = 0 with default options, want the default sweep to run (an unswept log grows to disk-full)")
 		}
-		if window != 7*24*time.Hour {
-			t.Fatalf("sweep window = %v, want the 7-day default", window)
+		if limit != 1000 {
+			t.Fatalf("sweep batch = %d, want the 1000-row default", limit)
 		}
 	})
 
@@ -1195,28 +1215,28 @@ func TestRetentionDefaultsOnAndIsWaivable(t *testing.T) {
 		}
 	})
 
-	t.Run("WithRetention overrides the window", func(t *testing.T) {
+	t.Run("WithRetention retunes the cadence", func(t *testing.T) {
 		st := newFakeStore()
 		r, err := sequence.NewRelay("c", st, noopSender,
-			sequence.WithRetention(30*24*time.Hour, time.Minute, 100))
+			sequence.WithRetention(time.Minute, 100))
 		if err != nil {
 			t.Fatalf("NewRelay: %v", err)
 		}
 		if err := r.RunOnce(t.Context()); err != nil {
 			t.Fatalf("RunOnce: %v", err)
 		}
-		calls, window := st.snapshotSweep()
+		calls, limit := st.snapshotSweep()
 		if calls == 0 {
 			t.Fatal("sweepCalls = 0 despite an explicit WithRetention")
 		}
-		if window != 30*24*time.Hour {
-			t.Fatalf("sweep window = %v, want the configured 30 days", window)
+		if limit != 100 {
+			t.Fatalf("sweep batch = %d, want the configured 100", limit)
 		}
 	})
 
 	t.Run("WithRetention and WithoutRetention conflict", func(t *testing.T) {
 		_, err := sequence.NewRelay("c", newFakeStore(), noopSender,
-			sequence.WithRetention(time.Hour, time.Minute, 100), sequence.WithoutRetention())
+			sequence.WithRetention(time.Minute, 100), sequence.WithoutRetention())
 		if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
 			t.Fatalf("err = %v, want a mutually-exclusive error", err)
 		}
@@ -1242,7 +1262,7 @@ func TestSweepReportsZeroCounts(t *testing.T) {
 	obs := relay.Observer{OnSwept: func(_ string, n int) { swept = append(swept, n) }}
 
 	r, err := sequence.NewRelay("c", st, noopSender,
-		sequence.WithRetention(time.Hour, time.Minute, 100), sequence.WithObserver(obs))
+		sequence.WithRetention(time.Minute, 100), sequence.WithObserver(obs))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -1575,14 +1595,15 @@ func (s storeWithoutSweeper) ReleaseLeaderLock(ctx context.Context, name, holder
 // TestMaybeSweepRunsOnInterval proves the retention sweep cadence is
 // wall-clock time (RetentionSweepInterval), decoupled from PollInterval: the
 // first leader tick sweeps immediately, ticks within the interval skip, and a
-// tick after the interval elapses sweeps again — with a `before` cutoff of
-// now-minus-window. Uses synctest's fake clock for deterministic elapsing.
+// tick after the interval elapses sweeps again — passing the configured batch
+// bound each time. (The age cutoff is not visible here at all: it is applied by
+// the store, against the store's own clock.) Uses synctest's fake clock for
+// deterministic elapsing.
 func TestMaybeSweepRunsOnInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		st := newFakeStore()
-		window := 24 * time.Hour
 		interval := 5 * time.Minute
-		r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(window, interval, 100))
+		r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(interval, 100))
 		if err != nil {
 			t.Fatalf("NewRelay: %v", err)
 		}
@@ -1593,10 +1614,10 @@ func TestMaybeSweepRunsOnInterval(t *testing.T) {
 				t.Fatalf("RunOnce[%d]: %v", i, err)
 			}
 		}
-		if calls, olderThan := st.snapshotSweep(); calls != 1 {
+		if calls, limit := st.snapshotSweep(); calls != 1 {
 			t.Fatalf("sweepCalls = %d within the interval, want 1", calls)
-		} else if olderThan != window {
-			t.Fatalf("sweep olderThan = %v, want the configured window %v (cutoff is the STORE clock's job)", olderThan, window)
+		} else if limit != 100 {
+			t.Fatalf("sweep batch = %d, want the configured 100", limit)
 		}
 
 		// After the interval elapses, the next tick sweeps again.
@@ -1616,7 +1637,7 @@ func TestMaybeSweepRunsOnInterval(t *testing.T) {
 // unboundedly and surface as a disk incident long after the misconfiguration).
 func TestNewRelayRejectsRetentionWithoutRetentionStore(t *testing.T) {
 	st := storeWithoutSweeper{inner: newFakeStore()}
-	_, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, time.Minute, 100))
+	_, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Minute, 100))
 	if err == nil || !strings.Contains(err.Error(), "Sweeper") {
 		t.Fatalf("err = %v, want the Sweeper capability error", err)
 	}
@@ -1644,6 +1665,17 @@ func (s storeWithoutSequencer) CommitOffset(ctx context.Context, name string, se
 
 func (s storeWithoutSequencer) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
 	return s.inner.InitOffsetLatest(ctx, name)
+}
+
+// The lock methods are delegated so this fixture lacks ONLY the Sequencer: a
+// store that also could not elect would be rejected for that first, and the test
+// below would pass for the wrong reason.
+func (s storeWithoutSequencer) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
+	return s.inner.TryAcquireLeaderLock(ctx, name, holderID, ttl)
+}
+
+func (s storeWithoutSequencer) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
+	return s.inner.ReleaseLeaderLock(ctx, name, holderID)
 }
 
 // TestNewRelayRejectsMissingSequencerWithoutWaiver pins the other half of the
@@ -1675,7 +1707,7 @@ func TestMaybeSweepLoopsWhileFullAndReportsCounts(t *testing.T) {
 	var swept []int
 	obs := relay.Observer{OnSwept: func(_ string, n int) { swept = append(swept, n) }}
 	r, err := sequence.NewRelay("c", st, noopSender,
-		sequence.WithRetention(time.Hour, time.Minute, 100), sequence.WithObserver(obs))
+		sequence.WithRetention(time.Minute, 100), sequence.WithObserver(obs))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -1700,7 +1732,7 @@ func TestMaybeSweepErrorPropagates(t *testing.T) {
 	sentinel := errors.New("sweep boom")
 	st := newFakeStore()
 	st.sweepErr = sentinel
-	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Hour, time.Minute, 100))
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithRetention(time.Minute, 100))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -2070,7 +2102,7 @@ func TestLeadershipLostDuringSequenceSkipsDrainAndSweep(t *testing.T) {
 
 	r, err := sequence.NewRelay("c", st, sender,
 		sequence.WithSequenceBatchSize(2), sequence.WithStartFromBeginning(),
-		sequence.WithRetention(time.Hour, time.Minute, 100))
+		sequence.WithRetention(time.Minute, 100))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}

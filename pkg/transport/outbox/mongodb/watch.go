@@ -19,10 +19,11 @@ import (
 
 // Compile-time capability pins: the runtime discovers LeaderStore by type
 // assertion, so signature drift would otherwise downgrade silently to
-// always-leader.
+// always-leader. Both contracts belong to *RelayStore — the publish *Store
+// deliberately implements neither.
 var (
-	_ stream.Store      = (*Store)(nil)
-	_ relay.LeaderStore = (*Store)(nil)
+	_ stream.Store      = (*RelayStore)(nil)
+	_ relay.LeaderStore = (*RelayStore)(nil)
 )
 
 // resumeTokenTimestampMarker is the KeyString type marker that opens a resume
@@ -51,7 +52,7 @@ type changeEvent struct {
 // passes its DrainWindow, keeping a single latency knob. A non-positive
 // maxAwait leaves the driver/server default in place (the relay validates
 // DrainWindow > 0, so this is unreachable through the stream relay).
-func (s *Store) Watch(ctx context.Context, token string, maxAwait time.Duration) (stream.Stream, error) {
+func (rs *RelayStore) Watch(ctx context.Context, token string, maxAwait time.Duration) (stream.Stream, error) {
 	// invalidate MUST pass the filter too: a $match on "insert" alone silently
 	// drops the collection-dropped/renamed invalidate event, leaving the
 	// stream reporting empty windows forever instead of surfacing the fatal
@@ -71,7 +72,7 @@ func (s *Store) Watch(ctx context.Context, token string, maxAwait time.Duration)
 	}
 	// else: no resumeAfter → the stream starts at "now" (v1 StartNow).
 
-	cs, err := s.db.Collection(s.collMessages).Watch(ctx, pipeline, opts)
+	cs, err := rs.db.Collection(rs.collMessages).Watch(ctx, pipeline, opts)
 	if err != nil {
 		// The server validates resumeAfter against the oplog AT AGGREGATE TIME,
 		// so the two most likely paths off the resume-token cliff — a relay
@@ -214,9 +215,21 @@ func tokenKeyFromString(token string) (string, bool) {
 		return "", false
 	}
 	// Validate it is hex before lowercasing: only then is ToLower
-	// order-preserving (all digits map within [0-9a-f]).
-	if _, err := hex.DecodeString(s); err != nil {
+	// order-preserving (all digits map within [0-9a-f]). Validated IN PLACE
+	// rather than via hex.DecodeString: the decoded bytes are never used —
+	// only the hex string is stored and compared — so decoding would allocate
+	// and discard a ~50-byte buffer on every token save (one per drain window
+	// per leader). Same accept/reject set as hex.DecodeString: even length,
+	// every byte a hex digit.
+	if len(s)%2 != 0 {
 		return "", false
+	}
+	for i := range len(s) {
+		switch c := s[i]; {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return "", false
+		}
 	}
 	return strings.ToLower(s), true
 }

@@ -156,20 +156,35 @@ func TestMetadataDecodesLegacyDataSchemaShape(t *testing.T) {
 	}
 }
 
-// TestMetadataRejectsEmptyDataSchema pins that a non-nil-but-empty DataSchema is
-// an error rather than a silently asymmetric round trip.
+// TestMetadataOmitsEmptyDataSchema pins that a non-nil-but-empty DataSchema is
+// OMITTED, not rejected.
 //
-// Encoding it would write "" and decode back to NIL, so the same event would carry
-// a non-nil schema in-process (gochan) and a nil one after crossing a store — and a
-// handler's `if md.DataSchema != nil` would take different branches on the two
-// sides for reasons invisible at the call site.
-func TestMetadataRejectsEmptyDataSchema(t *testing.T) {
+// It used to be an error, and the cost landed nowhere near the mistake:
+// `schema, _ := url.Parse(cfg.SchemaURL)` on an empty config value yields a
+// non-nil &url.URL{}, and the outbox stores marshal metadata INSIDE the caller's
+// business transaction — so a benign misconfiguration rolled back every request,
+// on the outbox path only, while the identical event published fine over
+// RabbitMQ. Omitting writes exactly what a read reconstructs (the decoder maps
+// both absent and "" to nil), so the round trip stays honest.
+func TestMetadataOmitsEmptyDataSchema(t *testing.T) {
 	md := event.NewMetadata("books.v1.BookCreated")
 	md.ID = "id-1"
 	md.DataSchema = &url.URL{}
 
-	if _, err := json.Marshal(md); err == nil {
-		t.Fatal("marshal error = nil for a non-nil empty DataSchema, want it named as a caller mistake")
+	b, err := json.Marshal(md)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), `"DataSchema"`) {
+		t.Fatalf("empty DataSchema was encoded, want it omitted: %s", b)
+	}
+
+	var got event.Metadata
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.DataSchema != nil {
+		t.Fatalf("DataSchema = %v, want nil after the round trip", got.DataSchema)
 	}
 }
 

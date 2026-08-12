@@ -1,11 +1,6 @@
 package notify
 
-import (
-	"log/slog"
-	"time"
-
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
-)
+import "time"
 
 // StuckEscalateAfter is how long a lane must be stopped at ONE position before it
 // escalates from "a send failed" to "this log is wedged". Chosen well above any
@@ -34,13 +29,19 @@ type StuckTracker[P comparable] struct {
 	position P
 	// active distinguishes "stopped at the zero position" from "not stopped at
 	// all" — seq 0 is a legitimate position, so the zero P cannot mean absence.
-	active    bool
-	since     time.Time
-	escalated bool
+	active bool
+	// identified records whether the stuck position could be observed at all.
+	// An UNIDENTIFIED episode — the stream runtime's event carrying neither a
+	// resume token nor an id — has no key a later Progress call can match, so it
+	// is ended by ANY successful disposal instead (see Progress).
+	identified bool
+	since      time.Time
+	escalated  bool
 }
 
 // Progress records a successful disposal (a send, or a confirmed park) at position,
-// ending the episode only if THAT is the position the lane was stuck at.
+// ending the episode only if THAT is the position the lane was stuck at — or if the
+// open episode is an unidentified one.
 //
 // The position check is the whole point. Clearing on any successful disposal looks
 // equivalent and is not: a pass that re-delivers a prefix AHEAD of the wedged
@@ -48,18 +49,37 @@ type StuckTracker[P comparable] struct {
 // being rejected by a monotone guard — would then reset the timer on every pass, and
 // a permanently wedged lane would never reach the threshold. Those re-deliveries are
 // at earlier positions, so they no longer match.
+//
+// An UNIDENTIFIED episode is the one case that must clear unconditionally: nothing
+// about the event could be observed, so no later Progress call can ever carry its
+// key, and the episode would stay active-and-escalated for the process's lifetime —
+// silently suppressing the NEXT unidentifiable wedge, a genuinely new incident, with
+// no StuckLaneError and no log line. The trade-off is narrow and deliberate: an
+// unidentifiable wedge preceded by a re-delivered prefix every pass (which happens
+// only while position saves are being rejected) restarts its timer instead of
+// escalating. Losing escalation in that compound case is worth getting it back for
+// every ordinary one.
 func (s *StuckTracker[P]) Progress(pos P) {
-	if !s.active || pos != s.position {
+	if !s.active {
+		return
+	}
+	if s.identified && pos != s.position {
 		return
 	}
 
 	var zero P
-	s.position, s.active, s.since, s.escalated = zero, false, time.Time{}, false
+	s.position, s.active, s.identified, s.since, s.escalated = zero, false, false, time.Time{}, false
 }
 
 // Stuck records that the lane stopped at pos and reports how long it has been
 // stopped there, with escalate true at most ONCE per episode — the caller reports
 // only when it is true, so the (allocating) label formatting stays off the hot path.
+//
+// identified reports whether pos actually identifies the message. Pass false when
+// the runtime could observe nothing about it: the zero P is otherwise a legitimate
+// key that every such message would share, so once one of those episodes escalated,
+// a LATER unidentifiable wedge would be treated as the same still-unresolved one and
+// never escalate again.
 //
 // Must be called from EVERY path that stops the lane: a send failure, a
 // classified-unsendable message whose park was not confirmed, and a poison row that
@@ -67,9 +87,10 @@ func (s *StuckTracker[P]) Progress(pos P) {
 // because the park failed). A path that stops without reporting here leaves the
 // wedge with no signal beyond the generic per-tick error, which is the gap this
 // type exists to close.
-func (s *StuckTracker[P]) Stuck(pos P) (stuckFor time.Duration, escalate bool) {
+func (s *StuckTracker[P]) Stuck(pos P, identified bool) (stuckFor time.Duration, escalate bool) {
 	if !s.active || pos != s.position {
-		s.position, s.active, s.since, s.escalated = pos, true, time.Now(), false
+		s.position, s.active, s.identified = pos, true, identified
+		s.since, s.escalated = time.Now(), false
 
 		return 0, false
 	}
@@ -86,23 +107,5 @@ func (s *StuckTracker[P]) Stuck(pos P) (stuckFor time.Duration, escalate bool) {
 	return stuckFor, true
 }
 
-// StuckLane reports a wedged lane to the observer and the log. Called only when
-// StuckTracker.Stuck returns escalate — position and id are formatted by the caller
-// at that point, which is why building them is not on the per-message path.
-func StuckLane(
-	o relay.Observer,
-	log *slog.Logger,
-	runtime, name, position, id string,
-	stuckFor time.Duration,
-	err error,
-) {
-	log.Error(runtime+" relay: log wedged on one message — no event behind it is being delivered",
-		"relay", name, "position", position, "outbox_id", id, "stuck_for", stuckFor, "err", err,
-		"remedy", "if the downstream will never accept this message, configure WithUnsendableClassifier to park it; otherwise fix the downstream")
-	Error(o, name, &relay.StuckLaneError{
-		Position: position,
-		ID:       id,
-		StuckFor: stuckFor,
-		Err:      err,
-	})
-}
+// The wedged-lane report itself lives on Reporter (see StuckLane there): it needs
+// the runtime and relay names, which Reporter already carries.

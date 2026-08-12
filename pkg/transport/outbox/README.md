@@ -133,8 +133,8 @@ Option mapping while you are there:
 | v1 | v2 |
 | --- | --- |
 | `WithErrorHandler` (called per failed send, relay continued) | no equivalent by default — a send failure now stops the lane. Use `WithUnsendableClassifier` + `WithPoisonHandler` for the messages that can never succeed, and watch `relay.StuckLaneError` for the rest |
-| retention by deletion on delivery | `WithRetention` / `WithoutRetention` (on by default, 7-day window) |
-| single relay per store | still one **sequencer** and one **sweep** owner per store; extra consumer groups add `WithoutSequencer()` and `WithoutRetention()` |
+| retention by deletion on delivery | the store's retention window (`tidb.WithRetentionWindow`, 7 days by default) plus a relay-side sweep cadence (`sequence.WithRetention` / `WithoutRetention`, on by default) |
+| single relay per store | still one **sequencer** owner per store; extra consumer groups add `WithoutSequencer()`, and may add `WithoutRetention()` to leave sweeping to one relay |
 
 ## Schema (TiDB)
 
@@ -174,14 +174,14 @@ migrate tooling), the embedded FS is exported as `tidb.Migrations` /
 3. **Publish** — `tidb.NewStore(tx)` inside the business transaction
    (autocommit fails loudly by design).
 4. **Relay** — `sequence.NewRelay(name, tidb.NewRelayStore(db), sender, …)`.
-   The retention sweep is **on by default** (7-day window, hourly, 1000 rows a
-   pass): the log is never pruned on delivery, so an unswept one grows until the
-   cluster runs out of disk. Retune with `WithRetention`, or turn it off with
-   `WithoutRetention` when something else owns pruning — **on a store shared by
-   several relays the shortest window in play wins for everyone**, since the
-   sweep's cutoff is `MIN(last_seq)` across all groups, so either give every
-   relay the same window or let exactly one sweep. Extra replicas of the same
-   group need no extra config (leader election is automatic); extra consumer
+   The retention sweep is **on by default** (the store's 7-day window, swept
+   hourly, 1000 rows a pass): the log is never pruned on delivery, so an unswept
+   one grows until the cluster runs out of disk. How much history survives is the
+   **store's** setting (`tidb.WithRetentionWindow`), because the sweep's cutoff is
+   `MIN(last_seq)` across all groups and so takes effect store-wide; the relay
+   only decides how often to ask. Retune the cadence with `sequence.WithRetention`,
+   or leave sweeping to one relay with `WithoutRetention`. Extra replicas of the
+   same group need no extra config (leader election is automatic); extra consumer
    *groups* add `WithoutSequencer()` and should first start only after the
    sequencing relay is caught up (see its godoc's start-order caveat).
 5. **Downstream sender** — a RabbitMQ sender needs its topology declared
@@ -230,25 +230,30 @@ positive; if `PollInterval` is not strictly less than `LeaseTTL/2` (the lease
 must be renewable at least twice per TTL); if `name` (or an overridden
 `LeaderLockName`) exceeds 64 bytes (the reference schema's `VARCHAR(64)` key
 columns — a relaxed `sql_mode` would silently truncate a longer name into
-another group's offset row and leader lock); if `WithRetention` is given a
-nonzero window without a strictly positive `sweepInterval` and `sweepBatch`;
-if `WithRetention` and `WithoutRetention` are both given; if
-`WithUnsendableClassifier` is given without `WithPoisonHandler` (there would be
-nowhere to park); if the store partially implements `relay.LeaderStore` — it
-carries one of the lock method names but does not satisfy the interface, which
-would otherwise degrade to always-leader and run dual leaders; if the store lacks
+another group's offset row and leader lock); if the sweep cadence
+(`sweepInterval`, `sweepBatch`) is not strictly positive without a
+`WithoutRetention()` waiver; if `WithRetention` and `WithoutRetention` are both
+given; if `WithUnsendableClassifier` is given without `WithPoisonHandler` (there
+would be nowhere to park); if the store does not implement `relay.LeaderStore`
+without a `WithoutLeaderElection()` waiver (an unelected relay on several replicas
+delivers the whole log from every one of them, so single-instance mode must be
+stated rather than fallen into); if the store lacks
 `sequence.Sequencer` without a `WithoutSequencer()` waiver (a missing sequencer is
 a permanent silent stall, not a mode); and if `WithRetention` is set on a store
 lacking `sequence.Sweeper` (a configured sweep that silently never runs would grow
-the log unboundedly — a store lacking `Sweeper` under the DEFAULT window is not an
+the log unboundedly — a store lacking `Sweeper` under the DEFAULT cadence is not an
 error, the sweep is disabled with an `Info` log). A
 `Relay` is not safe for concurrent use: call `Run` from a single goroutine.
 (`Run` is the production loop; `RunOnce` is exposed for tests and custom
 drivers that want to own the tick.)
 
 ```go
-r, err := sequence.NewRelay("broker-publish", tidb.NewRelayStore(db), rabbitSender,
-    sequence.WithRetention(7*24*time.Hour, 5*time.Minute, 5000),
+// The retention WINDOW belongs to the store (it is store-wide); the relay owns
+// only the sweep cadence.
+store := tidb.NewRelayStore(db, tidb.WithRetentionWindow(7*24*time.Hour))
+
+r, err := sequence.NewRelay("broker-publish", store, rabbitSender,
+    sequence.WithRetention(5*time.Minute, 5000),
     sequence.WithObserver(promObserver),
 )
 if err != nil {
@@ -436,12 +441,16 @@ single drain window. As with the sequence runtime, a `Relay` is not safe for
 concurrent use: call `Run` from a single goroutine.
 
 ```go
-st := mongodb.NewStore(db)
-if err := st.EnsureIndexes(ctx); err != nil {
+// NewRelayStore, not NewStore: the publish store is session-bound so its rows
+// commit with the caller's business writes, while every relay operation manages
+// its own transaction against the pool. They are separate types so a relay call
+// cannot be enlisted in a business transaction and silently rolled back with it.
+rs := mongodb.NewRelayStore(db)
+if err := rs.EnsureIndexes(ctx); err != nil {
     log.Fatal(err)
 }
 
-r, err := stream.NewRelay("broker-publish", st, rabbitSender,
+r, err := stream.NewRelay("broker-publish", rs, rabbitSender,
     stream.WithDrainWindow(time.Second),
     stream.WithLeaseTTL(15*time.Second),
     stream.WithObserver(promObserver),
@@ -455,15 +464,16 @@ if err := r.Run(ctx); err != nil {
 }
 ```
 
-`EnsureIndexes` creates the TTL index on `outbox.create_time` (default 7 days,
-tunable via `mongodb.WithRetention(d)`; idempotent for an unchanged retention —
-safe to call on every startup). Changing retention on an existing collection
-requires a `collMod` on the index, not a restart with a new option value;
-`EnsureIndexes` surfaces that server error with a hint. Several independent
-outbox instances can share one database via
+`RelayStore.EnsureIndexes` creates the TTL index on `outbox.create_time` (default
+7 days, tunable via `mongodb.WithRetention(d)` on `NewRelayStore`; idempotent for
+an unchanged retention — safe to call on every startup). Changing retention on an
+existing collection requires a `collMod` on the index, not a restart with a new
+option value; `EnsureIndexes` surfaces that server error with a hint. Several
+independent outbox instances can share one database via
 `mongodb.WithCollectionPrefix("orders_")` — all three collections
 (`outbox_messages`, `outbox_offsets`, `relay_locks`) get the prefix as a
-unit, on both the publish and relay sides; a separate `*mongo.Database` per
+unit; pass the SAME prefix to `NewStore` and `NewRelayStore`, since the two
+halves of one instance must address the same collections. A separate `*mongo.Database` per
 instance works too (session transactions span databases within a cluster). There is no separate
 `maxAwaitTime` knob: the relay passes `WithDrainWindow` to `Store.Watch` as
 `maxAwait`, which becomes the change stream's `maxAwaitTimeMS` — one latency
@@ -523,13 +533,13 @@ the reasoning and the caveats on writing `f`.
    relay (change streams) require a **replica set** (a single-node replica
    set is fine for dev; a standalone `mongod` fails both with raw server
    errors).
-2. **`EnsureIndexes`** — call it on every startup (idempotent). Skipping it
-   means **no TTL index is ever created and the outbox collection grows
-   forever, silently** — `WithRetention` alone changes nothing.
-3. **Publish** — inside `store.WithTransaction` (or on a
+2. **`RelayStore.EnsureIndexes`** — call it on every startup (idempotent).
+   Skipping it means **no TTL index is ever created and the outbox collection
+   grows forever, silently** — `WithRetention` alone changes nothing.
+3. **Publish** — `mongodb.NewStore(db)`, inside `store.WithTransaction` (or on a
    `store.WithSession(sess)`-bound copy under your own session runner); an
    unbound, transactionless publish is rejected loudly.
-4. **Relay** — `stream.NewRelay(name, store, sender, …)`; replicas of one
+4. **Relay** — `stream.NewRelay(name, mongodb.NewRelayStore(db), sender, …)`; replicas of one
    group need no extra config (leader election is automatic). Size
    `TokenBatchSize × worst-case Send latency < LeaseTTL` (see NewRelay's
    godoc).

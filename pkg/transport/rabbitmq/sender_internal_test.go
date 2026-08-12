@@ -28,14 +28,41 @@ func TestSenderSendPassesCommandContextToPublish(t *testing.T) {
 
 		return command(commandCtx, conn)
 	})
+	// Confirms off: the confirm-mode handshake needs a live channel, and what this
+	// pins is that the COMMAND's context — not Send's own — reaches the publish.
+	options := defaultSenderOptions()
+	WithoutPublisherConfirms()(&options)
 	sender := &Sender{
-		client:  client,
-		options: defaultSenderOptions(),
+		client:     client,
+		options:    options,
+		confirming: make(map[*amqp.Channel]struct{}),
 	}
 
 	err := sender.Send(t.Context(), event.NewMetadata("books.v1.BookCreated"), []byte("event"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Send() error = %v, want context.Canceled", err)
+	}
+}
+
+// TestSenderConfirmsAreOnByDefault pins the default that makes the outbox's
+// at-least-once guarantee real.
+//
+// Without confirms, Send returns nil as soon as the frame is written, so a broker
+// rejection — the 404 for an exchange that does not exist yet, a resource alarm, a
+// failed persist — arrives asynchronously, after Send already reported success. An
+// outbox relay takes that answer as authorization to commit its offset (or persist
+// its resume token) past the event, so the event is dropped and later swept while
+// Observer.OnDrained counts it as sent: silent loss, in the one component whose
+// entire purpose is not losing anything.
+func TestSenderConfirmsAreOnByDefault(t *testing.T) {
+	if !defaultSenderOptions().confirms {
+		t.Fatal("publisher confirms are off by default; an unconfirmed publish lets the relay commit past discarded events")
+	}
+
+	options := defaultSenderOptions()
+	WithoutPublisherConfirms()(&options)
+	if options.confirms {
+		t.Fatal("WithoutPublisherConfirms() did not turn confirms off")
 	}
 }
 
@@ -76,17 +103,55 @@ func TestSenderSendRejectsMalformedEventType(t *testing.T) {
 	}
 }
 
-// TestSplitEventTypeIgnoresMarshalerType pins that routing is derived from
+// retypingMarshaler rewrites amqp.Publishing.Type, the thing routing must NOT be
+// derived from.
+type retypingMarshaler struct {
+	publishingType string
+}
+
+func (m retypingMarshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, error) {
+	return amqp.Publishing{Type: m.publishingType, ContentType: md.DataContentType, Body: data}, nil
+}
+
+func (m retypingMarshaler) Unmarshal(*amqp.Delivery) (*event.Metadata, []byte, error) {
+	return nil, nil, errors.New("not used")
+}
+
+// TestSendRoutesOnMetadataTypeNotMarshalerType pins that routing is derived from
 // meta.Type, the authoritative event type, and not from amqp.Publishing.Type: a
 // custom WithMessageMarshaler may leave the latter empty or rewrite it, and
 // indexing one string with a position computed from the other panics or silently
 // routes to the wrong exchange.
-func TestSplitEventTypeIgnoresMarshalerType(t *testing.T) {
-	exchange, routingKey, err := splitEventType("books.v1.BookCreated")
-	if err != nil {
-		t.Fatalf("splitEventType: %v", err)
-	}
-	if exchange != "books.v1" || routingKey != "BookCreated" {
-		t.Fatalf("splitEventType = (%q, %q), want (\"books.v1\", \"BookCreated\")", exchange, routingKey)
+//
+// A well-formed meta.Type must therefore reach the broker even when the marshaler
+// hands back a Publishing.Type that would not survive the split — here the command
+// context is pre-canceled, so success is "got as far as the publish".
+func TestSendRoutesOnMetadataTypeNotMarshalerType(t *testing.T) {
+	for name, publishingType := range map[string]string{
+		"empty":     "",
+		"malformed": "BookCreated",
+	} {
+		t.Run(name, func(t *testing.T) {
+			commandCtx, cancel := context.WithCancel(t.Context())
+			cancel()
+
+			client := commandProcessorFunc(func(_ context.Context, command amqpx.Command) error {
+				return command(commandCtx, connpool.NewConn(nil, &amqp.Channel{}))
+			})
+
+			options := defaultSenderOptions()
+			WithoutPublisherConfirms()(&options)
+			WithMessageMarshaler(retypingMarshaler{publishingType: publishingType})(&options)
+			sender := &Sender{
+				client:     client,
+				options:    options,
+				confirming: make(map[*amqp.Channel]struct{}),
+			}
+
+			err := sender.Send(t.Context(), event.NewMetadata("books.v1.BookCreated"), []byte("event"))
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Send() error = %v, want context.Canceled (routing must come from meta.Type)", err)
+			}
+		})
 	}
 }

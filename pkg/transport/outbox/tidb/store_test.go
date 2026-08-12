@@ -33,6 +33,32 @@ func TestRelayStoreConstructs(t *testing.T) {
 	if tidb.NewRelayStore(nil) == nil {
 		t.Fatal("NewRelayStore returned nil")
 	}
+	// A retention window is accepted at construction, like any other option.
+	if tidb.NewRelayStore(nil, tidb.WithRetentionWindow(48*time.Hour)) == nil {
+		t.Fatal("NewRelayStore with a retention window returned nil")
+	}
+}
+
+// TestWithRetentionWindowRejectsNonPositive is the new home of a guard the
+// relay used to own: when the window was a sequence.WithRetention parameter,
+// the relay rejected a non-positive one at NewRelay. The window moved to the
+// store (its cutoff is MIN(last_seq) store-wide, so a per-relay window let the
+// shortest one silently win for every group), and the validation moved with
+// it. Here it panics rather than erroring, matching WithTablePrefix: both are
+// static developer configuration, not runtime input.
+func TestWithRetentionWindowRejectsNonPositive(t *testing.T) {
+	for _, bad := range []time.Duration{0, -time.Second, -7 * 24 * time.Hour} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("WithRetentionWindow(%v) did not panic", bad)
+				}
+			}()
+			tidb.WithRetentionWindow(bad)
+		}()
+	}
+	// A positive window must not panic.
+	tidb.WithRetentionWindow(time.Nanosecond)
 }
 
 // TestCreateOutboxMessageRejectsNilMetadata proves the nil-Metadata guard
@@ -61,7 +87,13 @@ func TestCreateOutboxMessageRejectsZeroTime(t *testing.T) {
 	}
 }
 
-var testDB *sql.DB
+var (
+	testDB *sql.DB
+	// testDSN is testDB's DSN, so a test can reopen the same database with
+	// different go-sql-driver connection flags — see
+	// TestLeaderLockOutcomeSurvivesDSNFlags.
+	testDSN string
+)
 
 func TestMain(m *testing.M) {
 	inst, cleanup, err := tidbtest.Start(context.Background())
@@ -85,6 +117,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1) // real harness bug, not a missing Docker
 	}
 	testDB = inst.DB
+	testDSN = inst.DSN
 	code := m.Run()
 	cleanup()
 	os.Exit(code)
@@ -341,6 +374,119 @@ func TestLeaderLockExpiredLeaseTakeover(t *testing.T) {
 	}
 }
 
+// TestLeaderLockOutcomeSurvivesDSNFlags is the safety net under the
+// single-statement TryAcquireLeaderLock.
+//
+// The upsert reports whether it took the lock via LAST_INSERT_ID rather than
+// via affected-rows, because affected-rows is DSN-dependent: with
+// CLIENT_FOUND_ROWS (go-sql-driver's clientFoundRows=true) an ON DUPLICATE KEY
+// UPDATE that changed nothing — i.e. a LOST election — reports 1 affected row,
+// exactly like the fresh insert that means "won". A store reading that signal
+// would tell every replica it is the leader, and dual leaders deliver the whole
+// log twice and skip events where their GREATEST offset commits interleave.
+//
+// So each flag combination a user may plausibly put in a DSN is exercised
+// against the same table, and TryAcquireLeaderLock's boolean is checked against
+// the ground truth in relay_locks — not against an expected round-trip count.
+func TestLeaderLockOutcomeSurvivesDSNFlags(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+	ctx := context.Background()
+
+	for _, flags := range []string{"", "clientFoundRows=true", "interpolateParams=true"} {
+		t.Run("flags="+flags, func(t *testing.T) {
+			dsn := testDSN
+			if flags != "" {
+				sep := "?"
+				if strings.Contains(dsn, "?") {
+					sep = "&"
+				}
+				dsn += sep + flags
+			}
+			db, err := sql.Open("mysql", dsn)
+			if err != nil {
+				t.Fatalf("open %q: %v", flags, err)
+			}
+			defer func() { _ = db.Close() }()
+
+			st := tidb.NewRelayStore(db)
+			lock := "dsn-" + flags // one lock row per subtest, so they can't interfere
+
+			// holds reports who the table says owns the lock ("" if no row) —
+			// the ground truth every assertion below is checked against.
+			holds := func() string {
+				var h string
+				err := db.QueryRowContext(ctx, "SELECT holder_id FROM relay_locks WHERE name = ?", lock).Scan(&h)
+				if errors.Is(err, sql.ErrNoRows) {
+					return ""
+				}
+				if err != nil {
+					t.Fatalf("read holder: %v", err)
+				}
+				return h
+			}
+
+			// 1. Fresh insert: the row does not exist, so A wins.
+			ok, err := st.TryAcquireLeaderLock(ctx, lock, "A", 30*time.Second)
+			if err != nil || !ok {
+				t.Fatalf("A first acquire = %v, %v; want true (fresh insert)", ok, err)
+			}
+			if got := holds(); got != "A" {
+				t.Fatalf("holder = %q after A's insert, want A", got)
+			}
+
+			// 2. Renewal: the row exists and is already A's. This is the case
+			// affected-rows would misreport as 0 ("lost") if two renewals ever
+			// wrote an identical expire_time.
+			ok, err = st.TryAcquireLeaderLock(ctx, lock, "A", 30*time.Second)
+			if err != nil || !ok {
+				t.Fatalf("A renew = %v, %v; want true", ok, err)
+			}
+			if got := holds(); got != "A" {
+				t.Fatalf("holder = %q after A's renewal, want A", got)
+			}
+
+			// 3. Contention: the row exists, A's lease is live. B must lose —
+			// the case CLIENT_FOUND_ROWS makes indistinguishable from case 1
+			// under affected-rows.
+			ok, err = st.TryAcquireLeaderLock(ctx, lock, "B", 30*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok {
+				t.Fatal("B reported leadership while A holds a live lease (dual leaders)")
+			}
+			if got := holds(); got != "A" {
+				t.Fatalf("holder = %q after B's failed acquire, want A (a loser must not overwrite)", got)
+			}
+
+			// 4. Expired-lease takeover: the row exists and is stale, so B wins.
+			if _, err := db.ExecContext(ctx,
+				"UPDATE relay_locks SET expire_time = NOW(6) - INTERVAL 1 SECOND WHERE name = ?", lock); err != nil {
+				t.Fatalf("expire A's lease: %v", err)
+			}
+			ok, err = st.TryAcquireLeaderLock(ctx, lock, "B", 30*time.Second)
+			if err != nil || !ok {
+				t.Fatalf("B takeover of an expired lease = %v, %v; want true", ok, err)
+			}
+			if got := holds(); got != "B" {
+				t.Fatalf("holder = %q after B's takeover, want B", got)
+			}
+
+			// 5. And the displaced holder is now the loser.
+			ok, err = st.TryAcquireLeaderLock(ctx, lock, "A", 30*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok {
+				t.Fatal("A reported leadership after B took over (dual leaders)")
+			}
+		})
+	}
+}
+
 // TestMetadataFullFidelityRoundTrip proves the TiDB store now round-trips the
 // FULL CloudEvents envelope through the metadata JSON column — Extensions and
 // DataSchema in particular, which the old scalar-column schema dropped.
@@ -556,6 +702,55 @@ func TestListMessagesEmptyObjectMetadataIsPoison(t *testing.T) {
 	}
 }
 
+// TestSweepHonoursStoreRetentionWindow proves the age half of the sweep's
+// cutoff comes from the STORE's configured window, and that the default keeps a
+// week of history.
+//
+// Both halves matter. A store on the default window must not delete rows that
+// are fully consumed but only seconds old — retention is what lets a consumer
+// group come back from downtime, so "everyone has read it" is not on its own a
+// license to delete. And the window must actually be reconfigurable, or the
+// option is decoration.
+func TestSweepHonoursStoreRetentionWindow(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+	ctx := context.Background()
+
+	for range 3 {
+		publish(t, "retention")
+	}
+	if _, err := tidb.NewRelayStore(testDB).SequenceMessages(ctx, 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+	// Every row is below the only group's watermark, so ONLY the age cutoff can
+	// hold the sweep back.
+	if err := tidb.NewRelayStore(testDB).CommitOffset(ctx, "c", 3); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default window (7 days): the rows were inserted moments ago, so nothing
+	// is sweepable.
+	n, err := tidb.NewRelayStore(testDB).SweepMessages(ctx, 100)
+	if err != nil {
+		t.Fatalf("sweep at the default window: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("swept %d rows at the default 7-day window, want 0 (fresh rows must survive)", n)
+	}
+
+	// A window short enough that the same rows are already older than it.
+	short := tidb.NewRelayStore(testDB, tidb.WithRetentionWindow(time.Microsecond))
+	n, err = short.SweepMessages(ctx, 100)
+	if err != nil {
+		t.Fatalf("sweep at a short window: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("swept %d rows at a 1us window, want 3 (the store's window must reach the DELETE)", n)
+	}
+}
+
 // TestDeleteOffsetUnpinsSweep proves DeleteOffset is the decommissioning step
 // for a retired consumer group: its stale offset row pins MIN(last_seq) and
 // halts the retention sweep until the row is removed.
@@ -568,7 +763,11 @@ func TestDeleteOffsetUnpinsSweep(t *testing.T) {
 	for range 3 {
 		publish(t, "s")
 	}
-	st := tidb.NewRelayStore(testDB)
+	// The retention window is the STORE's now: the smallest positive one makes
+	// every row published above already older than the cutoff by the time the
+	// sweep runs (publish + sequence + commit are several DB round trips), so
+	// the test still isolates the OFFSET pinning from the age cutoff.
+	st := tidb.NewRelayStore(testDB, tidb.WithRetentionWindow(time.Microsecond))
 	ctx := context.Background()
 	if _, err := st.SequenceMessages(ctx, 100); err != nil {
 		t.Fatalf("sequence: %v", err)
@@ -581,8 +780,7 @@ func TestDeleteOffsetUnpinsSweep(t *testing.T) {
 	}
 
 	// The retired group pins MIN(last_seq) at 1: only seq 1 is sweepable.
-	sweepOlderThan := -time.Hour // negative: everything is "older", regardless of insert age
-	n, err := st.SweepMessages(ctx, sweepOlderThan, 100)
+	n, err := st.SweepMessages(ctx, 100)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -602,7 +800,7 @@ func TestDeleteOffsetUnpinsSweep(t *testing.T) {
 	}
 
 	// With the retired row gone, the sweep advances to the live watermark.
-	n, err = st.SweepMessages(ctx, sweepOlderThan, 100)
+	n, err = st.SweepMessages(ctx, 100)
 	if err != nil {
 		t.Fatalf("sweep after delete: %v", err)
 	}

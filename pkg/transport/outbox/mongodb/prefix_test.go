@@ -47,8 +47,11 @@ func TestPrefixedOutboxCoexistsInOneDatabase(t *testing.T) {
 		}
 	}
 
+	// One prefix, both halves of the instance: the publish Store and the
+	// RelayStore must address the same three prefixed collections.
 	st := mongodbstore.NewStore(testDB, mongodbstore.WithCollectionPrefix("orders_"))
-	if err := st.EnsureIndexes(ctx); err != nil {
+	rs := mongodbstore.NewRelayStore(testDB, mongodbstore.WithCollectionPrefix("orders_"))
+	if err := rs.EnsureIndexes(ctx); err != nil {
 		t.Fatalf("EnsureIndexes on prefixed instance: %v", err)
 	}
 
@@ -84,14 +87,14 @@ func TestPrefixedOutboxCoexistsInOneDatabase(t *testing.T) {
 	// Resume tokens are instance-local too: a save through the prefixed store
 	// is invisible to a default-instance LoadToken for the same group name.
 	ct := time.Now().UTC().Truncate(time.Millisecond)
-	if persisted, err := st.SaveToken(ctx, "orders-relay", "tok1", ct); err != nil || !persisted {
+	if persisted, err := rs.SaveToken(ctx, "orders-relay", "tok1", ct); err != nil || !persisted {
 		t.Fatalf("prefixed SaveToken: persisted=%v err=%v", persisted, err)
 	}
-	tok, _, err := st.LoadToken(ctx, "orders-relay")
+	tok, _, err := rs.LoadToken(ctx, "orders-relay")
 	if err != nil || tok != "tok1" {
 		t.Fatalf("prefixed LoadToken = %q, %v; want tok1", tok, err)
 	}
-	defaultTok, _, err := mongodbstore.NewStore(testDB).LoadToken(ctx, "orders-relay")
+	defaultTok, _, err := mongodbstore.NewRelayStore(testDB).LoadToken(ctx, "orders-relay")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -18,6 +18,7 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 	mongodbstore "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/mongodb"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/mongodb/mongodbtest"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/stream"
 )
 
@@ -27,9 +28,36 @@ func TestNewStoreConstructs(t *testing.T) {
 	}
 }
 
-func TestNewStoreWithRetention(t *testing.T) {
-	if mongodbstore.NewStore(nil, mongodbstore.WithRetention(48*time.Hour)) == nil {
-		t.Fatal("NewStore returned nil")
+// TestStoreSplitIsStructural is the negative half of the compile-time pins in
+// store.go/watch.go, and the reason the old per-method "must not run inside a
+// transaction" guards could be deleted: the publish Store must implement
+// NEITHER relay contract, and the RelayStore must not implement the publish
+// one. Re-adding a relay method to *Store (or embedding *Store in RelayStore,
+// or vice versa) would restore exactly the two failure modes the split
+// removes — a relay call enlisting in the caller's business transaction, and
+// outbox.NewSender(relayStore) publishing outside one. Neither direction is
+// expressible as a `var _` pin, so it is asserted here.
+func TestStoreSplitIsStructural(t *testing.T) {
+	var publish any = mongodbstore.NewStore(nil)
+	if _, ok := publish.(stream.Store); ok {
+		t.Error("*Store implements stream.Store: a relay call reached with the publish transaction's " +
+			"session ctx would enlist in the caller's business transaction and roll back with it")
+	}
+	if _, ok := publish.(relay.LeaderStore); ok {
+		t.Error("*Store implements relay.LeaderStore: an acquired lease taken inside the caller's " +
+			"transaction would silently disappear on rollback")
+	}
+
+	var relayStore any = mongodbstore.NewRelayStore(nil)
+	if _, ok := relayStore.(outbox.Store); ok {
+		t.Error("*RelayStore implements outbox.Store: outbox.NewSender(relayStore) would compile and " +
+			"publish rows that commit independently of any business write")
+	}
+}
+
+func TestNewRelayStoreWithRetention(t *testing.T) {
+	if mongodbstore.NewRelayStore(nil, mongodbstore.WithRetention(48*time.Hour)) == nil {
+		t.Fatal("NewRelayStore returned nil")
 	}
 }
 
@@ -65,6 +93,7 @@ func TestCreateOutboxMessageRejectsZeroCreateTime(t *testing.T) {
 	st := mongodbstore.NewStore(nil)
 	md := event.NewMetadata("books.created")
 	md.ID = "id-1"
+	md.Time = time.Now().UTC() // otherwise the shared metadata validation fires first
 	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: md.ID, Metadata: md})
 	if err == nil || !strings.Contains(err.Error(), "create time is zero") {
 		t.Fatalf("err = %v, want descriptive zero-create-time error", err)
@@ -103,7 +132,7 @@ func TestCreateOutboxMessageRejectsZeroMetadataTime(t *testing.T) {
 // truncate to 0 — expiring every row immediately. Fails before any driver
 // call (nil *mongo.Database).
 func TestEnsureIndexesRejectsSubSecondRetention(t *testing.T) {
-	st := mongodbstore.NewStore(nil, mongodbstore.WithRetention(500*time.Millisecond))
+	st := mongodbstore.NewRelayStore(nil, mongodbstore.WithRetention(500*time.Millisecond))
 	err := st.EnsureIndexes(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "retention") {
 		t.Fatalf("expected retention range rejection, got %v", err)
@@ -115,7 +144,7 @@ func TestEnsureIndexesRejectsSubSecondRetention(t *testing.T) {
 // bug, not a request for the default, and must fail loudly at EnsureIndexes
 // instead of being silently swallowed by the option.
 func TestEnsureIndexesRejectsNonPositiveRetention(t *testing.T) {
-	st := mongodbstore.NewStore(nil, mongodbstore.WithRetention(0))
+	st := mongodbstore.NewRelayStore(nil, mongodbstore.WithRetention(0))
 	err := st.EnsureIndexes(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "retention") {
 		t.Fatalf("expected retention rejection for 0, got %v", err)
@@ -127,7 +156,7 @@ func TestEnsureIndexesRejectsNonPositiveRetention(t *testing.T) {
 // 1500ms would otherwise become a 1s TTL, expiring rows earlier than the
 // configured window.
 func TestEnsureIndexesRejectsFractionalRetention(t *testing.T) {
-	st := mongodbstore.NewStore(nil, mongodbstore.WithRetention(1500*time.Millisecond))
+	st := mongodbstore.NewRelayStore(nil, mongodbstore.WithRetention(1500*time.Millisecond))
 	err := st.EnsureIndexes(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "whole number of seconds") {
 		t.Fatalf("expected fractional-retention rejection, got %v", err)
@@ -138,7 +167,7 @@ func TestEnsureIndexesRejectsFractionalRetention(t *testing.T) {
 // the upper bound: expireAfterSeconds is int32, and 2^31 seconds would
 // overflow the cast.
 func TestEnsureIndexesRejectsRetentionAboveTTLRange(t *testing.T) {
-	st := mongodbstore.NewStore(nil, mongodbstore.WithRetention((1<<31)*time.Second))
+	st := mongodbstore.NewRelayStore(nil, mongodbstore.WithRetention((1<<31)*time.Second))
 	err := st.EnsureIndexes(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "retention") {
 		t.Fatalf("expected retention range rejection, got %v", err)
@@ -231,7 +260,7 @@ func TestEnsureIndexesCreatesTTL(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	if err := mongodbstore.NewStore(testDB).EnsureIndexes(context.Background()); err != nil {
+	if err := mongodbstore.NewRelayStore(testDB).EnsureIndexes(context.Background()); err != nil {
 		t.Fatalf("ensure indexes: %v", err)
 	}
 	cur, err := testDB.Collection("outbox_messages").Indexes().List(context.Background())
@@ -307,16 +336,16 @@ func TestEnsureIndexesRetentionConflictHinted(t *testing.T) {
 	reset(t)
 	ctx := context.Background()
 
-	if err := mongodbstore.NewStore(testDB, mongodbstore.WithRetention(48*time.Hour)).EnsureIndexes(ctx); err != nil {
+	if err := mongodbstore.NewRelayStore(testDB, mongodbstore.WithRetention(48*time.Hour)).EnsureIndexes(ctx); err != nil {
 		t.Fatalf("ensure indexes (48h): %v", err)
 	}
 	// Re-ensuring with the SAME retention stays idempotent.
-	if err := mongodbstore.NewStore(testDB, mongodbstore.WithRetention(48*time.Hour)).EnsureIndexes(ctx); err != nil {
+	if err := mongodbstore.NewRelayStore(testDB, mongodbstore.WithRetention(48*time.Hour)).EnsureIndexes(ctx); err != nil {
 		t.Fatalf("re-ensure with unchanged retention: %v", err)
 	}
 	// A DIFFERENT retention on the existing index must fail loudly, with the
 	// operational hint (collMod) in the message.
-	err := mongodbstore.NewStore(testDB, mongodbstore.WithRetention(24*time.Hour)).EnsureIndexes(ctx)
+	err := mongodbstore.NewRelayStore(testDB, mongodbstore.WithRetention(24*time.Hour)).EnsureIndexes(ctx)
 	if err == nil {
 		t.Fatal("re-ensure with a different retention succeeded; want IndexOptionsConflict surfaced")
 	}
@@ -330,7 +359,7 @@ func TestOffsetRoundTrip(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 	ct := time.Now().UTC().Truncate(time.Millisecond)
 	if persisted, err := st.SaveToken(ctx, "c", "\x01\x02", ct); err != nil || !persisted {
@@ -357,7 +386,7 @@ func TestSaveTokenMonotoneClusterTime(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 
 	t1 := time.Now().UTC().Truncate(time.Millisecond)
@@ -418,7 +447,7 @@ func TestSaveTokenSameSecondTokenOrder(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 
 	const secs = uint32(1752444000)
@@ -469,7 +498,7 @@ func TestSaveTokenKeyedSaveRespectsCoarseGuardOnLegacyRow(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 
 	const baseSecs = uint32(1752444000)
@@ -513,7 +542,7 @@ func TestDeleteTokenResetsGroup(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 
 	if persisted, err := st.SaveToken(ctx, "c", "tok1", time.Now().UTC()); err != nil || !persisted {
@@ -545,7 +574,7 @@ func TestSaveTokenRejectsEmptyToken(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 
 	ct := time.Now().UTC().Truncate(time.Millisecond)
@@ -586,7 +615,7 @@ func TestSaveTokenHealsRowWithoutClusterTime(t *testing.T) {
 		t.Fatalf("hand-insert legacy row: %v", err)
 	}
 
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ct := time.Now().UTC().Truncate(time.Millisecond)
 	if persisted, err := st.SaveToken(ctx, "c", "tok1", ct); err != nil || !persisted {
 		t.Fatalf("save over legacy row: persisted=%v err=%v, want true, nil", persisted, err)
@@ -605,7 +634,7 @@ func TestLeaderLockMutualExclusionAndRelease(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 	okA, err := st.TryAcquireLeaderLock(ctx, "lock", "A", 30*time.Second)
 	if err != nil || !okA {
@@ -640,7 +669,7 @@ func TestLeaderLockRenewalSameHolder(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 
 	okA1, err := st.TryAcquireLeaderLock(ctx, "lock", "A", 30*time.Second)
@@ -674,7 +703,7 @@ func TestLeaderLockExpiredLeaseTakeover(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	st := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 
 	okA, err := st.TryAcquireLeaderLock(ctx, "lock", "A", 200*time.Millisecond)
@@ -861,10 +890,10 @@ func TestRealResumeTokenParsesForKeyedSave(t *testing.T) {
 		t.Skip("no MongoDB")
 	}
 	reset(t)
-	st := mongodbstore.NewStore(testDB)
+	rs := mongodbstore.NewRelayStore(testDB)
 	ctx := context.Background()
 
-	strm, err := st.Watch(ctx, "", 5*time.Second)
+	strm, err := rs.Watch(ctx, "", 5*time.Second)
 	if err != nil {
 		t.Fatalf("watch: %v", err)
 	}
@@ -894,7 +923,7 @@ func TestRealResumeTokenParsesForKeyedSave(t *testing.T) {
 		t.Fatalf("commit time = %v: token-embedded clusterTime failed to parse on a real server token", ev.CommitTime)
 	}
 
-	if persisted, err := st.SaveToken(ctx, "canary", ev.ResumeToken, ev.CommitTime); err != nil || !persisted {
+	if persisted, err := rs.SaveToken(ctx, "canary", ev.ResumeToken, ev.CommitTime); err != nil || !persisted {
 		t.Fatalf("save token: persisted=%v err=%v", persisted, err)
 	}
 	var doc bson.M

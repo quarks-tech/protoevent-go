@@ -9,17 +9,14 @@ package tidb
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 
-	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/sequence"
@@ -39,33 +36,25 @@ const (
 	baseLocksTable      = "relay_locks"
 )
 
-// tablePrefixPattern constrains WithTablePrefix to a safe SQL identifier
-// fragment: the prefix is spliced into DDL/DML as an IDENTIFIER (it cannot be
-// a bound parameter), so it must never carry quoting or punctuation.
-var tablePrefixPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
-
-// maxTablePrefixLen keeps every prefixed identifier — including the
-// per-instance golang-migrate versions table (prefix + "schema_migrations")
-// — comfortably under TiDB's 64-character identifier limit.
-const maxTablePrefixLen = 40
-
-func validateTablePrefix(prefix string) error {
-	if prefix == "" {
-		return errors.New("outbox: table prefix must not be empty")
-	}
-	if len(prefix) > maxTablePrefixLen {
-		return fmt.Errorf("outbox: table prefix %q exceeds %d characters", prefix, maxTablePrefixLen)
-	}
-	if !tablePrefixPattern.MatchString(prefix) {
-		return fmt.Errorf("outbox: table prefix %q is not a valid identifier fragment (want %s)", prefix, tablePrefixPattern)
-	}
-	return nil
-}
+// defaultRetentionWindow is how much history the retention sweep keeps (see
+// WithRetentionWindow). The MongoDB sibling store makes the same choice with
+// its TTL index, so one outbox reads the same on either backend.
+const defaultRetentionWindow = 7 * 24 * time.Hour
 
 // config carries construction-time configuration shared by NewStore and
 // NewRelayStore.
 type config struct {
-	prefix string
+	prefix    string
+	retention time.Duration // sweep cutoff age; see WithRetentionWindow
+}
+
+// newConfig applies opts over the defaults.
+func newConfig(opts []Option) config {
+	c := config{retention: defaultRetentionWindow}
+	for _, opt := range opts {
+		opt(&c)
+	}
+	return c
 }
 
 // Option configures a Store / RelayStore instance.
@@ -77,15 +66,40 @@ type Option func(*config)
 // each with its own total order, retention, and consumer groups. The publish
 // Store and the RelayStore of one instance MUST use the same prefix.
 //
-// The prefix is an SQL identifier fragment ([A-Za-z][A-Za-z0-9_]*, at most 40
-// characters, e.g. "orders_"). An invalid prefix panics: it is static
-// developer configuration, not runtime input — the regexp.MustCompile
-// convention for programmer error.
+// The prefix is an SQL identifier fragment ([A-Za-z][A-Za-z0-9_]*, at most
+// outbox.MaxInstancePrefixLen characters, e.g. "orders_") — the rule is shared
+// with the other backends' instance prefixes via
+// outbox.ValidateInstancePrefix, so one prefix value works verbatim on all of
+// them. An invalid prefix panics: it is static developer configuration, not
+// runtime input — the regexp.MustCompile convention for programmer error.
 func WithTablePrefix(prefix string) Option {
-	if err := validateTablePrefix(prefix); err != nil {
+	if err := outbox.ValidateInstancePrefix("table prefix", prefix); err != nil {
 		panic(err)
 	}
 	return func(c *config) { c.prefix = prefix }
+}
+
+// WithRetentionWindow sets how long a delivered row survives before
+// SweepMessages may delete it (default 7 days). The cutoff is evaluated
+// against the DATABASE clock, never a relay host's — see SweepMessages.
+//
+// The window belongs to the STORE, not to a relay: the sweep's cutoff is
+// MIN(last_seq) across ALL consumer groups, so its effect is store-wide while
+// a relay is per-group. Configured per relay, the shortest window silently won
+// for everybody — a second consumer group could truncate the first's 30-day
+// history to a 7-day default, diagnosable only by comparing two startup logs.
+// Every relay over this store therefore inherits one window, which is what
+// retention on a shared log always was.
+//
+// Size it above the longest consumer downtime you intend to survive: a group
+// that is down longer than the window loses the events swept out from under
+// its offset. A non-positive window panics — static developer configuration,
+// same convention as WithTablePrefix.
+func WithRetentionWindow(d time.Duration) Option {
+	if d <= 0 {
+		panic(fmt.Errorf("outbox: retention window must be > 0, got %v", d))
+	}
+	return func(c *config) { c.retention = d }
 }
 
 // Runner is the subset of *sql.DB / *sql.Tx the store needs. Publish uses a
@@ -120,10 +134,7 @@ type Store struct {
 // transaction. For relay use, parseTime=true is REQUIRED too (see
 // NewRelayStore).
 func NewStore(r Runner, opts ...Option) *Store {
-	var c config
-	for _, opt := range opts {
-		opt(&c)
-	}
+	c := newConfig(opts)
 	// occur_time is kept as a queryable/indexable event-time column for
 	// operators and future event-time features; the engine itself reads event
 	// time from the metadata JSON, and retention (SweepMessages) is
@@ -147,16 +158,6 @@ VALUES (NULL, NULLIF(@@tidb_current_ts, 0), ?, ?, ?, NOW(6), ?)`, c.prefix+baseM
 
 var _ outbox.Store = (*Store)(nil)
 
-// Compile-time capability pins for *RelayStore: the sequence runtime discovers
-// every optional capability by type assertion, so signature drift would
-// otherwise downgrade silently (always-leader, no sequencer, no sweep).
-var (
-	_ sequence.Sequencer = (*RelayStore)(nil)
-	_ sequence.Sweeper   = (*RelayStore)(nil)
-	_ sequence.Clock     = (*RelayStore)(nil)
-	_ relay.LeaderStore  = (*RelayStore)(nil)
-)
-
 // RelayStore is the pool-backed relay store: everything the relay runtimes
 // need — read/offset, the sequencer, the retention sweep, and leader
 // election. These all manage their own transactions against the pool, so they
@@ -171,27 +172,50 @@ var (
 type RelayStore struct {
 	db *sql.DB
 	q  relayQueries
+	// retention is the sweep's cutoff age (WithRetentionWindow). It is bound
+	// to the store rather than passed per SweepMessages call because the
+	// sweep's effect is store-wide — see WithRetentionWindow.
+	retention time.Duration
 }
 
 // relayQueries holds every relay-side statement, rendered once at
 // construction: the table names are identifiers and cannot be bound
 // parameters, and WithTablePrefix validates the only variable fragment.
 type relayQueries struct {
-	list           string
-	offset         string
-	commitOffset   string
-	initOffset     string
-	deleteOffset   string
-	probePending   string
-	lockSequencer  string
-	assignSeq      string
-	bumpSequencer  string
-	acquireLock    string
-	readLockHolder string
-	releaseLock    string
-	sweep          string
-	storeNow       string
+	list          string
+	offset        string
+	commitOffset  string
+	initOffset    string
+	deleteOffset  string
+	probePending  string
+	lockSequencer string
+	assignSeq     string
+	bumpSequencer string
+	acquireLock   string
+	releaseLock   string
+	sweep         string
+	storeNow      string
 }
+
+// Leader-lock outcomes, as reported by acquireLock's LastInsertId.
+//
+//   - lockInserted (0) is not a value the statement writes: it is what the OK
+//     packet carries when the INSERT succeeded outright, because ON DUPLICATE
+//     KEY UPDATE never ran and relay_locks has no AUTO_INCREMENT column (see
+//     migrations/000001_create_outbox.up.sql — a generated id there would
+//     collide with the sentinels below). A fresh insert means the lock was free
+//     and is now ours.
+//   - lockTaken (1): the row existed and the conditional took or renewed it.
+//   - lockLost (2): the row existed, belongs to a live holder, and was left
+//     untouched.
+//
+// Any other value is treated as an error, not as leadership: this is the one
+// place where guessing "probably ours" turns into two active leaders.
+const (
+	lockInserted = 0
+	lockTaken    = 1
+	lockLost     = 2
+)
 
 func buildRelayQueries(c config) relayQueries {
 	messages := c.prefix + baseMessagesTable
@@ -239,17 +263,40 @@ JOIN (
 ) b ON b.id = o.id
 SET o.seq = ? + b.rn - 1`, messages, messages),
 		bumpSequencer: fmt.Sprintf(`UPDATE %s SET next_seq = ? WHERE name = 'default'`, sequencers),
+		// The upsert both decides the election AND reports its own outcome, so
+		// TryAcquireLeaderLock is ONE statement per tick rather than an upsert
+		// plus a read-back (which was two round trips per relay per
+		// PollInterval, forever, even on an idle relay).
+		//
+		// The outcome is carried by LAST_INSERT_ID(expr), which sets the value
+		// the OK packet returns as LastInsertId, and NOT by affected-rows.
+		// Affected-rows looks like it would do (1 inserted / 2 updated / 0
+		// unchanged) and is wrong: with CLIENT_FOUND_ROWS in the DSN
+		// (go-sql-driver's clientFoundRows=true) an unchanged row reports 1
+		// instead of 0, making a LOST election indistinguishable from a won
+		// insert — every replica would believe it holds the lock. Verified on
+		// TiDB v7.5.1 in both DSN modes; LAST_INSERT_ID is unaffected by the
+		// flag. See lockInserted/lockTaken/lockLost for the encoding.
+		//
+		// The second assignment deliberately re-tests the SAME condition rather
+		// than reusing the first: MySQL evaluates ON DUPLICATE KEY UPDATE
+		// assignments left to right, so `holder_id` here is already the NEW
+		// value — which makes `holder_id = VALUES(holder_id)` true exactly when
+		// the first IF took the lock, and false when it left the incumbent
+		// alone. expire_time is still the OLD value at this point, so the
+		// expiry branch reads the incumbent's deadline as intended.
 		acquireLock: fmt.Sprintf(`
 INSERT INTO %s (name, holder_id, expire_time)
 VALUES (?, ?, NOW(6) + INTERVAL ? MICROSECOND)
 ON DUPLICATE KEY UPDATE
     holder_id   = IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), VALUES(holder_id), holder_id),
-    expire_time = IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), VALUES(expire_time), expire_time)`, locks),
-		readLockHolder: fmt.Sprintf(`SELECT holder_id FROM %s WHERE name = ?`, locks),
-		releaseLock:    fmt.Sprintf(`DELETE FROM %s WHERE name = ? AND holder_id = ?`, locks),
+    expire_time = IF(LAST_INSERT_ID(IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), %d, %d)) = %d,
+                     VALUES(expire_time), expire_time)`, locks, lockTaken, lockLost, lockTaken),
+		releaseLock: fmt.Sprintf(`DELETE FROM %s WHERE name = ? AND holder_id = ?`, locks),
 		// The cutoff is evaluated against the DATABASE clock (NOW(6)), per the
 		// Sweeper contract: a skewed relay host must not sweep early or
-		// pin rows forever.
+		// pin rows forever. The bound parameter is the store's own retention
+		// window (WithRetentionWindow), not a per-call one.
 		sweep: fmt.Sprintf(`
 DELETE FROM %s
 WHERE seq IS NOT NULL
@@ -262,7 +309,9 @@ LIMIT ?`, messages, offsets),
 
 // NewRelayStore builds a relay store over db. Use the same WithTablePrefix as
 // the instance's publish Store (NewStore) — the two sides address one
-// four-table outbox instance.
+// four-table outbox instance. WithRetentionWindow tunes how much history the
+// sweep keeps (default 7 days); the sweep's CADENCE is the relay's
+// (sequence.WithRetention / sequence.WithoutRetention).
 //
 // DSN note: with go-sql-driver/mysql, parseTime=true is REQUIRED — ListMessages
 // scans create_time (DATETIME(6)) into time.Time, and with the driver default
@@ -271,13 +320,13 @@ LIMIT ?`, messages, offsets),
 // far from the misconfiguration. interpolateParams=true is additionally
 // recommended (see NewStore).
 func NewRelayStore(db *sql.DB, opts ...Option) *RelayStore {
-	var c config
-	for _, opt := range opts {
-		opt(&c)
-	}
-	return &RelayStore{db: db, q: buildRelayQueries(c)}
+	c := newConfig(opts)
+	return &RelayStore{db: db, q: buildRelayQueries(c), retention: c.retention}
 }
 
+// Compile-time capability pins for *RelayStore: the sequence runtime discovers
+// every optional capability by type assertion, so signature drift would
+// otherwise downgrade silently (always-leader, no sequencer, no sweep).
 var (
 	_ sequence.Store     = (*RelayStore)(nil)
 	_ sequence.Sequencer = (*RelayStore)(nil)
@@ -298,8 +347,13 @@ var (
 // m.ID is parsed as a UUID before the insert. A custom outbox.RowIDGenerator
 // (via outbox.WithRowIDGenerator) MUST emit UUIDs to be usable with this store.
 func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) error {
-	if m.Metadata == nil {
-		return errors.New("outbox: message metadata is nil")
+	// The shared write-side envelope rules (metadata present, Metadata.Time
+	// non-zero) live in the parent module so both backends accept and reject the
+	// same messages. The zero-time half matters HERE in particular: a zero time
+	// would be sent as 0001-01-01, below DATETIME(6)'s minimum, and surface as an
+	// opaque driver error from inside the caller's business transaction.
+	if err := outbox.ValidateMetadata(m.Metadata); err != nil {
+		return err
 	}
 	// The error names the remedy, because of WHERE this fails: the insert runs
 	// inside the caller's business transaction, so a non-UUID id does not merely
@@ -315,21 +369,28 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 			m.ID, err)
 	}
 	md := m.Metadata
-	if md.Time.IsZero() {
-		// A zero time would be sent as 0001-01-01, below DATETIME(6)'s minimum,
-		// and surface as an opaque driver error; reject it up front instead.
-		return errors.New("outbox: message metadata time is zero; set Metadata.Time before publishing")
-	}
-	meta, err := json.Marshal(md)
+	meta, err := outbox.MarshalMetadata(md)
 	if err != nil {
-		return fmt.Errorf("outbox: marshal metadata: %w", err)
+		return err
+	}
+	// A nil payload is an EMPTY payload, not a missing one. database/sql sends a
+	// nil []byte as SQL NULL, and data is `MEDIUMBLOB NOT NULL`, so the insert
+	// would fail with MySQL 1048 naming the column — from inside the caller's
+	// business transaction, rolling back the whole request over an error that
+	// describes the schema rather than the cause. And the input is ordinary:
+	// proto.Marshal returns (nil, nil) for a typed-nil or empty message, so
+	// publishing an event with no fields set lands here. The sibling MongoDB store
+	// accepts nil, so normalizing is also what keeps the two backends agreeing.
+	data := m.Data
+	if data == nil {
+		data = []byte{}
 	}
 	// Message.CreateTime is deliberately IGNORED here: the row's create_time
 	// is stamped by the database clock (see NewStore) because it anchors
 	// retention and must not trust publisher clocks. ListMessages returns the
 	// DB-stamped value.
 	_, err = s.r.ExecContext(ctx, s.insertQuery,
-		id[:], meta, m.Data, md.Time.UTC(),
+		id[:], meta, data, md.Time.UTC(),
 	)
 	if err != nil {
 		if isNullColumn(err, "tx_start_ts") {
@@ -351,8 +412,28 @@ func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit in
 	}
 	defer func() { _ = rows.Close() }()
 
-	out := make([]*outbox.Message, 0, limit)
+	// One backing array for the whole page, not one heap object per row: a
+	// default 100-row page used to cost 101 allocations (a full-size pointer
+	// slice plus a &Message per row) and now costs three.
+	//
+	// The initial capacity is deliberately well BELOW limit. An idle relay
+	// polls once a second and reads nothing, so the empty page is the common
+	// case and must not pay for limit messages; the first row that overflows
+	// grows the buffer straight to limit, which the SQL LIMIT guarantees is
+	// enough. Letting append double instead would allocate past the page size
+	// (16, 32, 64, 128 for limit=100) and leave more garbage than the
+	// per-row allocations it replaced — measured 9% MORE bytes per page.
+	//
+	// Pointers into buf are taken only after the last append (pagePointers),
+	// so a growth reallocation cannot leave earlier entries aliasing a stale
+	// array.
+	buf := make([]outbox.Message, 0, min(limit, initialPageCap))
 	for rows.Next() {
+		if len(buf) == cap(buf) && cap(buf) < limit {
+			grown := make([]outbox.Message, len(buf), limit)
+			copy(grown, buf)
+			buf = grown
+		}
 		var (
 			seq     int64
 			eventID []byte
@@ -367,30 +448,25 @@ func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit in
 		if err != nil {
 			return nil, fmt.Errorf("outbox: event_id not a uuid: %w", err)
 		}
-		// Unmarshal into a *pointer* target: JSON `null` unmarshals into a
-		// struct value WITHOUT error (leaving it zero), and a zero-metadata
-		// event would slip past the poison classification and be sent
-		// downstream as an empty event. With a pointer target, `null` yields
-		// nil and is classified poison like any other undecodable row.
-		var md *event.Metadata
-		if err := json.Unmarshal(meta, &md); err != nil {
+		// outbox.UnmarshalMetadata carries the three shared poison rules, which
+		// exist because each one is a way an unusable row could otherwise reach
+		// a consumer as if it were a real event: it decodes into a POINTER
+		// target (JSON `null` unmarshals into a struct value WITHOUT error,
+		// leaving it zero, so a null row would be sent downstream as an empty
+		// event), classifies a nil result as poison, and classifies a zero
+		// Metadata.Time as poison (JSON-valid-but-empty metadata "{}" decodes
+		// non-nil with every field zero; the write side rejects a zero time —
+		// see CreateOutboxMessage — so such a row was not written by this
+		// library). They live in the parent module so the two backends cannot
+		// disagree about whether the same row is deliverable.
+		md, err := outbox.UnmarshalMetadata(meta)
+		if err != nil {
 			// Poison row: hand the decoded prefix back with a typed error so
 			// the relay can deliver up to the poison row and then park it (or
 			// stop the lane) instead of blocking on the whole page.
-			return out, &sequence.DecodeError{ID: id.String(), Seq: seq, Err: err}
+			return pagePointers(buf), &sequence.DecodeError{ID: id.String(), Seq: seq, Err: err}
 		}
-		if md == nil {
-			return out, &sequence.DecodeError{ID: id.String(), Seq: seq, Err: errors.New("persisted metadata is JSON null")}
-		}
-		if md.Time.IsZero() {
-			// JSON-valid-but-empty metadata ("{}") decodes into a non-nil md
-			// with every field zero. The write side rejects zero Metadata.Time
-			// (see CreateOutboxMessage), so such a row was not written by this
-			// store — classify it poison like the null case instead of sending
-			// an empty event downstream.
-			return out, &sequence.DecodeError{ID: id.String(), Seq: seq, Err: errors.New("persisted metadata has zero time")}
-		}
-		out = append(out, &outbox.Message{
+		buf = append(buf, outbox.Message{
 			ID:         id.String(),
 			Seq:        seq,
 			Metadata:   md,
@@ -401,7 +477,26 @@ func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit in
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("outbox: list rows: %w", err)
 	}
-	return out, nil
+	return pagePointers(buf), nil
+}
+
+// initialPageCap is the starting capacity of a ListMessages page — see there
+// for why it is not the caller's limit.
+const initialPageCap = 16
+
+// pagePointers views a page's backing array as the []*outbox.Message the Store
+// contract returns, without copying a message. An empty page returns nil: the
+// relay only ever ranges over the result, and an idle poll should allocate
+// nothing at all.
+func pagePointers(msgs []outbox.Message) []*outbox.Message {
+	if len(msgs) == 0 {
+		return nil
+	}
+	out := make([]*outbox.Message, len(msgs))
+	for i := range msgs {
+		out[i] = &msgs[i]
+	}
+	return out
 }
 
 // Offset returns the named consumer's watermark (0 if unset).
@@ -551,27 +646,35 @@ func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, err
 
 // TryAcquireLeaderLock acquires or renews the lock; the incoming holder wins if
 // the lock is free (expired) or already theirs. TTL is applied via DB clock.
+//
+// One statement, no read-back: the upsert reports its own outcome through
+// LastInsertId (see acquireLock and the lock* constants). Beyond saving a round
+// trip per tick this removes a race the read-back had — between the upsert and
+// the SELECT, a graceful ReleaseLeaderLock could delete the row we had just
+// won, and we reported false for a lock we held.
 func (rs *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
-	if _, err := rs.db.ExecContext(ctx, rs.q.acquireLock,
-		name, holderID, ttl.Microseconds(),
-	); err != nil {
+	res, err := rs.db.ExecContext(ctx, rs.q.acquireLock, name, holderID, ttl.Microseconds())
+	if err != nil {
 		return false, fmt.Errorf("outbox: acquire lock: %w", err)
 	}
-
-	var holder string
-	err := rs.db.QueryRowContext(ctx, rs.q.readLockHolder, name).Scan(&holder)
-	if errors.Is(err, sql.ErrNoRows) {
-		// The upsert and the read-back are two non-transactional statements: a
-		// live holder's graceful ReleaseLeaderLock can delete the row between
-		// them. No row simply means we don't hold the lock — the semantically
-		// correct answer is false, not an error (which would cost the caller a
-		// spurious pass failure); the next tick's acquire takes the free lock.
-		return false, nil
-	}
+	outcome, err := res.LastInsertId()
 	if err != nil {
-		return false, fmt.Errorf("outbox: read lock holder: %w", err)
+		return false, fmt.Errorf("outbox: acquire lock outcome: %w", err)
 	}
-	return holder == holderID, nil
+	switch outcome {
+	case lockInserted, lockTaken:
+		return true, nil
+	case lockLost:
+		return false, nil
+	default:
+		// Fail closed and loudly. An unrecognized value means the statement no
+		// longer means what the constants say (a schema with an AUTO_INCREMENT
+		// on relay_locks, a driver that does not surface LAST_INSERT_ID), and
+		// the safe reading of "I don't know" is "not the leader" — guessing the
+		// other way runs every replica as leader.
+		return false, fmt.Errorf("outbox: acquire lock: unexpected outcome %d from the leader-lock upsert "+
+			"(want %d inserted, %d taken, or %d lost)", outcome, lockInserted, lockTaken, lockLost)
+	}
 }
 
 // ReleaseLeaderLock drops the lock if still held by holderID.
@@ -584,13 +687,19 @@ func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID stri
 }
 
 // SweepMessages deletes sequenced rows at or below the minimum committed offset
-// across all consumers and inserted (create_time) more than `olderThan` ago —
-// per the DATABASE clock on both sides: create_time is DB-stamped at insert
-// (see CreateOutboxMessage) and the cutoff is NOW(6)-relative, so no
-// publisher or relay host clock can sweep early or pin rows forever.
+// across all consumers and inserted (create_time) longer ago than this store's
+// retention window (WithRetentionWindow, default 7 days) — per the DATABASE
+// clock on both sides: create_time is DB-stamped at insert (see
+// CreateOutboxMessage) and the cutoff is NOW(6)-relative, so no publisher or
+// relay host clock can sweep early or pin rows forever.
 // Retention is anchored to insert time, not event time, so a backdated
 // WithEventTime event is not swept early. If no offsets exist yet,
 // MIN(last_seq) is NULL and nothing is deleted.
+//
+// The window is the STORE's and not a parameter of this call because the
+// cutoff is MIN(last_seq) over ALL consumer groups: the effect is store-wide,
+// so a per-relay window would let the shortest one win for everybody. limit
+// bounds one pass; the relay owns the cadence (sequence.WithRetention).
 //
 // MIN(last_seq) spans only registered offset rows: a consumer group that was
 // created but never run (or InitOffsetLatest'd) has no outbox_offsets row and
@@ -601,8 +710,8 @@ func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID stri
 // Conversely, a RETIRED group's offset row stops advancing but keeps pinning
 // MIN(last_seq) at its last committed position, halting the sweep permanently.
 // Decommission a retired consumer group with DeleteOffset to unpin retention.
-func (rs *RelayStore) SweepMessages(ctx context.Context, olderThan time.Duration, limit int) (int, error) {
-	res, err := rs.db.ExecContext(ctx, rs.q.sweep, olderThan.Microseconds(), limit)
+func (rs *RelayStore) SweepMessages(ctx context.Context, limit int) (int, error) {
+	res, err := rs.db.ExecContext(ctx, rs.q.sweep, rs.retention.Microseconds(), limit)
 	if err != nil {
 		return 0, fmt.Errorf("outbox: sweep: %w", err)
 	}

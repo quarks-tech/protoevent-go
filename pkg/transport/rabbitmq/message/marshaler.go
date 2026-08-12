@@ -1,8 +1,6 @@
 package message
 
 import (
-	"strings"
-
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
@@ -10,27 +8,30 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message/contentmode/structured"
 )
 
-const structuredContentType = "application/cloudevents+json"
-
 type Marshaler struct {
 	structured structured.Marshaler
 	binary     binary.Marshaler
 }
 
-// isStructured reports whether a content type selects CloudEvents structured
-// mode.
+// isStructured reports whether a content type selects the CloudEvents structured
+// envelope this package can write and read.
 //
-// The comparison ignores RFC 2045 parameters and case, because "media type" and
-// "the exact bytes some publisher sent" are not the same thing:
-// "application/cloudevents+json; charset=utf-8" is a legal spelling of structured
-// mode, and matching it byte-for-byte routes it to the BINARY unmarshaler, which
-// finds no cloudEvents:* headers and fails it as unprocessable — parking every
-// event from that publisher in the DLQ. Media types are case-insensitive per RFC
-// 2045 §5.1 for the same reason.
+// Dispatch goes through event.ParseContentType — the ONE definition of what a
+// content type means here — rather than a local comparison. A local one matched
+// "application/cloudevents+json" and its parameters, but not
+// "application/cloudevents;json", which the shared parser accepts and which the
+// publisher's own codec lookup resolves to JSON; such a delivery went to the BINARY
+// unmarshaler, found no cloudEvents:* headers, and was failed as unprocessable —
+// parking every event from that publisher in the DLQ.
+//
+// The subtype guard stays: the structured marshaler here implements only the JSON
+// envelope, so "application/cloudevents+proto" must keep falling through to binary
+// rather than be handed to a marshaler that would emit JSON under a proto content
+// type.
 func isStructured(contentType string) bool {
-	base, _, _ := strings.Cut(contentType, ";")
+	mode, subtype, ok := event.ParseContentType(contentType)
 
-	return strings.EqualFold(strings.TrimSpace(base), structuredContentType)
+	return ok && mode == event.StructuredMode && subtype == "json"
 }
 
 func (m Marshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, error) {

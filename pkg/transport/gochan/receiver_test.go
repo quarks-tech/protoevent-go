@@ -21,7 +21,7 @@ func TestReceiveReturnsOnCancelWhileIdle(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- tr.Receive(ctx, func(*event.Metadata, []byte) error { return nil })
+		done <- tr.Receive(ctx, func(context.Context, *event.Metadata, []byte) error { return nil })
 	}()
 
 	cancel()
@@ -61,7 +61,7 @@ func TestReceiveProcessesNothingAfterCancel(t *testing.T) {
 	cancel()
 
 	var processed int
-	err := tr.Receive(ctx, func(*event.Metadata, []byte) error {
+	err := tr.Receive(ctx, func(context.Context, *event.Metadata, []byte) error {
 		processed++
 
 		return nil
@@ -101,7 +101,7 @@ func TestReceiveDoesNotDropDequeuedMessages(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = tr.Receive(ctx, func(*event.Metadata, []byte) error {
+		_ = tr.Receive(ctx, func(context.Context, *event.Metadata, []byte) error {
 			processed++
 			cancel() // cancel mid-drain, racing the next dequeue
 			return nil
@@ -119,7 +119,7 @@ func TestReceiveDoesNotDropDequeuedMessages(t *testing.T) {
 	tr.Close(t.Context())
 
 	remaining := 0
-	if err := tr.Receive(t.Context(), func(*event.Metadata, []byte) error {
+	if err := tr.Receive(t.Context(), func(context.Context, *event.Metadata, []byte) error {
 		remaining++
 		return nil
 	}); err != nil {
@@ -145,7 +145,7 @@ func TestReceiveDeliversThenStopsOnClose(t *testing.T) {
 	tr.Close(ctx)
 
 	var got int
-	err := tr.Receive(ctx, func(*event.Metadata, []byte) error {
+	err := tr.Receive(ctx, func(context.Context, *event.Metadata, []byte) error {
 		got++
 		return nil
 	})
@@ -154,5 +154,49 @@ func TestReceiveDeliversThenStopsOnClose(t *testing.T) {
 	}
 	if got != 1 {
 		t.Fatalf("processed = %d, want 1", got)
+	}
+}
+
+// TestReceiveSurvivesProcessorError pins that a handler failure does not end the
+// subscription.
+//
+// Receive used to return the processor's error, which killed the whole subscriber
+// goroutine on the first unhandled event: every message still buffered, and
+// everything published afterwards, was silently never processed, while Send kept
+// succeeding until the buffer filled and publishers blocked forever. One bad event
+// is not a broken transport — and the failures are ordinary (a malformed event
+// type, an unknown subscription, a codec failure all reach the processor as
+// errors), so the documented contract ("until the channel is closed or ctx is
+// canceled") has to hold through them.
+func TestReceiveSurvivesProcessorError(t *testing.T) {
+	const total = 5
+
+	var failed []error
+	tr := gochan.New(gochan.WithErrorHandler(func(_ *event.Metadata, err error) {
+		failed = append(failed, err)
+	}))
+
+	md := event.NewMetadata("books.created")
+	for range total {
+		if err := tr.Send(t.Context(), md, []byte("x")); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+	}
+	tr.Close(t.Context())
+
+	var seen int
+	err := tr.Receive(t.Context(), func(context.Context, *event.Metadata, []byte) error {
+		seen++
+
+		return errors.New("handler failed")
+	})
+	if err != nil {
+		t.Fatalf("Receive() error = %v, want nil: a handler failure must not end the subscription", err)
+	}
+	if seen != total {
+		t.Fatalf("delivered = %d, want %d: delivery stopped at the first handler failure", seen, total)
+	}
+	if len(failed) != total {
+		t.Fatalf("error handler saw %d failures, want %d", len(failed), total)
 	}
 }

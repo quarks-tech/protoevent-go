@@ -43,11 +43,14 @@ type Metadata struct {
 // this writes.
 //
 // Field names match Metadata's exported names exactly, so the envelope keys are
-// unchanged from the plain-struct marshaling this replaces. DataSchema is decoded
-// through a json.RawMessage rather than a string because its VALUE shape did
-// change: rows persisted before this marshaler existed hold the url.URL struct.
-// Rejecting those would turn every one of them into a poison row and stop the
-// relay lane at it, so the decoder accepts both (see decodeDataSchema).
+// unchanged from the plain-struct marshaling this replaces.
+//
+// The shape is split in two because the read and write sides are not symmetric.
+// Writing always emits the URI as a plain string (metadataJSONOut). Reading has to
+// accept the legacy url.URL struct as well — rows persisted before this marshaler
+// existed hold it, and rejecting those would turn every one into a poison row and
+// stop the relay lane at it — so the decode shape takes a json.RawMessage and
+// decodeDataSchema sorts out which it is.
 type metadataJSON struct {
 	SpecVersion     string          `json:"SpecVersion"`
 	Type            string          `json:"Type"`
@@ -60,9 +63,25 @@ type metadataJSON struct {
 	DataContentType string          `json:"DataContentType"`
 }
 
+// metadataJSONOut is the write shape: identical keys and order, with DataSchema as
+// the string it always is on the way out. Encoding it directly saves marshaling the
+// URI into a json.RawMessage that the outer encoder then re-scans — per persisted
+// event, inside the caller's business transaction.
+type metadataJSONOut struct {
+	SpecVersion     string         `json:"SpecVersion"`
+	Type            string         `json:"Type"`
+	Source          string         `json:"Source"`
+	Subject         string         `json:"Subject"`
+	ID              string         `json:"ID"`
+	Time            time.Time      `json:"Time"`
+	Extensions      map[string]any `json:"Extensions"`
+	DataSchema      string         `json:"DataSchema,omitempty"`
+	DataContentType string         `json:"DataContentType"`
+}
+
 // MarshalJSON implements json.Marshaler. See metadataJSON.
 func (m Metadata) MarshalJSON() ([]byte, error) {
-	out := metadataJSON{
+	out := metadataJSONOut{
 		SpecVersion:     m.SpecVersion,
 		Type:            m.Type,
 		Source:          m.Source,
@@ -73,19 +92,25 @@ func (m Metadata) MarshalJSON() ([]byte, error) {
 		DataContentType: m.DataContentType,
 	}
 	if m.DataSchema != nil {
-		// Both checks reject rather than encode, and for the same reason: an outbox
-		// row is durable, so anything written here must be readable back. A value
-		// that is not is worse than a failed publish — it is a row that decodes to
-		// something different, or not at all, on every future read.
+		// An outbox row is durable, so anything written here must be readable back.
+		// A value that is not is worse than a failed publish — it is a row that
+		// decodes to something different, or not at all, on every future read.
 		uri := m.DataSchema.String()
 		switch uri {
 		case "":
-			// An empty URI decodes back to a NIL DataSchema, so the same event would
-			// carry a non-nil schema in-process and a nil one after crossing a store,
-			// and `if md.DataSchema != nil` would branch differently on the two
-			// sides. An empty URI reference is not a valid dataschema anyway — a
-			// &url.URL{} here is a caller mistake worth naming.
-			return nil, errors.New("event: DataSchema is non-nil but its URI is empty; leave it nil instead")
+			// OMITTED, not rejected. An empty URI carries no dataschema, and the
+			// decoder already maps both an absent attribute and an empty string to a
+			// nil DataSchema — so omitting it writes exactly what every future read
+			// reconstructs, which is all this marshaler owes the row.
+			//
+			// Rejecting is what this used to do, and the cost was out of all
+			// proportion to the mistake: `schema, _ := url.Parse(cfg.SchemaURL)` on an
+			// empty config value yields a NON-nil &url.URL{} (the standard Go
+			// footgun), and the store marshals metadata INSIDE the caller's business
+			// transaction — so a benign misconfiguration rolled back every request,
+			// on the outbox path only, while the identical event published fine over
+			// RabbitMQ. Publishers normalize this to nil up front (see
+			// eventbus.publish); this is the durable-path backstop.
 		default:
 			// url.URL.String() does not guarantee output that url.Parse accepts, nor
 			// output that is already canonical: a URL assembled field-by-field (or
@@ -108,11 +133,7 @@ func (m Metadata) MarshalJSON() ([]byte, error) {
 			uri = parsed.String()
 		}
 
-		schema, err := json.Marshal(uri)
-		if err != nil {
-			return nil, fmt.Errorf("event: marshal dataschema: %w", err)
-		}
-		out.DataSchema = schema
+		out.DataSchema = uri
 	}
 
 	b, err := json.Marshal(out)
@@ -213,10 +234,14 @@ var coreAttributeNames = map[string]struct{}{
 	"time":            {},
 }
 
-// binaryAttrPrefix is the namespace binary content mode gives core attributes
+// BinaryAttrPrefix is the namespace binary content mode gives core attributes
 // (RabbitMQ headers: "cloudEvents:id" and friends). Extensions travel un-prefixed,
 // so an extension using this prefix would land on a core attribute.
-const binaryAttrPrefix = "cloudEvents:"
+//
+// It is exported because the binary marshaler builds its header keys from it and
+// ReservedExtensionName rejects extensions that use it: one definition, so the
+// namespace a transport writes and the namespace publish defends cannot drift.
+const BinaryAttrPrefix = "cloudEvents:"
 
 // ReservedExtensionName reports whether name would collide with a core CloudEvents
 // attribute in some serialization, making it illegal as an extension name.
@@ -232,13 +257,54 @@ const binaryAttrPrefix = "cloudEvents:"
 //
 // CloudEvents forbids such names outright, so this is a publish-time contract check,
 // not a policy choice.
+//
+// The comparison is EXACT, not case-folded. Every serialization this repo emits is
+// case-sensitive — structured mode writes the extension's own key into the JSON
+// object, binary mode writes it as a bare AMQP header — so "Source" lands beside
+// "source" rather than on top of it and corrupts nothing. Case-folding here
+// rejected names that neither marshaler would have corrupted, and did it at the
+// worst possible moment: over an outbox, publish runs inside the caller's business
+// transaction, so an audit extension named "Type" failed every request.
 func ReservedExtensionName(name string) bool {
-	if strings.HasPrefix(name, binaryAttrPrefix) {
+	if strings.HasPrefix(name, BinaryAttrPrefix) {
 		return true
 	}
-	_, core := coreAttributeNames[strings.ToLower(name)]
+	_, core := coreAttributeNames[name]
 
 	return core
+}
+
+// ValidExtensionValue reports whether v is an extension value every transport here
+// can actually serialize, returning a descriptive error when it is not.
+//
+// The accepted set is the intersection of the CloudEvents extension-value types and
+// what an AMQP field table encodes: strings, booleans, the AMQP-representable
+// integer and float widths, binary, and timestamps. Structured mode would take
+// anything json.Marshal takes, but the mode is the CONSUMER's choice and the
+// publisher does not know it — and over an outbox the metadata is persisted and may
+// be relayed by a transport the publisher never saw.
+//
+// A nested value (map, struct, slice) is the case that matters: amqp091-go's field
+// encoder matches only the defined amqp.Table type, so a map[string]any extension
+// fails there, and it fails at SEND time — after the outbox row committed with the
+// caller's business transaction, as a non-DecodeError that no classifier claims. The
+// lane then stops on that row every tick forever. Rejecting the value at publish is
+// the cheap end of that, exactly as ReservedExtensionName is for names.
+func ValidExtensionValue(v any) error {
+	switch v.(type) {
+	case string, bool,
+		int, int8, int16, int32, int64,
+		uint8, uint16, uint32,
+		float32, float64,
+		[]byte, time.Time:
+		return nil
+	case nil:
+		return errors.New("value is nil; omit the extension instead")
+	default:
+		return fmt.Errorf("value of type %T is not a CloudEvents extension value "+
+			"(want a string, bool, integer, float, []byte or time.Time; nested maps, "+
+			"structs and slices cannot be carried in binary content mode)", v)
+	}
 }
 
 // NewMetadata returns a Metadata for event type t with SpecVersion pinned to

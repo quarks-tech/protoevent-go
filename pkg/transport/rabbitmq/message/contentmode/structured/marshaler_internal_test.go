@@ -35,6 +35,29 @@ func TestMarshalRejectsCoreAttributeCollision(t *testing.T) {
 	}
 }
 
+// TestMarshalRejectsBinaryPrefixExtension pins the UNION half of the name check: a
+// "cloudEvents:"-prefixed extension is rejected here too, even though this envelope
+// puts core attributes in the flat object un-prefixed and would survive it.
+//
+// A publisher does not choose the content mode its consumers use, and over an
+// outbox the metadata is persisted and may be relayed by a transport the publisher
+// never saw — so a name that is unsafe in EITHER mode has to fail in both, at
+// publish time. See event.ReservedExtensionName.
+func TestMarshalRejectsBinaryPrefixExtension(t *testing.T) {
+	for _, name := range []string{"cloudEvents:id", "cloudEvents:source", "cloudEvents:specversion"} {
+		t.Run(name, func(t *testing.T) {
+			md := event.NewMetadata("books.v1.BookCreated")
+			md.ID = "x"
+			md.Source = "/svc"
+			md.Extensions = map[string]any{name: "hijacked"}
+
+			if _, err := (Marshaler{}).Marshal(md, []byte(`{}`)); err == nil {
+				t.Fatalf("Marshal() error = nil for an extension named %q, want a reserved-name rejection", name)
+			}
+		})
+	}
+}
+
 // TestMarshalAcceptsNonCollidingExtensions pins that ordinary extensions still
 // pass through.
 func TestMarshalAcceptsNonCollidingExtensions(t *testing.T) {
@@ -99,7 +122,6 @@ func TestUnmarshalRejectsNonScalarAttributes(t *testing.T) {
 		"null id":     `{"specversion":"1.0","type":"t.E","id":null,"source":"/svc","data":{}}`,
 		"object id":   `{"specversion":"1.0","type":"t.E","id":{"a":1},"source":"/svc","data":{}}`,
 		"array id":    `{"specversion":"1.0","type":"t.E","id":[1,2],"source":"/svc","data":{}}`,
-		"empty id":    `{"specversion":"1.0","type":"t.E","id":"","source":"/svc","data":{}}`,
 		"missing id":  `{"specversion":"1.0","type":"t.E","source":"/svc","data":{}}`,
 		"object subj": `{"specversion":"1.0","type":"t.E","id":"x","source":"/svc","subject":{"a":1},"data":{}}`,
 	}
@@ -110,6 +132,30 @@ func TestUnmarshalRejectsNonScalarAttributes(t *testing.T) {
 				t.Fatal("Unmarshal() error = nil, want a rejection")
 			}
 		})
+	}
+}
+
+// TestUnmarshalAcceptsEmptyRequiredAttributes pins the OTHER side of that limit: a
+// present-but-empty required attribute is accepted, matching binary mode.
+//
+// Rejecting it (which this used to do) dead-lettered 100% of the traffic from any
+// publisher that writes every field unconditionally — generated serializers in
+// other languages do — from the moment the consumer was upgraded, with nothing
+// surfacing on the publisher side. binary/marshaler.go declined the same change
+// for the same reason, so rejecting here also made the two content modes disagree
+// about identical input.
+func TestUnmarshalAcceptsEmptyRequiredAttributes(t *testing.T) {
+	body := `{"specversion":"1.0","type":"t.E","id":"x","source":"","data":{}}`
+
+	md, _, err := Marshaler{}.Unmarshal(&amqp.Delivery{Body: []byte(body)})
+	if err != nil {
+		t.Fatalf("Unmarshal() error = %v, want an empty required attribute accepted", err)
+	}
+	if md.Source != "" {
+		t.Fatalf("Source = %q, want it carried through as empty", md.Source)
+	}
+	if md.ID != "x" {
+		t.Fatalf("ID = %q, want x", md.ID)
 	}
 }
 
