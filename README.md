@@ -329,8 +329,12 @@ the ID the publisher assigned. Pass
 #### Relay: TiDB (sequenced log)
 
 ```go
-r, err := sequence.NewRelay("broker-publish", tidb.NewRelayStore(db), rabbitSender,
-    sequence.WithRetention(7*24*time.Hour, 5*time.Minute, 5000),
+// The retention window is the store's (it applies store-wide); the relay owns
+// only how often the sweep runs.
+store := tidb.NewRelayStore(db, tidb.WithRetentionWindow(7*24*time.Hour))
+
+r, err := sequence.NewRelay("broker-publish", store, rabbitSender,
+    sequence.WithRetention(5*time.Minute, 5000),
 )
 if err != nil {
     log.Fatal(err)
@@ -344,12 +348,15 @@ if err := r.Run(ctx); err != nil {
 #### Relay: MongoDB (change-stream tail)
 
 ```go
-st := mongodb.NewStore(db)
-if err := st.EnsureIndexes(ctx); err != nil {
+// NewRelayStore, not NewStore: publishing is session-bound (the row commits with
+// the caller's business writes), while relay operations manage their own
+// transactions against the pool. Separate types keep the two from mixing.
+rs := mongodb.NewRelayStore(db)
+if err := rs.EnsureIndexes(ctx); err != nil {
     log.Fatal(err)
 }
 
-r, err := stream.NewRelay("broker-publish", st, rabbitSender,
+r, err := stream.NewRelay("broker-publish", rs, rabbitSender,
     stream.WithDrainWindow(time.Second),
     stream.WithLeaseTTL(15*time.Second),
 )
@@ -362,9 +369,13 @@ if err := r.Run(ctx); err != nil {
 }
 ```
 
-Both relays run leader election automatically when the store implements
+Both relays run leader election automatically over a store that implements
 `relay.LeaderStore` (both reference stores do), so multiple instances can run
-for failover with only one processing at a time. Delivery is at-least-once,
+for failover with only one processing at a time. A store that cannot elect is a
+construction error unless you pass `WithoutLeaderElection()`: an unelected relay
+running on several replicas delivers the whole log from every one of them, so
+single-instance mode has to be stated rather than inferred. Delivery is
+at-least-once,
 not exactly-once: consumers **must** dedup on the event's CloudEvents
 `Metadata.ID` (always the ID the publisher assigned; under the default
 `ReuseMetadataID` it also keys the outbox row) for effectively-once
