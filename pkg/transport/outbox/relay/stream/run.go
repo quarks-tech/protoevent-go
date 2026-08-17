@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
@@ -108,9 +109,19 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 		return nil
 	}
 	if r.stream == nil {
-		token, ct, err := r.store.LoadToken(ctx, r.name)
+		stored, storedCT, err := r.store.LoadToken(ctx, r.name)
 		if err != nil {
 			return err
+		}
+		// Kept apart from what we RESUME from, so neither variable has to mean two
+		// things: only a store-sourced token counts as "already persisted" below.
+		token, ct := stored, storedCT
+		if token == "" && r.baselineTok != "" {
+			// The store still has no row for this group, but this process already
+			// established a baseline that simply failed to persist. Resuming from it
+			// is what keeps the reopen from becoming a second, later "now" with the
+			// events in between dropped.
+			token, ct = r.baselineTok, r.baselineCT
 		}
 		s, err := r.store.Watch(ctx, token, r.options.DrainWindow)
 		if err != nil {
@@ -118,7 +129,11 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 		}
 		r.stream = s
 		r.committedCT = ct
-		r.lastSavedTok = token // the stored row already holds this position
+		// Only a token that came from the STORE may seed lastSavedTok: it is the
+		// "already persisted, skip the no-op save" marker, and seeding it with a
+		// baseline that failed to persist would suppress the very save that
+		// durably records the position.
+		r.lastSavedTok = stored
 		if token == "" {
 			// Fresh consumer group: establish a resume baseline from the stream's
 			// initial resume token BEFORE draining, so a first-window send failure
@@ -126,7 +141,20 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 			// point preceding the failed event instead of restarting at a fresh
 			// "now" and silently skipping it.
 			btok, bct, serverTime := r.stream.Checkpoint()
+			if btok == "" {
+				// Nothing resumable to anchor to: the driver has cached no token for
+				// this cursor yet. The window between here and the first persisted
+				// position is then unprotected, so say so rather than leaving the
+				// only silent path in this function.
+				r.options.Logger.Warn("stream relay: fresh consumer group has no resume baseline; "+
+					"a failure before the first persisted position will restart at a later "+
+					"\"now\" and skip the events in between",
+					"relay", r.name)
+			}
 			if btok != "" {
+				// Remembered BEFORE the save, because the save is exactly what may
+				// fail: a baseline kept only on success is no baseline at all.
+				r.baselineTok, r.baselineCT = btok, bct
 				if err := r.saveToken(ctx, btok, bct); err != nil {
 					return err
 				}
@@ -364,17 +392,33 @@ func (r *Relay) saveToken(ctx context.Context, tok string, ct time.Time) error {
 		// window whose position another writer had already moved past, so those
 		// events were very likely delivered twice. Silence made a split-brain
 		// leader look identical to a healthy one, since every other signal
-		// (OnDrained, leadership) reports success. Logged rather than returned:
-		// failing the pass would close and reopen the stream on a condition the
-		// next tick's TryAcquire resolves anyway.
+		// (OnDrained, leadership) reports success.
+		//
+		// Reported to BOTH the log and the Observer. Log-only was itself a
+		// telemetry hole: WithLogger explicitly permits a discarding logger, and a
+		// deployment that alarms on metrics could not see the one condition that
+		// says two leaders are draining the same stream. It is NOT returned as a
+		// pass error, because failing the pass would close and reopen the stream
+		// over a condition the next tick's TryAcquire resolves anyway.
 		r.options.Logger.Warn("stream relay: resume token rejected as stale; another writer holds a newer position",
 			"relay", r.name)
+		r.reporter.Error(fmt.Errorf("stream: resume token for group %q rejected as stale; another "+
+			"writer holds a newer position, so this window was very likely delivered twice "+
+			"(two leaders)", r.name))
 
 		return nil
 	}
 
 	r.lastSavedTok = tok
 	r.committedCT = ct
+	// The store now holds a position, so the in-memory fresh-group baseline has done
+	// its job and must stop being consulted. Keeping it would resurrect it whenever
+	// LoadToken later returns "" — which is exactly what the documented break-glass
+	// DeleteToken does, and what decommissioning a group does: the relay would reopen
+	// from a position of the previous incarnation instead of at "now", and if that
+	// position is the one that fell off the oplog, the recovery re-enters
+	// ErrHistoryLost forever.
+	r.baselineTok, r.baselineCT = "", time.Time{}
 
 	return nil
 }

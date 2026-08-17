@@ -43,6 +43,87 @@ func TestNewRelayRejectsOpTimeoutBelowDrainWindow(t *testing.T) {
 	}
 }
 
+// TestNewRelayRejectsOpTimeoutExceedingLease mirrors the sequence runtime's pin of
+// the same shared invariant (relaycfg Ops.Validate): the lease must be able to
+// contain the renewal cadence plus one store call, or a slow-but-successful call
+// returns onto an expired lease and the relay saves a token as a stale leader.
+func TestNewRelayRejectsOpTimeoutExceedingLease(t *testing.T) {
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	_, err := stream.NewRelay("c", &fakeStore{}, sender,
+		stream.WithLeaseTTL(15*time.Second), stream.WithOpTimeout(30*time.Second))
+	if err == nil || !strings.Contains(err.Error(), "OpTimeout") || !strings.Contains(err.Error(), "LeaseTTL") {
+		t.Fatalf("err = %v, want an error relating OpTimeout to LeaseTTL", err)
+	}
+}
+
+// TestFreshGroupBaselineSurvivesAFailedSave pins that a fresh consumer group does
+// not silently skip events when its resume BASELINE fails to persist.
+//
+// A fresh group (LoadToken == "") opens at "now" and immediately persists
+// Checkpoint() as its baseline, so a first-window failure that persists nothing
+// still has a position preceding the failed event to reopen from. That baseline is
+// a single best-effort save: when it fails — a replica-set election a millisecond
+// after the aggregate succeeded — RunOnce returns, Run closes the stream and
+// sleeps, and the next pass finds LoadToken == "" again and opens at a LATER
+// "now". Every event committed in between is never read, never parked, never
+// counted, and committedTokenAge stays 0 because committedCT is still zero, so the
+// resume-token-cliff alarm reads green while events are being dropped.
+//
+// The baseline the relay already holds in memory is enough to close this: reopen
+// from it rather than from a fresh "now".
+func TestFreshGroupBaselineSurvivesAFailedSave(t *testing.T) {
+	fs := &fakeStream{pbrt: "baseline-tok", pbrtCT: time.Unix(1000, 0).UTC()}
+	st := &fakeStore{
+		stream: fs,
+		// A brand-new group: nothing stored.
+		loadTok: "",
+		// The baseline save fails once, then the store recovers.
+		saveErr:      errors.New("not primary; election in progress"),
+		saveErrTimes: 1,
+	}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+
+	r := mustRelay(t, st, sender,
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithOpTimeout(500*time.Millisecond))
+
+	// Run, not RunOnce: it is Run that closes the stream after a failed pass and
+	// therefore Run that performs the REOPEN this test is about.
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	deadline := time.After(5 * time.Second)
+	for st.watchCountSnapshot() < 2 {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("only %d Watch call(s) after the failed baseline save; wanted the reopen",
+				st.watchCountSnapshot())
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	<-done
+
+	st.mu.Lock()
+	toks := slices.Clone(st.watchTokens)
+	st.mu.Unlock()
+
+	if len(toks) < 2 {
+		t.Fatalf("watch tokens = %q, want at least two Watch calls", toks)
+	}
+	if toks[0] != "" {
+		t.Fatalf("first Watch token = %q, want \"\" (a fresh group opens at now)", toks[0])
+	}
+	if toks[1] != "baseline-tok" {
+		t.Fatalf("second Watch token = %q, want %q: reopening at a fresh \"now\" silently drops "+
+			"every event committed since the first window", toks[1], "baseline-tok")
+	}
+}
+
 func TestNewRelayRejectsZeroOpTimeout(t *testing.T) {
 	// Zero would make every store call time out before it left the process.
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
@@ -52,19 +133,26 @@ func TestNewRelayRejectsZeroOpTimeout(t *testing.T) {
 	}
 }
 
-// TestOpTimeoutIsIndependentOfLeaseTTL pins the decoupling: a short lease is a
-// failover decision and must not shrink the store-call budget with it. Before
-// the split, LeaseTTL was the bound on every store operation, so halving the
-// lease halved every store deadline too.
-func TestOpTimeoutIsIndependentOfLeaseTTL(t *testing.T) {
+// TestStoreCallBudgetIsOpTimeoutNotLeaseTTL pins the decoupling: the store-call
+// budget is OpTimeout, not the lease. Before the split, LeaseTTL was the bound on
+// every store operation, so halving the lease halved every store deadline too.
+//
+// The knobs stay independent, but not unrelated: the lease must be able to CONTAIN
+// a pass, so DrainWindow + OpTimeout < LeaseTTL (see relaycfg Ops.Validate). This
+// test used to assert that a lease FAR SHORTER than the operation budget was
+// legal, which is precisely the stale-leader configuration — a 30s store call
+// inside a 2s lease returns onto an expired lease and commits anyway. What it
+// actually meant to pin is that within a valid pair the call still gets its full
+// OpTimeout rather than the lease, so it now says that.
+func TestStoreCallBudgetIsOpTimeoutNotLeaseTTL(t *testing.T) {
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 
 	store := &fakeStore{stream: &fakeStream{}}
 
 	r, err := stream.NewRelay("c", store, sender,
-		// A lease far shorter than the operation budget: legal, and the store
-		// call must still get its full OpTimeout.
-		stream.WithLeaseTTL(2*time.Second), stream.WithDrainWindow(500*time.Millisecond),
+		// A lease much LONGER than the operation budget: the store call must get
+		// its own 30s, not the 90s lease.
+		stream.WithLeaseTTL(90*time.Second), stream.WithDrainWindow(500*time.Millisecond),
 		stream.WithOpTimeout(30*time.Second), stream.WithoutLeaderElection())
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
@@ -78,9 +166,9 @@ func TestOpTimeoutIsIndependentOfLeaseTTL(t *testing.T) {
 	budget := store.loadBudget
 	store.mu.Unlock()
 
-	// Generous slack: the assertion is "the 30s budget, not the 2s lease".
-	if budget < 25*time.Second {
-		t.Fatalf("store call budget = %v, want ~30s (OpTimeout), not the 2s LeaseTTL", budget)
+	// Generous slack: the assertion is "the 30s budget, not the 90s lease".
+	if budget < 25*time.Second || budget > 60*time.Second {
+		t.Fatalf("store call budget = %v, want ~30s (OpTimeout), not the 90s LeaseTTL", budget)
 	}
 }
 
@@ -118,7 +206,8 @@ func TestNewRelayAcceptsValidWindow(t *testing.T) {
 	st := &fakeStore{}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	r, err := stream.NewRelay("c", st, sender,
-		stream.WithLeaseTTL(10*time.Second), stream.WithDrainWindow(1*time.Second))
+		stream.WithLeaseTTL(10*time.Second), stream.WithDrainWindow(1*time.Second),
+		stream.WithOpTimeout(5*time.Second))
 	if err != nil || r == nil {
 		t.Fatalf("NewRelay valid config: r=%v err=%v", r, err)
 	}
@@ -190,6 +279,7 @@ func (s *fakeStream) Next(context.Context) (*stream.Event, bool, error) {
 func (s *fakeStream) Checkpoint() (string, time.Time, bool) {
 	return s.pbrt, s.pbrtCT, !s.pbrtLocalClock
 }
+
 func (s *fakeStream) Close(ctx context.Context) error {
 	s.closeCount++
 	_, s.closeHadDeadline = ctx.Deadline()
@@ -215,6 +305,11 @@ type fakeStore struct {
 	watchErr    error
 	saveErr     error
 	denyPersist bool // SaveToken reports (false, nil): stale save skipped by the monotone guard
+
+	// saveErrTimes limits saveErr to the first N SaveToken calls (0 = every call),
+	// modeling a transient store failure. saveErrsSoFar is its counter.
+	saveErrTimes  int
+	saveErrsSoFar int
 
 	// Recorded by SaveToken, so tests can assert the final save on a shutdown
 	// path goes through a fresh bounded context (deadline set, not already
@@ -243,12 +338,17 @@ func (s *fakeStore) LoadToken(ctx context.Context, _ string) (string, time.Time,
 // real store: the next LoadToken reflects what was just persisted. With
 // denyPersist set it reports (false, nil) without storing anything — the
 // monotone guard's "stale save skipped" path.
-func (s *fakeStore) SaveToken(ctx context.Context, _ string, tok string, ct time.Time) (bool, error) {
+func (s *fakeStore) SaveToken(ctx context.Context, _, tok string, ct time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, s.saveHadDeadline = ctx.Deadline()
 	s.saveCtxErr = ctx.Err()
-	if s.saveErr != nil {
+	// saveErrTimes scopes saveErr to the first N calls, so a test can model a
+	// TRANSIENT save failure (a replica-set election) rather than a store that is
+	// broken forever. Zero means saveErr applies to every call, as before.
+	if s.saveErr != nil && (s.saveErrTimes == 0 || s.saveErrsSoFar < s.saveErrTimes) {
+		s.saveErrsSoFar++
+
 		return false, s.saveErr
 	}
 	s.saveCount++
@@ -259,6 +359,7 @@ func (s *fakeStore) SaveToken(ctx context.Context, _ string, tok string, ct time
 	s.loadTok, s.loadCT = tok, ct
 	return true, nil
 }
+
 func (s *fakeStore) Watch(_ context.Context, token string, maxAwait time.Duration) (stream.Stream, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -281,6 +382,7 @@ func (s *fakeStore) watchCountSnapshot() int {
 	defer s.mu.Unlock()
 	return s.watchCount
 }
+
 func (s *fakeStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, _ time.Duration) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -290,6 +392,7 @@ func (s *fakeStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, 
 	}
 	return false, nil
 }
+
 func (s *fakeStore) ReleaseLeaderLock(_ context.Context, _, holderID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -655,7 +758,8 @@ func TestWatchReceivesDrainWindowAsMaxAwait(t *testing.T) {
 	st := &fakeStore{stream: &fakeStream{}}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	r, err := stream.NewRelay("c", st, sender,
-		stream.WithDrainWindow(3*time.Second), stream.WithLeaseTTL(15*time.Second))
+		stream.WithDrainWindow(3*time.Second), stream.WithLeaseTTL(15*time.Second),
+		stream.WithOpTimeout(10*time.Second))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -750,7 +854,8 @@ func TestRunOnceNonLeaderIdles(t *testing.T) {
 	// returning, so keep this test fast (DrainWindow < LeaseTTL/2 guard still
 	// satisfied: 10ms < 500ms).
 	r := mustRelay(t, st, sender, stream.WithLeaderLockName("lock"),
-		stream.WithDrainWindow(10*time.Millisecond), stream.WithLeaseTTL(1*time.Second))
+		stream.WithDrainWindow(10*time.Millisecond), stream.WithLeaseTTL(1*time.Second),
+		stream.WithOpTimeout(500*time.Millisecond))
 	if err := r.RunOnce(t.Context()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -1101,6 +1206,7 @@ func TestPoisonParkFailureStopsLane(t *testing.T) {
 	parkAttempts := 0
 	r := mustRelay(t, st, sender,
 		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithOpTimeout(500*time.Millisecond),
 		stream.WithPoisonHandler(func(context.Context, *outbox.Message, error) error {
 			parkAttempts++
 			if parkAttempts == 1 {
@@ -1250,7 +1356,8 @@ func TestRunObservesOpLevelDeadlineExceededWhileCtxAlive(t *testing.T) {
 	obs := &signalingObserver{ch: make(chan struct{}, 1)}
 
 	r, err := stream.NewRelay("c", st, sender, stream.WithObserver(relay.Observer{OnError: obs.ObserveError}),
-		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(50*time.Millisecond))
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(50*time.Millisecond),
+		stream.WithOpTimeout(40*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -1452,7 +1559,8 @@ func TestLeaderDemotionClosesStreamAndReloadsToken(t *testing.T) {
 	st := &fakeStore{stream: fs}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	r := mustRelay(t, st, sender,
-		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second))
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithOpTimeout(500*time.Millisecond))
 
 	// Window 1: leader, delivers a+b, persists token "b".
 	if err := r.RunOnce(t.Context()); err != nil {
@@ -1496,7 +1604,8 @@ func TestCloseStreamErrorIsLoggedNotFatal(t *testing.T) {
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 	handler := &countingHandler{}
 	r := mustRelay(t, st, sender, stream.WithLogger(slog.New(handler)),
-		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second))
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithOpTimeout(500*time.Millisecond))
 
 	// Open the stream as leader, then get demoted: the demotion path closes
 	// the cursor, whose Close fails.
@@ -1628,7 +1737,8 @@ func TestWithLoggerReceivesTransientError(t *testing.T) {
 
 	r, err := stream.NewRelay("c", st, sender,
 		stream.WithObserver(relay.Observer{OnError: obs.ObserveError}), stream.WithLogger(slog.New(handler)),
-		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(50*time.Millisecond))
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(50*time.Millisecond),
+		stream.WithOpTimeout(40*time.Millisecond))
 	if err != nil {
 		t.Fatalf("NewRelay: %v", err)
 	}
@@ -1818,7 +1928,8 @@ func (s *ensuringStore) snapshotEnsure() int {
 func TestRunEnsuresTheStoresRetentionIndexes(t *testing.T) {
 	st := &ensuringStore{fakeStore: &fakeStore{stream: &fakeStream{}}}
 	r := mustRelay(t, st, senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil }),
-		stream.WithDrainWindow(time.Millisecond), stream.WithLeaseTTL(time.Second))
+		stream.WithDrainWindow(time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithOpTimeout(500*time.Millisecond))
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
@@ -1846,6 +1957,7 @@ func TestRunSurvivesAFailedEnsureIndexes(t *testing.T) {
 		delivered++
 		return nil
 	}), stream.WithDrainWindow(time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithOpTimeout(500*time.Millisecond),
 		stream.WithLogger(slog.New(handler)))
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -1931,5 +2043,129 @@ func TestUnsendableMetadataStopsTheLaneWithNoPoisonHandler(t *testing.T) {
 	}
 	if st.savedTok == "bad" {
 		t.Fatal("resume token advanced past an unparked event: it is now permanently skipped")
+	}
+}
+
+// TestBaselineIsDroppedOnceAPositionIsPersisted pins that the in-memory fresh-group
+// baseline stops being consulted the moment the store actually holds a position.
+//
+// The baseline exists to survive a FAILED first save. It is not cleared once a save
+// succeeds, and RunOnce consults it whenever LoadToken returns "" — so it also
+// resurrects itself in two situations where it is actively wrong:
+//
+//   - the documented break-glass DeleteToken (mongodb store: "the next Watch starts
+//     at now"). If the deleted token is the one that fell off the oplog, reopening
+//     from the stale baseline re-enters ErrHistoryLost forever and the documented
+//     recovery cannot work.
+//   - a decommissioned-then-revived group, which must start at "now" and instead
+//     rewinds to a position from the previous incarnation.
+//
+// Reachable whenever the same *Relay value outlives the store row: a supervisor
+// re-invoking Run, or a caller driving RunOnce directly (which ErrLaneStopped's
+// contract explicitly supports).
+func TestBaselineIsDroppedOnceAPositionIsPersisted(t *testing.T) {
+	// One event so a send failure stops the lane, which is what closes the stream and
+	// forces the reopen this test is about — no test-only API needed.
+	fs := &fakeStream{
+		events: []*stream.Event{ev("a")},
+		pbrt:   "baseline-tok", pbrtCT: time.Unix(1000, 0).UTC(),
+	}
+	st := &fakeStore{stream: fs, loadTok: ""}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+		return errors.New("broker down")
+	})
+
+	r := mustRelay(t, st, sender,
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithOpTimeout(500*time.Millisecond))
+
+	// Fresh group: takes the baseline, persists it, then the lane stops on the send
+	// failure and the stream is closed.
+	if err := r.RunOnce(t.Context()); !errors.Is(err, stream.ErrLaneStopped) {
+		t.Fatalf("first RunOnce = %v, want ErrLaneStopped", err)
+	}
+	st.mu.Lock()
+	saved := st.savedTok
+	st.mu.Unlock()
+	if saved != "baseline-tok" {
+		t.Fatalf("baseline was not persisted (savedTok=%q); this test assumes it was", saved)
+	}
+
+	// The operator runs the break-glass DeleteToken: the row is gone, and the
+	// documented contract is that the next Watch starts at "now".
+	st.mu.Lock()
+	st.loadTok = ""
+	st.mu.Unlock()
+
+	_ = r.RunOnce(t.Context())
+
+	st.mu.Lock()
+	toks := slices.Clone(st.watchTokens)
+	st.mu.Unlock()
+
+	last := toks[len(toks)-1]
+	if last != "" {
+		t.Fatalf("Watch token after DeleteToken = %q, want \"\" (start at now): the stale in-memory "+
+			"baseline outlived the position it was a fallback for, so the documented break-glass "+
+			"recovery reopens at the very token it was run to escape. watchTokens=%q", last, toks)
+	}
+}
+
+// TestStaleTokenSaveReachesTheObserver pins that the one in-band signal of a
+// split-brain leader is not log-only.
+//
+// SaveToken returning persisted=false means this relay delivered a window whose
+// position another writer had already moved past — i.e. those events were very likely
+// delivered twice by two leaders. Every other signal reports success: OnDrained
+// counts the sends, OnLeadership says leader, the pass returns nil. So a deployment
+// that scrapes metrics and ships logs elsewhere (or discards them, which WithLogger
+// explicitly permits) had no way to know a dual-leader episode happened at all.
+//
+// This is the same shape as the sweep hole: the condition IS detected, and the
+// detection reaches only a channel the alarm does not watch.
+func TestStaleTokenSaveReachesTheObserver(t *testing.T) {
+	fs := &fakeStream{events: []*stream.Event{ev("a"), ev("b")}}
+	st := &fakeStore{
+		stream: fs,
+		// An established group, so the fresh-group baseline path is not what is
+		// being exercised here.
+		loadTok: "existing-tok",
+		// The store's monotone guard rejects the save: a newer position is stored.
+		denyPersist: true,
+	}
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+
+	var observed []error
+	obs := relay.Observer{OnError: func(_ string, err error) {
+		observed = append(observed, err)
+	}}
+
+	r := mustRelay(t, st, sender,
+		stream.WithObserver(obs),
+		stream.WithDrainWindow(5*time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithOpTimeout(500*time.Millisecond))
+
+	// The pass itself must still succeed: the store's guard did its job, and failing
+	// the pass would close and reopen the stream over a condition the next
+	// TryAcquire resolves anyway.
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce = %v, want nil (a rejected stale save is not a pass failure)", err)
+	}
+
+	if len(observed) == 0 {
+		t.Fatal("a rejected stale resume-token save reported NOTHING to the Observer: a " +
+			"metrics-only deployment cannot tell a split-brain leader from a healthy one, " +
+			"because OnDrained, OnLeadership and the pass result all report success")
+	}
+	found := false
+	for _, err := range observed {
+		if strings.Contains(err.Error(), "stale") {
+			found = true
+
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Observer saw %v, want an error identifying the stale/rejected token save", observed)
 	}
 }

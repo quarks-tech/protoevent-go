@@ -2,6 +2,7 @@ package eventbus
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
@@ -37,6 +38,51 @@ func TestProcessUsesCallerContext(t *testing.T) {
 	}
 	if got != "from-transport" {
 		t.Fatalf("handler ctx value = %v, want the caller's context to reach the handler", got)
+	}
+}
+
+// TestProcessRecoversAPanickingHandler pins that a panicking handler cannot take
+// the consumer process down.
+//
+// Nothing in this library recovered a panic: `recover()` appeared only in tests. A
+// handler that panics on one malformed-but-well-typed payload therefore killed the
+// whole process, and — because the panic unwinds before any Ack/Reject — the
+// delivery was never acknowledged, so the broker redelivered it to the replacement
+// pod, which died the same way. One bad event became an unbounded crash loop that
+// takes every other subscription on the process with it.
+//
+// This is the same class of failure the malformed-event-type case below was
+// hardened against; the difference is that the panic comes from the CALLER's code,
+// where the library cannot prevent it and can only contain it. It is reported as an
+// unprocessable event because a panic is deterministic in the payload: retrying it
+// reproduces it, so the delivery belongs in the dead-letter/parking path, not back
+// on the queue.
+func TestProcessRecoversAPanickingHandler(t *testing.T) {
+	s := NewSubscriber("test")
+
+	sd := &ServiceDesc{ServiceName: "books.v1", Events: []EventDesc{{Name: "BookCreated"}}}
+	// The panic VALUE stands in for whatever the handler actually did — a nil map
+	// write, an out-of-range index, a nil dereference. Which one is irrelevant to
+	// the containment this test is about, and spelling one out literally is the kind
+	// of thing static analysis rightly refuses to let into a file.
+	s.RegisterHandler(sd, "BookCreated", func(context.Context, *event.Metadata, func(any) error, SubscriberInterceptor) error {
+		panic("assignment to entry in nil map")
+	})
+
+	md := event.NewMetadata("books.v1.BookCreated")
+	md.DataContentType = "application/protobuf"
+
+	err := s.process(t.Context(), md, []byte("data"))
+	if err == nil {
+		t.Fatal("process() = nil for a panicking handler, want an error")
+	}
+	if !IsUnprocessableEventError(err) {
+		t.Fatalf("process() = %v, want an unprocessable-event error: a panic is deterministic in "+
+			"the payload, so requeueing it reproduces the crash forever", err)
+	}
+	// The operator has to be able to find the handler that did it.
+	if !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("process() = %v, want the error to say it was a panic", err)
 	}
 }
 

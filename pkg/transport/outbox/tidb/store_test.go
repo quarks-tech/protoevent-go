@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -272,6 +273,103 @@ func TestConcurrentSequencersNoDuplicateNoGap(t *testing.T) {
 	if count != 200 || distinct != 200 || minSeq != 1 || maxSeq != 200 {
 		t.Fatalf("count=%d distinct=%d min=%d max=%d, want 200/200/1/200 (FOR UPDATE must serialize)",
 			count, distinct, minSeq, maxSeq)
+	}
+}
+
+// TestDuplicateSeqIsRejectedBySchema pins that the schema — not just the
+// sequencer's runtime discipline — enforces the invariant the whole sequenced log
+// rests on.
+//
+// The Sequencer contract asserts that passes serialize on the counter row FOR
+// UPDATE and "can never double-assign", but that is a property of the SESSION, not
+// of the table. When the counter and the data disagree, nothing stopped a second
+// row from taking a seq that was already used — and the failure mode is total,
+// permanent, silent loss: rows assigned a seq BELOW every consumer's committed
+// offset are never returned by `WHERE seq > ?`, and the retention sweep later
+// deletes them as fully consumed.
+//
+// The counter and the data disagree more easily than it sounds. This test
+// reproduces the migration path: 000001 seeds next_seq = 1 unconditionally, so a
+// down+up re-run against a retained outbox_messages does exactly this. Restoring
+// the small outbox_sequencers table from an older backup does too.
+//
+// With seq merely indexed the bad assignment succeeds. With it UNIQUE the UPDATE
+// aborts on ER_DUP_ENTRY, which SequenceMessages already surfaces as an error.
+func TestDuplicateSeqIsRejectedBySchema(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+	ctx := context.Background()
+	st := tidb.NewRelayStore(testDB)
+
+	publish(t, "s")
+	publish(t, "s")
+	if n, err := st.SequenceMessages(ctx, 10); err != nil || n != 2 {
+		t.Fatalf("SequenceMessages = (%d, %v), want (2, nil)", n, err)
+	}
+
+	// The counter is rewound while the data keeps its higher seqs — the state a
+	// down+up migration or a partial restore leaves behind.
+	if _, err := testDB.ExecContext(ctx,
+		"UPDATE outbox_sequencers SET next_seq = 1 WHERE name = 'default'"); err != nil {
+		t.Fatalf("rewinding the counter: %v", err)
+	}
+
+	publish(t, "s")
+	_, err := st.SequenceMessages(ctx, 10)
+	if err == nil {
+		var distinct, count int64
+		if qErr := testDB.QueryRowContext(ctx,
+			"SELECT COUNT(seq), COUNT(DISTINCT seq) FROM outbox_messages").Scan(&count, &distinct); qErr != nil {
+			t.Fatal(qErr)
+		}
+		t.Fatalf("SequenceMessages = nil error after the counter was rewound; seq count=%d distinct=%d. "+
+			"A duplicate seq below every committed offset is invisible to ListMessages and is swept "+
+			"as consumed: the schema must reject it, not the session alone", count, distinct)
+	}
+}
+
+// TestListMessagesNamesTheMissingParseTime pins that the single most likely
+// misconfiguration of this store reports its own cause.
+//
+// parseTime=true is REQUIRED — ListMessages scans create_time (DATETIME(6)) into a
+// time.Time — and with the driver default every relay page fails forever. The
+// failure appears nowhere near the mistake: publishing works fine, migrations work
+// fine, and the relay simply delivers nothing while emitting a driver error about
+// []uint8 and time.Time that says nothing about a DSN. Being a plain error rather
+// than a *DecodeError, it is also unparkable, so the lane wedges permanently.
+//
+// The store's doc comment already calls the parameter REQUIRED; the runtime has to
+// say so too.
+func TestListMessagesNamesTheMissingParseTime(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+	publish(t, "s")
+	if _, err := tidb.NewRelayStore(testDB).SequenceMessages(context.Background(), 10); err != nil {
+		t.Fatalf("SequenceMessages: %v", err)
+	}
+
+	// The same database, opened the way a caller who forgot the parameter would.
+	badDSN := strings.Replace(testDSN, "parseTime=true", "parseTime=false", 1)
+	if badDSN == testDSN {
+		t.Fatalf("test DSN %q does not contain parseTime=true; this test needs to remove it", testDSN)
+	}
+	db, err := sql.Open("mysql", badDSN)
+	if err != nil {
+		t.Fatalf("open without parseTime: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	_, err = tidb.NewRelayStore(db).ListMessages(context.Background(), 0, 10)
+	if err == nil {
+		t.Fatal("ListMessages succeeded without parseTime=true; this test assumes it cannot")
+	}
+	if !strings.Contains(err.Error(), "parseTime") {
+		t.Fatalf("ListMessages error = %v\nwant it to name parseTime: the raw driver error mentions "+
+			"only []uint8 and time.Time, so an operator cannot tell a DSN mistake from a data fault", err)
 	}
 }
 
@@ -855,5 +953,114 @@ func TestGenerateV4RelayedMetadataIDFidelity(t *testing.T) {
 	}
 	if msgs[0].ID == md.ID {
 		t.Fatalf("Message.ID = %s equals the published Metadata.ID; GenerateUUIDv4 must mint an independent row key", msgs[0].ID)
+	}
+}
+
+// TestSequencerPageIsBoundedByTheBatchNotTheBacklog pins that one sequencer pass
+// costs O(page), not O(pending backlog).
+//
+// This is the one place the house convention of "assert behavior, not plans" is set
+// aside, because the property IS a plan property and nothing observable distinguishes
+// the two shapes until a production backlog makes it an outage. The query's plan is
+// a TopN — which reads every row in the seq IS NULL range before returning the page —
+// unless BOTH of these hold: idx_outbox_seq_order carries id in its key (id is the
+// CLUSTERED handle, so a secondary index that does not name it cannot order by it),
+// and the query's ORDER BY leads with seq to match the index's first column. Either
+// one alone still yields the TopN, so a well-meaning simplification of either side
+// silently restores O(backlog).
+//
+// What that costs: a one-day relay outage at ~115 events/s leaves 10M pending rows,
+// so 10,000 passes each scanning up to 10M index entries, every one of them holding
+// the pessimistic counter-row lock that serializes all other consumer groups. Once a
+// pass exceeds OpTimeout the sequencer stops progressing at all, turning a
+// recoverable backlog into a permanent stall.
+//
+// Timing is deliberately NOT asserted (flaky); actRows is exact.
+func TestSequencerPageIsBoundedByTheBatchNotTheBacklog(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+	ctx := context.Background()
+
+	const (
+		backlog = 20000
+		page    = 1000
+	)
+
+	var b strings.Builder
+	b.WriteString("INSERT INTO outbox_messages (seq, tx_start_ts, event_id, metadata, data, create_time, occur_time) VALUES ")
+	for i := range backlog {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, "(NULL, %d, RANDOM_BYTES(16), '{\"Time\":\"2026-01-01T00:00:00Z\"}', 'x', NOW(6), NOW(6))", 1000+i)
+	}
+	if _, err := testDB.ExecContext(ctx, b.String()); err != nil {
+		t.Fatalf("seed backlog: %v", err)
+	}
+	if _, err := testDB.ExecContext(ctx, "ANALYZE TABLE outbox_messages"); err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	// Mirrors the inner page SELECT of assignSeq in store.go. Kept in sync by hand:
+	// the queries are built with fmt.Sprintf over table names and are unexported, so
+	// there is nothing to share. If this drifts from the store, this test stops
+	// guarding anything — which is why the assertion below names the store's query.
+	const pageQuery = `SELECT id, tx_start_ts FROM outbox_messages
+		WHERE seq IS NULL ORDER BY seq, tx_start_ts, id LIMIT ?`
+
+	rows, err := testDB.QueryContext(ctx, "EXPLAIN ANALYZE "+pageQuery, page)
+	if err != nil {
+		t.Fatalf("explain analyze: %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		scanned int
+		plan    strings.Builder
+		found   bool
+	)
+	for rows.Next() {
+		cells := make([][]byte, len(cols))
+		dest := make([]any, len(cols))
+		for i := range dest {
+			dest[i] = &cells[i]
+		}
+		if err := rows.Scan(dest...); err != nil {
+			t.Fatal(err)
+		}
+		id, actRows := string(cells[0]), string(cells[2])
+		fmt.Fprintf(&plan, "\n  %-36s actRows=%s", id, actRows)
+		if strings.Contains(id, "IndexRangeScan") {
+			n, convErr := strconv.Atoi(actRows)
+			if convErr != nil {
+				t.Fatalf("actRows %q for %s: %v", actRows, id, convErr)
+			}
+			scanned, found = n, true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatalf("no IndexRangeScan in the plan, so the page is not even index-served:%s", plan.String())
+	}
+
+	// Generous: the executor reads in batches, so it overshoots the page somewhat
+	// (measured 2048 for a 1000-row page). The point is that it does not approach
+	// the backlog.
+	const tolerated = 4 * page
+	if scanned > tolerated {
+		t.Fatalf("the sequencer page scanned %d index rows for a %d-row page against a %d-row "+
+			"backlog (tolerated %d):%s\n\nThis is the O(backlog) plan. Check that "+
+			"idx_outbox_seq_order is (seq, tx_start_ts, id) and that assignSeq's inner SELECT "+
+			"still orders by seq FIRST — either alone reintroduces the TopN.",
+			scanned, page, backlog, tolerated, plan.String())
 	}
 }

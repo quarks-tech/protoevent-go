@@ -2,11 +2,13 @@ package tidb_test
 
 import (
 	"context"
+	"database/sql"
 	"reflect"
 	"sync"
 	"testing"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/sequence"
 	tidb "github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb"
 )
@@ -231,4 +233,149 @@ func TestLatePublishGetsHigherSeq(t *testing.T) {
 	if lateSeq <= earlySeq {
 		t.Fatalf("late seq %d not > early seq %d", lateSeq, earlySeq)
 	}
+}
+
+// TestSameAggregateSeqFollowsBeginOrderNotCommitOrder pins what the sequenced log
+// actually orders by, using the case the design doc used to excuse.
+//
+// docs/design/outbox-sequenced-log.md disclaimed ordering only for "genuinely
+// concurrent transactions", and excused the dangerous case with: transactions that
+// matter to each other (same aggregate) "conflict on row locks, serialize, and fall
+// under the theorem" — where the theorem requires B to have STARTED after A
+// COMMITTED.
+//
+// That escape clause does not hold, and this test is the counterexample. Two
+// transactions here conflict on one row and do serialize on the lock, but their
+// lifetimes OVERLAP: A takes its start TSO first, B then takes the row lock and
+// commits, and only then does A write the same row and commit. seq follows
+// tx_start_ts (@@tidb_current_ts, allocated at BEGIN — see CreateOutboxMessage), so
+// A is delivered first while A is the last writer.
+//
+// Verified on TiDB v7.5.1: delivery order A,B with the database holding A, so a
+// last-write-wins replay reaches B and diverges from the source of truth
+// permanently. Nothing is duplicated, so event_id dedup cannot repair it.
+//
+// The guarantee this asserts is therefore the honest one — seq is ascending in
+// transaction-BEGIN order — and NOT "commit order". A consumer that needs
+// last-write-wins semantics per aggregate must carry its own version/revision in
+// the payload and reject stale writes; the log's order alone is not enough. Both
+// docs were corrected to say so.
+func TestSameAggregateSeqFollowsBeginOrderNotCommitOrder(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no TiDB")
+	}
+	truncate(t)
+	ctx := context.Background()
+
+	// A one-row business aggregate, in the same database as the outbox so both
+	// writes are in one transaction — the whole point of an outbox.
+	if _, err := testDB.ExecContext(ctx,
+		"CREATE TABLE IF NOT EXISTS causal_aggregate (k VARCHAR(16) PRIMARY KEY, v VARCHAR(16) NOT NULL)"); err != nil {
+		t.Fatalf("create aggregate table: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testDB.ExecContext(ctx, "DROP TABLE IF EXISTS causal_aggregate") })
+	if _, err := testDB.ExecContext(ctx,
+		"INSERT INTO causal_aggregate (k, v) VALUES ('k', 'init') ON DUPLICATE KEY UPDATE v = 'init'"); err != nil {
+		t.Fatalf("seed aggregate: %v", err)
+	}
+
+	// publishIn writes one event through the production Sender inside tx.
+	publishIn := func(tx *sql.Tx, value string) string {
+		md := newTestMetadata("causal-" + value)
+		if err := outbox.NewSender(tidb.NewStore(tx)).Send(ctx, md, []byte(value)); err != nil {
+			t.Fatalf("publish %s: %v", value, err)
+		}
+
+		return md.ID
+	}
+
+	txA, err := testDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin A: %v", err)
+	}
+	defer func() { _ = txA.Rollback() }()
+
+	// Materialize A's start TSO BEFORE B exists. This read takes no lock, so it
+	// makes A "older" without serializing anything.
+	var startA uint64
+	if err := txA.QueryRowContext(ctx, "SELECT @@tidb_current_ts").Scan(&startA); err != nil {
+		t.Fatalf("read A start ts: %v", err)
+	}
+
+	// B begins later, takes the row lock, writes 'B', publishes, and COMMITS FIRST.
+	txB, err := testDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin B: %v", err)
+	}
+	var startB uint64
+	if err := txB.QueryRowContext(ctx, "SELECT @@tidb_current_ts").Scan(&startB); err != nil {
+		t.Fatalf("read B start ts: %v", err)
+	}
+	if _, err := txB.ExecContext(ctx, "UPDATE causal_aggregate SET v = 'B' WHERE k = 'k'"); err != nil {
+		t.Fatalf("B update: %v", err)
+	}
+	idB := publishIn(txB, "B")
+	if err := txB.Commit(); err != nil {
+		t.Fatalf("commit B: %v", err)
+	}
+
+	// Now A writes the SAME row. It conflicts with B — the serialization the design
+	// doc relied on — and commits LAST, so the database's final value is A's.
+	if _, err := txA.ExecContext(ctx, "UPDATE causal_aggregate SET v = 'A' WHERE k = 'k'"); err != nil {
+		t.Fatalf("A update: %v", err)
+	}
+	idA := publishIn(txA, "A")
+	if err := txA.Commit(); err != nil {
+		t.Fatalf("commit A: %v", err)
+	}
+
+	if startA >= startB {
+		t.Fatalf("start TSOs did not order A before B (A=%d B=%d); this test is not exercising "+
+			"the overlap it claims", startA, startB)
+	}
+	var dbValue string
+	if err := testDB.QueryRowContext(ctx, "SELECT v FROM causal_aggregate WHERE k = 'k'").Scan(&dbValue); err != nil {
+		t.Fatalf("read aggregate: %v", err)
+	}
+	if dbValue != "A" {
+		t.Fatalf("database value = %q, want \"A\" (A must be the last writer); the intended "+
+			"interleaving did not happen", dbValue)
+	}
+
+	sender := &recordingSender{}
+	r, err := sequence.NewRelay("causal", tidb.NewRelayStore(testDB), sender,
+		sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	// THE guarantee: seq order is transaction-BEGIN order. A began first, so A is
+	// delivered first — even though A committed last.
+	if !reflect.DeepEqual(sender.ids, []string{idA, idB}) {
+		t.Fatalf("delivered %v, want [%s %s] — seq must be ascending in tx_start_ts "+
+			"(transaction-begin order)", sender.ids, idA, idB)
+	}
+
+	// And the consequence, asserted so it cannot quietly stop being true: begin order
+	// here is the REVERSE of commit order, so the naive last-write-wins replay
+	// disagrees with the database. This is the hazard consumers must design around.
+	value := map[string]string{idA: "A", idB: "B"}
+	replayed := ""
+	for _, id := range sender.ids {
+		if v, ok := value[id]; ok {
+			replayed = v
+		}
+	}
+	if replayed == dbValue {
+		t.Fatalf("a last-write-wins replay reached %q, matching the database — the begin/commit "+
+			"order inversion this test documents no longer reproduces. If TiDB now allocates "+
+			"start TSOs so that this cannot happen, the ordering caveats in "+
+			"docs/design/outbox-sequenced-log.md and README.md can be relaxed; verify before "+
+			"deleting this test", replayed)
+	}
+	t.Logf("documented hazard reproduced: delivery order %v (begin order) replays to %q while the "+
+		"database holds %q", sender.ids, replayed, dbValue)
 }

@@ -73,7 +73,7 @@ func (rs *RelayStore) Watch(ctx context.Context, token string, maxAwait time.Dur
 	}
 	// else: no resumeAfter → the stream starts at "now" (v1 StartNow).
 
-	cs, err := rs.db.Collection(rs.collMessages).Watch(ctx, pipeline, opts)
+	cs, err := rs.coll(rs.collMessages).Watch(ctx, pipeline, opts)
 	if err != nil {
 		// The server validates resumeAfter against the oplog AT AGGREGATE TIME,
 		// so the two most likely paths off the resume-token cliff — a relay

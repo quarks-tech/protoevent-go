@@ -394,3 +394,67 @@ func TestMarshalExtensionRejectionsAreUnsendable(t *testing.T) {
 		}
 	})
 }
+
+// TestUnmarshalDropsBrokerDeathBookkeeping pins that RabbitMQ's dead-lettering
+// bookkeeping never becomes part of the event.
+//
+// The filter here is TYPE-based: `x-death` is dropped only because it is a
+// []interface{} that ValidExtensionValue rejects. But the `x-first-death-*` family
+// are plain strings, so they sail through the very rule whose comment says these
+// "are transport-layer headers that were never part of the event".
+//
+// Promoting them is not cosmetic. `x-first-death-queue` is what the parking-lot
+// receiver's retry budget is keyed on: a forwarder that re-publishes an incoming
+// Metadata carries the ORIGINAL service's queue name into a durable outbox row, and
+// the downstream receiver then looks for that name in its own x-death entries,
+// never finds it, and applies no retry cap at all — the message loops through the
+// wait queue forever, re-running side effects, with no log line.
+//
+// No forgery is needed for this: consuming a once-dead-lettered event and
+// re-publishing its Metadata is the documented forward pattern.
+func TestUnmarshalDropsBrokerDeathBookkeeping(t *testing.T) {
+	d := &amqp.Delivery{
+		Type:        "svc.Event",
+		ContentType: "application/protobuf",
+		Headers: amqp.Table{
+			"cloudEvents:id":          "id-1",
+			"cloudEvents:source":      "svc",
+			"cloudEvents:specversion": "1.0",
+			"cloudEvents:time":        "2026-01-01T00:00:00Z",
+
+			// Broker bookkeeping. Every one of these is written by RabbitMQ, not by
+			// any publisher.
+			"x-death":                []any{amqp.Table{"queue": "q", "count": int64(3)}},
+			"x-first-death-queue":    "someone-elses-queue",
+			"x-first-death-exchange": "someone-elses.dlx",
+			"x-first-death-reason":   "rejected",
+			"x-last-death-queue":     "someone-elses-queue",
+			"x-last-death-exchange":  "someone-elses.dlx",
+			"x-last-death-reason":    "expired",
+
+			// A caller's own extension must be unaffected.
+			"tenant": "acme",
+		},
+	}
+
+	md, _, err := Marshaler{}.Unmarshal(d)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	for _, name := range []string{
+		"x-death",
+		"x-first-death-queue", "x-first-death-exchange", "x-first-death-reason",
+		"x-last-death-queue", "x-last-death-exchange", "x-last-death-reason",
+	} {
+		if v, ok := md.Extensions[name]; ok {
+			t.Errorf("extension %q = %#v was promoted into the event; broker dead-lettering "+
+				"bookkeeping must never become event data (re-publishing it forges another "+
+				"service's retry state and unbounds the parking-lot retry cap)", name, v)
+		}
+	}
+	if md.Extensions["tenant"] != "acme" {
+		t.Errorf("extension \"tenant\" = %#v, want \"acme\": the filter must not eat a caller's "+
+			"own extensions", md.Extensions["tenant"])
+	}
+}

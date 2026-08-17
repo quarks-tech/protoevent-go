@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"strconv"
-	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -17,6 +16,7 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/consume"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/publish"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
 )
 
@@ -114,13 +114,12 @@ type Receiver struct {
 	options      receiverOptions
 	consumerName string
 
-	// mu guards confirming, the set of pooled channels already switched into
-	// publisher-confirm mode. Confirm mode is per channel and lasts for the
-	// channel's life, so tracking it makes confirm.select a once-per-channel round
-	// trip instead of a once-per-park one. Deliveries are handled concurrently, and
-	// the pool hands out one channel per connection. Mirrors rabbitmq.Sender.
-	mu         sync.Mutex
-	confirming map[*amqp.Channel]struct{}
+	// confirms is the per-channel publisher-confirm bookkeeping for the park publish,
+	// shared with rabbitmq.Sender via internal/publish. This used to be a copy of that
+	// machinery, and the copy kept holding a mutex across the confirm-mode RPC long
+	// after the Sender stopped — a divergence that wedged the whole park path, which is
+	// the last-resort path for poison deliveries.
+	confirms *publish.Confirms
 }
 
 func NewReceiver(client *amqpx.Client, opts ...ReceiverOption) *Receiver {
@@ -131,44 +130,10 @@ func NewReceiver(client *amqpx.Client, opts ...ReceiverOption) *Receiver {
 	}
 
 	return &Receiver{
-		client:     client,
-		options:    options,
-		confirming: make(map[*amqp.Channel]struct{}),
+		client:   client,
+		options:  options,
+		confirms: publish.NewConfirms(),
 	}
-}
-
-// enableConfirms puts ch into publisher-confirm mode, once per channel.
-func (r *Receiver) enableConfirms(ch *amqp.Channel) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if _, ok := r.confirming[ch]; ok {
-		return nil
-	}
-
-	if err := ch.Confirm(false); err != nil {
-		return fmt.Errorf("enable publisher confirms: %w", err)
-	}
-
-	if r.confirming == nil {
-		// A Receiver built as a struct literal rather than through NewReceiver
-		// (tests do this) has no map; assigning into a nil one panics.
-		r.confirming = make(map[*amqp.Channel]struct{})
-	}
-
-	// Forget channels the pool has retired, so the set tracks the live pool
-	// instead of growing with every reconnect for the process lifetime. Swept on
-	// the miss path only: that is once per new channel, i.e. exactly as often as
-	// the set grows.
-	for c := range r.confirming {
-		if c.IsClosed() {
-			delete(r.confirming, c)
-		}
-	}
-
-	r.confirming[ch] = struct{}{}
-
-	return nil
 }
 
 func (r *Receiver) Setup(ctx context.Context, consumerName string, infos ...eventbus.ServiceInfo) error {
@@ -365,17 +330,34 @@ func (r *Receiver) putIntoParkingLot(ctx context.Context, conn *connpool.Conn, d
 	// precaution for ordinary publishes; losing a poison message is worse, not
 	// better.
 	//
-	// mandatory stays false. Detecting an unroutable park would need the return to
-	// be correlated to THIS publish, and the channel comes from a shared pool that
-	// handles deliveries concurrently, so a NotifyReturn listener cannot tell whose
-	// return it saw. A missing binding is a topology error that WithTopologySetup
-	// prevents; what confirms catch is the broker refusing the publish outright.
-	if err := r.enableConfirms(conn.Channel()); err != nil {
+	// mandatory is TRUE, and it has to be. Confirms alone do not cover an unroutable
+	// park: RabbitMQ acks a publish once the exchange has determined its routing set,
+	// including when that set is EMPTY. So with mandatory=false a park whose
+	// parkingLot binding was missing came back acked, the Ack below destroyed the
+	// original, and the message was gone from every queue with no error and no log —
+	// verified against a real broker.
+	//
+	// The previous justification ("a missing binding is a topology error that
+	// WithTopologySetup prevents") does not hold: Setup runs once per process, so any
+	// operator action or topology migration that removes the binding afterwards opens
+	// a window in which every poison message is silently annihilated. That was also
+	// reproduced.
+	//
+	// The old objection — that a shared pooled channel makes a NotifyReturn listener
+	// unable to tell whose return it saw — is answered by returnWatch: hold the
+	// channel for this publish/confirm pair, drain stale returns first, and read at
+	// most one after the confirm. Parks are poison-only and rare, so serializing them
+	// per channel costs nothing.
+	ch := conn.Channel()
+	if err := r.confirms.Enable(ch); err != nil {
 		return fmt.Errorf("put into parking lot: %w", err)
 	}
 
-	conf, err := conn.Channel().PublishWithDeferredConfirmWithContext(
-		pubCtx, r.options.dlxExchange, parkingLot, false, false, msg)
+	watch := r.confirms.Returns(ch)
+	defer watch.Lock()()
+
+	conf, err := ch.PublishWithDeferredConfirmWithContext(
+		pubCtx, r.options.dlxExchange, parkingLot, true, false, msg)
 	if err != nil {
 		return fmt.Errorf("put into parking lot: %w", err)
 	}
@@ -383,6 +365,18 @@ func (r *Receiver) putIntoParkingLot(ctx context.Context, conn *connpool.Conn, d
 	acked, err := conf.WaitContext(pubCtx)
 	if err != nil {
 		return fmt.Errorf("await parking-lot publisher confirm: %w", err)
+	}
+	// Checked after the confirm, which is the ordering that makes it attributable.
+	// Returning an error here means the original is NOT acked: consume.Run requeues
+	// it, so the delivery is retried and re-parked once the binding is back. That is
+	// the same choice the !acked branch below already makes, and it is the whole point
+	// — a poison message we cannot park must survive, not disappear.
+	if ret, ok := watch.Took(); ok {
+		return fmt.Errorf("parking-lot publish to exchange %q with routing key %q was returned as "+
+			"unroutable (%d %s): the parking-lot queue binding is missing, so the message cannot be "+
+			"parked; it is being requeued instead of acknowledged away. Restore the binding (or "+
+			"restart with WithTopologySetup so Setup re-declares it)",
+			r.options.dlxExchange, parkingLot, ret.ReplyCode, ret.ReplyText)
 	}
 	if !acked {
 		// A nack, or a channel exception that closed the channel with the publish
@@ -435,10 +429,24 @@ func (r *Receiver) hasExceededRetryCount(d *amqp.Delivery) bool {
 		return false
 	}
 
+	// maxSeen is the fallback budget for the case where NO entry matches
+	// firstDeathQueue. See the return below for why that case exists and why it
+	// cannot be allowed to mean "no cap".
+	var (
+		maxSeen  int64
+		anyCount bool
+	)
+
 	for _, i := range death {
 		t, ok := i.(amqp.Table)
 		if !ok {
 			continue
+		}
+
+		count, countOK := deathCount(t["count"])
+		if countOK {
+			anyCount = true
+			maxSeen = max(maxSeen, count)
 		}
 
 		// Compared as normalized strings, never with interface ==: AMQP longstr
@@ -447,8 +455,7 @@ func (r *Receiver) hasExceededRetryCount(d *amqp.Delivery) bool {
 		// with "comparing uncomparable type []uint8" — crashing the consumer on
 		// the retry path that is meant to be the safe one.
 		if queue, _ := consume.HeaderString(t["queue"]); queue == firstDeathQueue {
-			count, ok := deathCount(t["count"])
-			if !ok {
+			if !countOK {
 				if r.options.logger != nil {
 					r.options.logger.Errorf("parkinglot: unreadable x-death count %#v (%T) on delivery %q: "+
 						"retry budget cannot be evaluated, continuing to retry", t["count"], t["count"], d.MessageId)
@@ -459,6 +466,30 @@ func (r *Receiver) hasExceededRetryCount(d *amqp.Delivery) bool {
 
 			return count >= r.options.maxRetries
 		}
+	}
+
+	// No x-death entry names firstDeathQueue. This is NOT the absent-header
+	// fail-safe above: a value is present, it just describes some other consumer's
+	// dead-lettering. RabbitMQ writes x-first-death-* once and never updates them,
+	// so a service that consumes a once-dead-lettered event and re-publishes its
+	// metadata carries the original consumer's queue name onward — where it will
+	// never match. Returning false there made the retry cap silently unreachable and
+	// the delivery looped incoming -> DLX -> wait -> retry forever, re-running the
+	// handler's side effects on every lap with nothing logged.
+	//
+	// Fall back to the largest count any entry reports. That keeps the bias of the
+	// unreadable-count branch (a budget we cannot evaluate precisely should not park
+	// a healthy message early) while restoring a bound, because every lap through
+	// the wait queue increments some entry.
+	if anyCount {
+		if maxSeen >= r.options.maxRetries && r.options.logger != nil {
+			r.options.logger.Errorf("parkinglot: x-first-death-queue %q matches no x-death entry on "+
+				"delivery %q (it likely came from another consumer via a re-published event); "+
+				"parking on the highest observed retry count %d >= %d instead of retrying forever",
+				firstDeathQueue, d.MessageId, maxSeen, r.options.maxRetries)
+		}
+
+		return maxSeen >= r.options.maxRetries
 	}
 
 	return false

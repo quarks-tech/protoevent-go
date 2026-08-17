@@ -256,8 +256,22 @@ SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM %s`, offsets, messages),
 		// `ROW_NUMBER() OVER (...) ... LIMIT ?` ships the ENTIRE pending backlog
 		// to the root executor and fully sorts it on every pass — O(backlog) per
 		// pass, O(N²/batch) to recover from a long outage. With the inner LIMIT
-		// the TopN is pushed into TiKV and only the page reaches the root, where
-		// the window numbers just those rows.
+		// only the page reaches the root, where the window numbers just those rows.
+		//
+		// The inner ORDER BY LEADS WITH seq, and must: it is what lets the page be an
+		// index-ordered scan with the limit pushed down, instead of a TopN that reads
+		// every row in the seq IS NULL range. Ordering by seq first cannot change the
+		// result order, since the WHERE clause pins seq to a single value (NULL) — it
+		// exists purely to match the leading column of idx_outbox_seq_order
+		// (seq, tx_start_ts, id). Measured on TiDB v7.5.1 at a 20,000-row backlog:
+		// with it, IndexRangeScan actRows 2048 under a Limit; without it, actRows
+		// 20000 under a TopN. The migration explains the other half of the pair: why
+		// the index has to carry id in the key (id is the CLUSTERED handle, not an
+		// ordered suffix).
+		//
+		// The window keeps ORDER BY (tx_start_ts, id): that is the ASSIGNMENT order
+		// and is what the Sequencer contract specifies. It runs over the already-
+		// limited page, so its cost is bounded by the batch size.
 		assignSeq: fmt.Sprintf(`
 UPDATE %s o
 JOIN (
@@ -265,7 +279,7 @@ JOIN (
     FROM (
         SELECT id, tx_start_ts FROM %s
         WHERE seq IS NULL
-        ORDER BY tx_start_ts, id
+        ORDER BY seq, tx_start_ts, id
         LIMIT ?
     ) page
 ) b ON b.id = o.id
@@ -454,7 +468,7 @@ func (rs *RelayStore) ListMessages(ctx context.Context, afterSeq int64, limit in
 		)
 		var createTime time.Time
 		if err := rows.Scan(&seq, &eventID, &meta, &data, &createTime); err != nil {
-			return nil, fmt.Errorf("outbox: scan: %w", err)
+			return nil, fmt.Errorf("outbox: scan: %w%s", err, missingParseTimeHint(err))
 		}
 		id, err := uuid.FromBytes(eventID)
 		if err != nil {
@@ -577,6 +591,29 @@ func (rs *RelayStore) InitOffsetLatest(ctx context.Context, name string) (int64,
 		return 0, fmt.Errorf("outbox: init offset latest read back: %w", err)
 	}
 	return seq, nil
+}
+
+// missingParseTimeHint returns an actionable suffix for the one scan failure that
+// is a DSN mistake rather than a data fault.
+//
+// Worth special-casing because of how far the symptom sits from the cause: with the
+// driver default (parseTime=false) publishing works, migrations work, and only the
+// RELAY breaks — on every page, forever — with an error that names []uint8 and
+// time.Time and nothing else. It is also not a *DecodeError, so no PoisonHandler
+// can park past it and the lane stays wedged at the same offset for the group's
+// lifetime. The parameter is documented as REQUIRED on NewRelayStore; a store that
+// only says so in a doc comment leaves the operator to guess.
+func missingParseTimeHint(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if !strings.Contains(s, "[]uint8") || !strings.Contains(s, "time.Time") {
+		return ""
+	}
+
+	return " (this store REQUIRES parseTime=true in the DSN: create_time is a DATETIME(6) " +
+		"scanned into a time.Time, so every relay page fails this way until the parameter is added)"
 }
 
 // isDuplicateKey reports whether err is MySQL/TiDB ER_DUP_ENTRY (1062).

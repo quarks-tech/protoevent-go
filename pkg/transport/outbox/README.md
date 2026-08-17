@@ -375,11 +375,26 @@ stops being delivered indefinitely. Two mechanisms address it:
   and the lane advances past it. Everything `f` does not claim keeps stopping the
   lane. Errors are broker-specific, so there is no safe default; a classifier that
   claims transient errors bulk-diverts the backlog to the DLQ during an outage.
-- Regardless of configuration, a lane stopped at one position for more than 15
-  minutes escalates **once per episode** to a `relay.StuckLaneError` on `OnError`
-  (plus an `Error` log naming the position and the remedy), so an alert can tell a
-  bad minute from a wedge that needs a human. Every stop path reports it: a send
-  failure, an unsendable message whose park failed, an unconfirmed poison park.
+- A lane stopped at one position for more than 15 minutes escalates **once per
+  episode** to a `relay.StuckLaneError` on `OnError` (plus an `Error` log naming the
+  position and the remedy), so an alert can tell a bad minute from a wedge that needs
+  a human. Every stop path reports it: a send failure, an unsendable message whose
+  park failed, an unconfirmed poison park, and a page the store cannot read at all.
+
+  **The 15-minute clock is per PROCESS, not per position.** It lives in memory on the
+  `Relay` value, so a relay that restarts more often than the threshold never reaches
+  it: a `CrashLoopBackoff`, HPA churn, or a rolling node drain on a period shorter
+  than 15 minutes silently disables this alarm while the log stays wedged. (Verified:
+  six restart generations across 60 minutes of continuous wedge produced zero
+  escalations. Leadership merely *alternating* between long-lived replicas does still
+  escalate, just later than 15 minutes, because a demoted replica's clock keeps
+  running.)
+
+  So do not make `StuckLaneError` your only wedge alarm. Pair it with a signal derived
+  from the store rather than from process memory: `OnDrained`'s `oldestAge` for the
+  sequenced-log runtime (it keeps climbing while a lane is stopped, because a stopped
+  page still reports), or committed-token age for the change-stream runtime. Those
+  survive restarts; the escalation is the convenience, not the guarantee.
 
 ## Ordering guarantee
 

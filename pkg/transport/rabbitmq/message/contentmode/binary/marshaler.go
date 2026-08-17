@@ -217,6 +217,9 @@ func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 		if strings.HasPrefix(k, event.BinaryAttrPrefix) || event.ReservedExtensionName(k) {
 			continue
 		}
+		if brokerDeathHeader(k) {
+			continue
+		}
 		if err := event.ValidExtensionValue(v); err != nil {
 			continue
 		}
@@ -228,4 +231,27 @@ func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 	}
 
 	return md, nil
+}
+
+// brokerDeathHeader reports whether k is RabbitMQ's dead-lettering bookkeeping,
+// which is written by the broker and is never part of the event.
+//
+// Matched by NAME, not by value type. The type check below this call already drops
+// `x-death` — but only incidentally, because it is a []interface{} that
+// ValidExtensionValue refuses. The `x-first-death-*` and `x-last-death-*` family are
+// plain strings and sailed straight through, which made the type check a filter that
+// only appeared to do what its comment said.
+//
+// Letting them through is not cosmetic. `x-first-death-queue` is the key the
+// parking-lot receiver's retry budget is evaluated against
+// (parkinglot.Receiver.hasExceededRetryCount): once promoted into Metadata.Extensions
+// it is persisted by an outbox and re-emitted as a header, so a downstream receiver
+// looks for ANOTHER service's queue name among its own x-death entries, never finds
+// it, and applies no cap — the delivery loops through the wait queue indefinitely,
+// re-running side effects. Re-publishing an incoming Metadata is the documented
+// forward pattern, so this needs no malice to happen.
+func brokerDeathHeader(k string) bool {
+	return k == "x-death" ||
+		strings.HasPrefix(k, "x-first-death-") ||
+		strings.HasPrefix(k, "x-last-death-")
 }

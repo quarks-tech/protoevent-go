@@ -19,6 +19,78 @@ func validMetadata() *event.Metadata {
 	return md
 }
 
+// TestEnvelopeRoundTripLosesLargeIntegerExtensions is the evidence for the
+// validation rule above: it demonstrates the corruption on the real
+// Marshal/Unmarshal pair rather than asserting it from the JSON spec.
+//
+// event.ValidExtensionValue deliberately accepts int64 at ANY magnitude, and it is
+// right to: the AMQP encoder writes int64 as a 64-bit field ('l'), so nothing is
+// lost on the wire it was calibrated for. The outbox envelope is a NARROWER
+// channel — encoding/json unmarshals every JSON number into float64, whose mantissa
+// is 53 bits — so the same value that survives a direct publish is durably
+// corrupted by a round trip through an outbox row. That asymmetry is why the
+// rejection belongs here and not in pkg/event.
+func TestEnvelopeRoundTripLosesLargeIntegerExtensions(t *testing.T) {
+	const beyondFloat64 = int64(1)<<53 + 1
+
+	md := validMetadata()
+	md.Extensions = map[string]any{"account": beyondFloat64}
+
+	b, err := outbox.MarshalMetadata(md)
+	if err != nil {
+		t.Fatalf("MarshalMetadata: %v", err)
+	}
+	got, err := outbox.UnmarshalMetadata(b)
+	if err != nil {
+		t.Fatalf("UnmarshalMetadata: %v", err)
+	}
+
+	// Not merely a type change: the VALUE differs. int64(1)<<53+1 has no float64
+	// representation, so it comes back as int64(1)<<53 — off by one, silently, in
+	// a durable row.
+	back, ok := got.Extensions["account"].(float64)
+	if !ok {
+		t.Fatalf("extension came back as %T; this test is documenting the float64 round trip",
+			got.Extensions["account"])
+	}
+	if int64(back) == beyondFloat64 {
+		t.Fatalf("int64(%d) survived the envelope round trip; if the encoding now preserves "+
+			"exact integers, the ValidateMetadata rejection above is obsolete and should go", beyondFloat64)
+	}
+}
+
+// TestEnvelopeRoundTripCoercesBinaryAndTimestampExtensions pins the two coercions
+// that are NOT corruption, so they are a known property rather than an accident.
+//
+// []byte and time.Time are legal CloudEvents extension types and their VALUES
+// survive (base64, RFC3339). Only the Go type changes on the way back, which
+// matters solely to a caller that type-asserts. They are therefore documented
+// rather than rejected — rejecting them would drop two legitimate CloudEvents
+// types for a fidelity issue that loses no data.
+func TestEnvelopeRoundTripCoercesBinaryAndTimestampExtensions(t *testing.T) {
+	stamp := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
+
+	md := validMetadata()
+	md.Extensions = map[string]any{"blob": []byte("hi"), "seen": stamp}
+
+	b, err := outbox.MarshalMetadata(md)
+	if err != nil {
+		t.Fatalf("MarshalMetadata: %v", err)
+	}
+	got, err := outbox.UnmarshalMetadata(b)
+	if err != nil {
+		t.Fatalf("UnmarshalMetadata: %v", err)
+	}
+
+	if blob, ok := got.Extensions["blob"].(string); !ok || blob != "aGk=" {
+		t.Fatalf(`extension "blob" = %#v, want the base64 string "aGk="`, got.Extensions["blob"])
+	}
+	if seen, ok := got.Extensions["seen"].(string); !ok || seen != stamp.Format(time.RFC3339Nano) {
+		t.Fatalf(`extension "seen" = %#v, want the RFC3339 string %q`,
+			got.Extensions["seen"], stamp.Format(time.RFC3339Nano))
+	}
+}
+
 // TestValidateMetadataEnforcesTheSendableShape pins the write-side rules that
 // keep a row the relay can neither send nor classify out of the store.
 //
@@ -68,6 +140,20 @@ func TestValidateMetadataEnforcesTheSendableShape(t *testing.T) {
 		{
 			name:   "ordinary extension is untouched",
 			mutate: func(md *event.Metadata) { md.Extensions = map[string]any{"tenant": "acme"} },
+		},
+		{
+			name:    "int64 extension beyond JSON's exact-integer range",
+			mutate:  func(md *event.Metadata) { md.Extensions = map[string]any{"account": int64(1)<<53 + 1} },
+			wantErr: "cannot survive the outbox envelope",
+		},
+		{
+			name:    "negative int64 extension beyond JSON's exact-integer range",
+			mutate:  func(md *event.Metadata) { md.Extensions = map[string]any{"account": -(int64(1)<<53 + 1)} },
+			wantErr: "cannot survive the outbox envelope",
+		},
+		{
+			name:   "int64 extension inside JSON's exact-integer range passes",
+			mutate: func(md *event.Metadata) { md.Extensions = map[string]any{"account": int64(1) << 53} },
 		},
 	}
 

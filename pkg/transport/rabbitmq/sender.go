@@ -2,8 +2,8 @@ package rabbitmq
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
@@ -12,6 +12,7 @@ import (
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/publish"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/message"
 )
 
@@ -48,10 +49,42 @@ func WithoutPublisherConfirms() SenderOption {
 	}
 }
 
+// WithMandatoryPublish makes Send fail when the exchange routed the message to NO
+// queue, instead of reporting success.
+//
+// Publisher confirms do NOT cover this. RabbitMQ acks a publish once the exchange
+// has determined the routing set, INCLUDING when that set is empty, so with
+// confirms alone Send returns nil for a message no queue ever received. For an
+// outbox relay that answer is what authorizes committing the offset (or persisting
+// the resume token) past the event, so the event is gone and OnDrained counts it as
+// sent. basic.return, which requires the mandatory flag, is the only signal.
+//
+// Off by default, because in pub/sub an exchange with no matching binding is
+// normally a topic nobody subscribes to yet, not a failure — and with this option a
+// publish to such a topic becomes an error, which for a relay means the lane stops
+// and retries that event until a binding exists. That is the right trade when every
+// event has a known consumer and losing one is unacceptable (the outbox case), and
+// the wrong one for genuinely optional fan-out.
+//
+// Turn it on if any of these can happen to you: an event type published before its
+// consumer's binding exists, a binding dropped during a topology migration, or a
+// routing-key typo. Each of those loses events silently by default.
+//
+// Requires publisher confirms (the default): detecting the return needs the ack to
+// order against. With WithoutPublisherConfirms it is rejected at construction, since
+// there is nothing to correlate against and the combination would silently do
+// nothing.
+func WithMandatoryPublish() SenderOption {
+	return func(opts *senderOptions) {
+		opts.mandatory = true
+	}
+}
+
 type senderOptions struct {
 	deliveryMode uint8
 	marshaler    Marshaler
 	confirms     bool
+	mandatory    bool
 }
 
 func defaultSenderOptions() senderOptions {
@@ -72,13 +105,10 @@ type Sender struct {
 	client  commandProcessor
 	options senderOptions
 
-	// mu guards confirming, the set of pooled channels already switched into
-	// publisher-confirm mode. Confirm mode is per channel and survives for the
-	// channel's life, so tracking it turns confirm.select into a once-per-channel
-	// round trip instead of a once-per-publish one. Send runs concurrently, and
-	// the pool hands out one channel per connection.
-	mu         sync.Mutex
-	confirming map[*amqp.Channel]struct{}
+	// confirms is the per-channel publisher-confirm bookkeeping, shared with the
+	// parking-lot receiver via internal/publish. It used to be a copy of that
+	// machinery in each file, and the copies diverged.
+	confirms *publish.Confirms
 }
 
 func NewSender(client *amqpx.Client, opts ...SenderOption) *Sender {
@@ -89,48 +119,38 @@ func NewSender(client *amqpx.Client, opts ...SenderOption) *Sender {
 	}
 
 	return &Sender{
-		client:     client,
-		options:    options,
-		confirming: make(map[*amqp.Channel]struct{}),
+		client:   client,
+		options:  options,
+		confirms: publish.NewConfirms(),
 	}
 }
 
-// enableConfirms puts ch into publisher-confirm mode, once per channel.
-func (s *Sender) enableConfirms(ch *amqp.Channel) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// ErrUnroutable reports a publish the exchange routed to no queue at all. Returned
+// only under WithMandatoryPublish; by default such a publish is acked by the broker
+// and reported as success. See that option for why it is off by default.
+var ErrUnroutable = errors.New("rabbitmq: publish was not routed to any queue")
 
-	if _, ok := s.confirming[ch]; ok {
-		return nil
-	}
-
-	if err := ch.Confirm(false); err != nil {
-		return fmt.Errorf("enable publisher confirms: %w", err)
-	}
-
-	// Forget channels the pool has retired, so the set tracks the live pool
-	// instead of growing with every reconnect for the process lifetime. Swept on
-	// the miss path only: that is once per new channel, i.e. exactly as often as
-	// the set grows.
-	for c := range s.confirming {
-		if c.IsClosed() {
-			delete(s.confirming, c)
-		}
-	}
-
-	s.confirming[ch] = struct{}{}
-
-	return nil
-}
-
+// Setup declares the service's exchange.
+//
+// It is also where an incoherent option pair is reported. WithMandatoryPublish needs
+// the confirm ack to order the basic.return against (see returnWatch), so with
+// WithoutPublisherConfirms it could detect nothing — and an option that silently
+// detects nothing is worse than no option, because it reads as protection.
 func (s *Sender) Setup(ctx context.Context, desc *eventbus.ServiceDesc) error {
-	return s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
+	if s.options.mandatory && !s.options.confirms {
+		return errors.New("rabbitmq: WithMandatoryPublish requires publisher confirms: an " +
+			"unroutable publish is detected by correlating basic.return with the publish's " +
+			"confirm, so with WithoutPublisherConfirms nothing would be detected; drop one of " +
+			"the two options")
+	}
+
+	return poolExhaustionHint(s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
 		if err := conn.Channel().ExchangeDeclare(desc.ServiceName, amqp.ExchangeTopic, true, false, false, false, nil); err != nil {
 			return fmt.Errorf("declare exchange %q: %w", desc.ServiceName, err)
 		}
 
 		return nil
-	})
+	}))
 }
 
 func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) error {
@@ -154,7 +174,7 @@ func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) er
 		return err
 	}
 
-	return s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
+	return poolExhaustionHint(s.client.Process(ctx, func(ctx context.Context, conn *connpool.Conn) error {
 		// Nothing below is worth a broker round trip on a dead context, and the
 		// confirm-mode handshake would take one before the publish ever refused.
 		if err := ctx.Err(); err != nil {
@@ -180,15 +200,26 @@ func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) er
 		// the resume token) past the event, so the event is dropped and swept while
 		// Observer.OnDrained counts it as sent.
 		//
-		// mandatory stays false, deliberately: in pub/sub an exchange with no
-		// matching binding is a topic nobody subscribes to, not a failure. What is
-		// being caught here is the broker refusing the publish, not the absence of
-		// consumers.
-		if err := s.enableConfirms(ch); err != nil {
+		// mandatory is off unless WithMandatoryPublish: in pub/sub an exchange with no
+		// matching binding is normally a topic nobody subscribes to, not a failure.
+		// But confirms do NOT cover that case — RabbitMQ acks a publish whose routing
+		// set is EMPTY — so by default an event no queue received is reported as
+		// delivered, and a relay commits its position past it. See
+		// WithMandatoryPublish for when that trade is the wrong one.
+		if err := s.confirms.Enable(ch); err != nil {
 			return err
 		}
 
-		conf, err := ch.PublishWithDeferredConfirmWithContext(ctx, exchange, routingKey, false, false, mess)
+		// Under mandatory publishing, hold this channel for the publish/confirm pair:
+		// a basic.return names no publish, so attributing one needs a single publish
+		// in flight on the channel (see returnWatch).
+		var watch *publish.Watch
+		if s.options.mandatory {
+			watch = s.confirms.Returns(ch)
+			defer watch.Lock()()
+		}
+
+		conf, err := ch.PublishWithDeferredConfirmWithContext(ctx, exchange, routingKey, s.options.mandatory, false, mess)
 		if err != nil {
 			return fmt.Errorf("publish to exchange %q: %w", exchange, err)
 		}
@@ -196,6 +227,14 @@ func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) er
 		acked, err := conf.WaitContext(ctx)
 		if err != nil {
 			return fmt.Errorf("await publisher confirm from exchange %q: %w", exchange, err)
+		}
+		// Checked after the ack, which is the ordering that makes it attributable:
+		// the broker sends basic.return before the ack for the same publish.
+		if watch != nil {
+			if ret, ok := watch.Took(); ok {
+				return fmt.Errorf("%w: exchange %q, routing key %q (%d %s)",
+					ErrUnroutable, exchange, routingKey, ret.ReplyCode, ret.ReplyText)
+			}
 		}
 		if !acked {
 			// A nack, or a channel exception that closed the channel with the
@@ -207,5 +246,35 @@ func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) er
 		}
 
 		return nil
-	})
+	}))
+}
+
+// poolExhaustionHint annotates connection-pool exhaustion with the cause the raw
+// error cannot name.
+//
+// amqpx reports it as "connection pool timeout", which reads like broker trouble. The
+// overwhelmingly common cause is neither the broker nor load: a running subscription
+// holds one pool connection EXCLUSIVELY for its entire life (Receive ->
+// ConsumeWithDrain -> ProcessWithDrain -> withConn), and PoolSize defaults to
+// runtime.GOMAXPROCS(0), which on Go 1.25+ is cgroup-aware. So a 1-CPU pod gets a pool
+// of one, and a service that subscribes and publishes through a single client starves
+// every one of its own publishes, permanently — the exact shape this library's own
+// examples show. Two subscriptions need PoolSize >= 3 before a publish can succeed.
+//
+// It cannot be caught at construction: amqpx.Client exposes no way to read PoolSize
+// (its exported surface is Process, ProcessWithDrain and Close). Naming the cause in
+// the error is the only place this library can intervene, so it does.
+//
+// The sentinel is preserved for errors.Is, and any other error passes through
+// untouched.
+func poolExhaustionHint(err error) error {
+	if err == nil || !errors.Is(err, connpool.ErrPoolTimeout) {
+		return err
+	}
+
+	return fmt.Errorf("%w: every connection in the amqpx pool is busy. A running subscription holds "+
+		"one pool connection for as long as it runs, and PoolSize defaults to GOMAXPROCS "+
+		"(cgroup-aware, so a 1-CPU pod gets 1) — a service that subscribes and publishes through "+
+		"ONE client therefore starves its own publishes. Set PoolSize >= subscriptions+1, or give "+
+		"the publisher its own amqpx.Client", err)
 }

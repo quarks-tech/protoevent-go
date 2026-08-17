@@ -425,7 +425,7 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	if err := options.Lease.Validate("sequence", name, "PollInterval", options.PollInterval); err != nil {
 		return nil, err
 	}
-	if err := options.Ops.Validate("sequence", "PollInterval", options.PollInterval); err != nil {
+	if err := options.Ops.Validate("sequence", "PollInterval", options.PollInterval, options.LeaseTTL); err != nil {
 		return nil, err
 	}
 	if err := options.Hooks.Validate("sequence"); err != nil {
@@ -462,6 +462,9 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 			Poison:     options.PoisonHandler,
 			Unsendable: options.Unsendable,
 			Label:      stuckLabel,
+			// A send is bounded by the same budget as a store call: both are a
+			// remote peer that can hold the connection open and never answer.
+			SendTimeout: options.OpTimeout,
 			// Identified is nil: every seq identifies its row.
 		},
 	}

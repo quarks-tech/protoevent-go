@@ -13,8 +13,6 @@ func TestMigrationsEmbedded(t *testing.T) {
 	if err := fstest.TestFS(tidb.Migrations,
 		"migrations/000001_create_outbox.up.sql",
 		"migrations/000001_create_outbox.down.sql",
-		"migrations/000002_add_create_time_index.up.sql",
-		"migrations/000002_add_create_time_index.down.sql",
 	); err != nil {
 		t.Fatalf("migration not embedded: %v", err)
 	}

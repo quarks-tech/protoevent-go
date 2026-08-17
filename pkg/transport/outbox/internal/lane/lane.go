@@ -16,10 +16,12 @@ package lane
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/bound"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/notify"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
@@ -71,6 +73,15 @@ type Lane[P comparable] struct {
 	// poison-event resume token and id are both best-effort extractions and can
 	// both come back empty — see notify.StuckTracker.Stuck.
 	Identified func(pos P) bool
+	// SendTimeout bounds one Sender.Send, the way OpTimeout bounds one store call
+	// (see internal/bound). Both runtimes pass their OpTimeout: a send and a store
+	// call are the same kind of hazard — a remote peer that holds the connection
+	// open and never answers — and the relay has one budget for that.
+	//
+	// Non-positive leaves the send unbounded, which is the pre-bound behavior and
+	// exists only so a Lane built as a bare struct literal stays usable. Both
+	// runtimes set it.
+	SendTimeout time.Duration
 
 	stuck notify.StuckTracker[P]
 }
@@ -95,7 +106,7 @@ type Lane[P comparable] struct {
 //     parking healthy messages during an outage would bulk-divert the whole
 //     backlog to the DLQ while permanently advancing past it.
 func (l *Lane[P]) Send(ctx context.Context, pos P, msg *outbox.Message) Disposition {
-	sendErr := l.Sender.Send(ctx, msg.Metadata, msg.Data)
+	sendErr := l.send(ctx, msg)
 	if sendErr == nil {
 		l.Progress(pos)
 
@@ -128,6 +139,30 @@ func (l *Lane[P]) Send(ctx context.Context, pos P, msg *outbox.Message) Disposit
 	l.Stuck(pos, msg.ID, sendErr)
 
 	return Stopped
+}
+
+// send delivers msg under the send budget.
+//
+// A send is bounded for the same reason a store call is: a broker that accepts the
+// TCP connection and then never answers — RabbitMQ blocking a publishing
+// connection on vm_memory_high_watermark is the everyday case — otherwise stalls
+// the relay's single Run goroutine indefinitely. That stall is the worst failure
+// in the system AND the quietest: no Drained, no Error, no log, and lane.Stuck is
+// only reachable once Send has returned, so the wedged-lane escalation cannot
+// fire while it is happening.
+//
+// A deadline of its own, rather than relying on the caller's context: the run
+// context has no deadline, and the transports do not impose one (amqp091's
+// confirm wait is a bare select on the confirm channel).
+func (l *Lane[P]) send(ctx context.Context, msg *outbox.Message) error {
+	if l.SendTimeout <= 0 {
+		return l.Sender.Send(ctx, msg.Metadata, msg.Data)
+	}
+
+	sendCtx, cancel := bound.Call(ctx, l.SendTimeout)
+	defer cancel()
+
+	return l.Sender.Send(sendCtx, msg.Metadata, msg.Data)
 }
 
 // permanent reports whether a send failure is permanent for THIS message, and so

@@ -23,11 +23,15 @@ func TestDefaultOptions(t *testing.T) {
 	if o.PollInterval != time.Second {
 		t.Fatalf("PollInterval = %v, want 1s", o.PollInterval)
 	}
-	if o.LeaseTTL != 15*time.Second {
-		t.Fatalf("LeaseTTL = %v, want 15s", o.LeaseTTL)
+	// 60s, not 15s: the lease must be able to CONTAIN a pass, and a pass is the
+	// tick plus one store call. At 15s against the 30s OpTimeout below, one slow
+	// store call returned onto an EXPIRED lease and the relay committed anyway.
+	if o.LeaseTTL != 60*time.Second {
+		t.Fatalf("LeaseTTL = %v, want 60s", o.LeaseTTL)
 	}
 	// Deliberately NOT LeaseTTL: the failover budget and the store-call budget
-	// are separate knobs, so lowering one cannot silently tighten the other.
+	// are separate knobs, so lowering one cannot silently tighten the other. They
+	// are not unrelated, though — tick + OpTimeout must stay under LeaseTTL.
 	if o.OpTimeout != 30*time.Second {
 		t.Fatalf("OpTimeout = %v, want 30s", o.OpTimeout)
 	}

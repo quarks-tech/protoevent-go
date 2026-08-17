@@ -226,6 +226,13 @@ func main() {
 
     client := amqpx.NewClient(&amqpx.Config{
         Address: "guest:guest@localhost:5672/",
+        // REQUIRED if this process also PUBLISHES through the same client. Each
+        // running subscription holds one pool connection for as long as it runs,
+        // and PoolSize defaults to GOMAXPROCS — which is cgroup-aware, so a
+        // 1-CPU pod gets a pool of ONE and every publish then fails with
+        // "connection pool timeout", permanently. Size it to
+        // subscriptions + 1 (or give the publisher its own client).
+        PoolSize: 2,
         // Consumer drain budget on shutdown (amqpx ProcessWithDrain): in-flight
         // deliveries get this long to finish before the connection is
         // force-closed. Default 30s — size it to the deployment's termination
@@ -278,10 +285,20 @@ pass assigns a dense, gapless offset (`seq`) to committed rows after the
 fact, so a transaction that started earlier but committed later is never
 skipped. On **MongoDB**, a relay tails a change stream on the insert-only
 outbox collection, reusing the oplog's total commit order — no sequencer
-needed. Both give **at-least-once** delivery in commit order (equivalent to
-one Kafka partition) and support independent consumer groups, each with its
-own offset/resume token; a new group starts at "latest" (future events only)
-by default.
+needed. Both give **at-least-once** delivery in a single total order
+(equivalent to one Kafka partition) and support independent consumer groups,
+each with its own offset/resume token; a new group starts at "latest" (future
+events only) by default.
+
+The two backends order by different things, and it matters for
+read-modify-write consumers: MongoDB delivers in **commit** order (the oplog's),
+while TiDB's `seq` is **transaction-begin** order (`tx_start_ts`). Two TiDB
+transactions with overlapping lifetimes can therefore be delivered in the
+reverse of the order they committed — even when they conflict on the same row.
+No event is skipped or duplicated by this, but a consumer that applies
+last-write-wins per aggregate must carry its own version/revision in the payload
+rather than trusting delivery order. See "Not guaranteed" in
+`docs/design/outbox-sequenced-log.md`.
 
 ```text
 ┌──────────────┐  insert (seq=NULL)   ┌──────────────────┐

@@ -36,6 +36,9 @@ func TestStreamRelayEndToEnd(t *testing.T) {
 	r, err := stream.NewRelay("e2e", st, sender,
 		stream.WithDrainWindow(300*time.Millisecond),
 		stream.WithLeaseTTL(15*time.Second),
+		// Must fit inside the lease alongside the tick: the default 30s would put
+		// a single store call outside a 15s lease. See relaycfg Ops.Validate.
+		stream.WithOpTimeout(10*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("new relay: %v", err)
@@ -98,6 +101,7 @@ func TestStreamRelayEndToEnd(t *testing.T) {
 	r2, err := stream.NewRelay("e2e", st, sender2,
 		stream.WithDrainWindow(300*time.Millisecond),
 		stream.WithLeaseTTL(15*time.Second),
+		stream.WithOpTimeout(10*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("new relay (resume): %v", err)

@@ -89,6 +89,36 @@ func TestNewRelayRejectsZeroSweepCadence(t *testing.T) {
 	}
 }
 
+// TestNewRelayRejectsOpTimeoutExceedingLease pins the one relation between the
+// lease and the store-operation budget that decides whether a pass can return
+// onto an EXPIRED lease: the renewal cadence plus one store call must fit inside
+// the lease term.
+//
+// The lease is renewed between pages, so in a caught-up steady state exactly once
+// per tick. Anything longer than LeaseTTL - tick spent inside a single store call
+// means the relay resumes as a STALE leader and then commits an offset — and
+// CommitOffset is an unconditional GREATEST upsert with no holder check, so two
+// leaders interleave seq ranges into the same exchange. event_id dedup absorbs the
+// duplicates; it cannot restore total order, which is the guarantee the sequenced
+// log exists to provide.
+//
+// Validating tick and lease separately (each against the other's half) never
+// catches this, because the violation is in their SUM.
+func TestNewRelayRejectsOpTimeoutExceedingLease(t *testing.T) {
+	_, err := sequence.NewRelay("c", newFakeStore(), noopSender,
+		sequence.WithLeaseTTL(15*time.Second), sequence.WithOpTimeout(30*time.Second))
+	if err == nil || !strings.Contains(err.Error(), "OpTimeout") || !strings.Contains(err.Error(), "LeaseTTL") {
+		t.Fatalf("err = %v, want an error relating OpTimeout to LeaseTTL: a 30s store call "+
+			"cannot run inside a 15s lease", err)
+	}
+
+	// The remedy the message implies must actually work.
+	if _, err := sequence.NewRelay("c", newFakeStore(), noopSender,
+		sequence.WithLeaseTTL(60*time.Second), sequence.WithOpTimeout(30*time.Second)); err != nil {
+		t.Fatalf("NewRelay with a lease that fits the store budget: %v", err)
+	}
+}
+
 func TestNewRelayAcceptsDefaults(t *testing.T) {
 	r, err := sequence.NewRelay("c", newFakeStore(), noopSender)
 	if err != nil || r == nil {
@@ -923,6 +953,66 @@ func TestStuckLaneEscalatesAfterThreshold(t *testing.T) {
 	})
 }
 
+// TestStuckLaneEscalatesOnUnreadablePage pins the escalation for the one wedge that
+// could not report it at all: a page-level READ failure that is not a *DecodeError.
+//
+// A row-level fault the store cannot classify as poison — a create_time that will
+// not scan (the symptom of a DSN missing parseTime=true), an event_id that is not a
+// UUID after a hand-edited migration — makes ListMessages fail the whole page every
+// tick, forever. It is unparkable by any PoisonHandler, because parking is reached
+// only from the poison branch, and drainPage returned the error before ever calling
+// lane.Stuck, so notify's 15-minute escalation was structurally unreachable for it.
+//
+// The result was a relay delivering zero events for the group's lifetime whose only
+// symptom was one generic OnError per second — indistinguishable from a two-second
+// blip. lane.Stuck's own contract says it "must be called from EVERY path that
+// stops the lane"; this was the exception.
+func TestStuckLaneEscalatesOnUnreadablePage(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := newFakeStore()
+		st.append(msg())
+		// Not a *DecodeError: the store could not even read the page. This is what
+		// a []uint8 -> time.Time scan failure looks like from the relay's side.
+		st.listErr = errors.New("outbox: scan: unsupported Scan, storing driver.Value type []uint8 into type *time.Time")
+
+		var stuck []*sequence.StuckLaneError
+		obs := relay.Observer{OnError: func(_ string, err error) {
+			if sl, ok := errors.AsType[*sequence.StuckLaneError](err); ok {
+				stuck = append(stuck, sl)
+			}
+		}}
+
+		r, err := sequence.NewRelay("c", st, noopSender,
+			sequence.WithStartFromBeginning(), sequence.WithObserver(obs))
+		if err != nil {
+			t.Fatalf("NewRelay: %v", err)
+		}
+
+		for range 3 {
+			_ = r.RunOnce(t.Context())
+		}
+		if len(stuck) != 0 {
+			t.Fatalf("escalated %d times during a short failure, want 0", len(stuck))
+		}
+
+		time.Sleep(20 * time.Minute)
+		synctest.Wait()
+
+		for range 3 {
+			_ = r.RunOnce(t.Context())
+		}
+
+		if len(stuck) != 1 {
+			t.Fatalf("escalated %d times, want exactly 1: a page the store can never read wedges "+
+				"the lane exactly as a send failure does, and is the one wedge no PoisonHandler "+
+				"can clear", len(stuck))
+		}
+		if stuck[0].StuckFor < 20*time.Minute {
+			t.Fatalf("StuckLaneError.StuckFor = %v, want >= 20m", stuck[0].StuckFor)
+		}
+	})
+}
+
 // TestStuckLaneEscalatesOnUnconfirmedParks pins that EVERY path which wedges the
 // lane escalates, not just the plain send failure. A message that can neither be
 // sent nor parked (an unsendable body plus a broken DLQ), and a poison row that
@@ -1431,6 +1521,14 @@ func TestDeletedOffsetRowRePrimesAtLatest(t *testing.T) {
 	st.append(msg())
 	st.append(msg())
 	st.append(msg())
+	// Sequence them BEFORE the relay starts, so these are rows of the existing
+	// LOG — what "re-prime at latest, don't replay" is about. Leaving them pending
+	// would instead make this a test about the committed-but-unsequenced backlog, a
+	// fresh group now deliberately DOES receive (see
+	// TestFreshGroupReceivesTheBacklogCommittedBeforeItStarted).
+	if _, err := st.SequenceMessages(t.Context(), 10); err != nil {
+		t.Fatalf("seeding SequenceMessages: %v", err)
+	}
 
 	var got []int64
 	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
@@ -2665,5 +2763,260 @@ func TestSweepIsSkippedOnAShutdown(t *testing.T) {
 
 	if calls, _ := st.snapshotSweep(); calls != 0 {
 		t.Fatalf("sweepCalls = %d on a canceled ctx, want 0", calls)
+	}
+}
+
+// TestFreshGroupReceivesTheBacklogCommittedBeforeItStarted pins that registering a
+// new consumer group does not discard the committed backlog.
+//
+// RunOnce used to sequence BEFORE it primed, so on a group's first tick the
+// sequencer labeled the whole pending backlog and InitOffsetLatest — whose
+// contract is "the current maximum assigned seq" — then registered the group at the
+// TOP of what had just been labeled. Every one of those rows was permanently
+// undeliverable, with no log line and no observer signal, and the offset row was
+// left looking like a healthy committed position that InitOffsetLatest will never
+// revisit.
+//
+// This is exactly what InitOffsetLatest's own doc comment promises does NOT happen:
+// "a group primed before the sequencer catches up will receive that backlog once it
+// is sequenced". Priming first is what makes that true.
+//
+// The same silent jump occurred whenever a group's offset row was lost for any
+// other reason — the documented DeleteOffset decommission applied to the wrong
+// name, an offsets-table restore from an older backup, a truncate during a
+// migration.
+func TestFreshGroupReceivesTheBacklogCommittedBeforeItStarted(t *testing.T) {
+	st := newFakeStore()
+	// Committed by publishers before the relay ever ran, still unsequenced —
+	// the state of any first deploy where the writers ship before the relay.
+	st.append(msg())
+	st.append(msg())
+
+	var got []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		got = append(got, mdSeq(md))
+
+		return nil
+	})
+
+	// Default options: no WithStartFromBeginning. A brand-new group must still
+	// receive what was already committed and never delivered to anyone.
+	r, err := sequence.NewRelay("c", st, sender)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if !slices.Equal(got, []int64{1, 2}) {
+		t.Fatalf("delivered %v, want [1 2]: the group was registered at the head of the very "+
+			"backlog this tick had just sequenced, so those rows can never be read", got)
+	}
+}
+
+// TestSendIsBoundedByOpTimeout pins that the sender gets the same operation
+// budget every store call gets.
+//
+// Send was the ONLY relay I/O with no bound at all, while every store call is
+// wrapped by internal/bound precisely against this — per that package's own
+// header, "an unbounded call on a wedged connection stalls the single Run
+// goroutine with no error and no log while the lease quietly expires and a
+// standby takes over".
+//
+// The infra event is ordinary: RabbitMQ breaches vm_memory_high_watermark and
+// BLOCKS the publishing connection. TCP stays healthy, heartbeats flow, the
+// confirm never arrives. Every consequence is silent — no OnDrained, no OnError,
+// no PassFailed, no log line — and lane.Stuck is only reachable AFTER Send
+// RETURNS, so StuckLaneError, the one signal that means "a human is needed", can
+// never fire for the worst stall in the system.
+func TestSendIsBoundedByOpTimeout(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg())
+
+	var (
+		hadDeadline bool
+		budget      time.Duration
+	)
+	sender := senderFunc(func(ctx context.Context, _ *event.Metadata, _ []byte) error {
+		dl, ok := ctx.Deadline()
+		hadDeadline = ok
+		if ok {
+			budget = time.Until(dl)
+		}
+
+		return nil
+	})
+
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning(),
+		sequence.WithOpTimeout(20*time.Second), sequence.WithLeaseTTL(60*time.Second))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if !hadDeadline {
+		t.Fatal("Sender.Send got a context with no deadline: a broker that accepts the TCP " +
+			"connection and never answers stalls the single Run goroutine forever, with no " +
+			"error, no log, and no reachable stuck-lane escalation")
+	}
+	if budget < 15*time.Second || budget > 20*time.Second {
+		t.Fatalf("send budget = %v, want ~20s (OpTimeout)", budget)
+	}
+}
+
+// TestRunOnceDrainsWhenSequencerFails pins that a failed sequencer pass does not
+// halt delivery of the already-sequenced backlog.
+//
+// The two halves are independent: drain reads rows that ALREADY carry a seq and
+// advances a monotone offset, with no data dependency on this tick's sequencer
+// pass. Coupling them means a store-side fault with nothing to do with delivery
+// stops the whole log from moving — and the reachable trigger is the DEFAULT
+// multi-group configuration, where two groups over one store both run the
+// sequencer and contend on the pessimistic counter-row lock, so the loser gets a
+// lock-wait timeout every contended pass and never drains.
+//
+// RunOnce already makes exactly this decoupling argument for the SWEEP, whose
+// blast radius is smaller.
+func TestRunOnceDrainsWhenSequencerFails(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg())
+	st.append(msg())
+	// Move both rows into the sequenced log, then break the sequencer: the rows
+	// under test are readable and undelivered before this tick begins.
+	if _, err := st.SequenceMessages(t.Context(), 10); err != nil {
+		t.Fatalf("seeding SequenceMessages: %v", err)
+	}
+	sequencerFailed := errors.New("lock wait timeout exceeded")
+	st.seqErr = sequencerFailed
+
+	var got []int64
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		got = append(got, mdSeq(md))
+		return nil
+	})
+
+	r, err := sequence.NewRelay("c", st, sender, sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	// The sequencer failure must still be REPORTED — it is a real fault and the
+	// observer/log path is how an operator learns the log has stopped growing.
+	if runErr := r.RunOnce(t.Context()); !errors.Is(runErr, sequencerFailed) {
+		t.Fatalf("RunOnce err = %v, want it to report the sequencer failure", runErr)
+	}
+
+	if !slices.Equal(got, []int64{1, 2}) {
+		t.Fatalf("delivered %v, want [1 2]: a sequencer fault must not stop delivery of rows "+
+			"that already carry a seq", got)
+	}
+}
+
+// TestFailedSweepDoesNotConsumeTheRetentionInterval pins that a sweep which did
+// nothing does not buy a full interval of silence.
+//
+// lastSweep was latched BEFORE the store call, so any failed sweep — a lock wait, a
+// query-memory cancellation, a connection blip — deferred the next attempt by a whole
+// RetentionSweepInterval (one hour by default) despite having deleted nothing. The
+// table keeps growing for that hour, and the retry cadence for a transient fault is
+// an hour rather than the next tick.
+//
+// The interval exists to bound how OFTEN a successful sweep runs, not to ration
+// attempts after failures.
+func TestFailedSweepDoesNotConsumeTheRetentionInterval(t *testing.T) {
+	st := newFakeStore()
+	st.sweepBacklog = 5
+	sweepBroken := errors.New("lock wait timeout exceeded")
+	st.sweepErr = sweepBroken
+
+	// A long interval: if a failed attempt latches it, the second tick cannot sweep.
+	r, err := sequence.NewRelay("c", st, noopSender,
+		sequence.WithStartFromBeginning(), sequence.WithRetention(time.Hour, 10))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	if runErr := r.RunOnce(t.Context()); !errors.Is(runErr, sweepBroken) {
+		t.Fatalf("first RunOnce = %v, want the sweep failure reported", runErr)
+	}
+	calls, _ := st.snapshotSweep()
+	if calls != 1 {
+		t.Fatalf("sweepCalls = %d after the first tick, want 1", calls)
+	}
+
+	// The fault clears. The next tick must try again rather than wait out an hour.
+	st.mu.Lock()
+	st.sweepErr = nil
+	st.mu.Unlock()
+
+	if runErr := r.RunOnce(t.Context()); runErr != nil {
+		t.Fatalf("second RunOnce: %v", runErr)
+	}
+
+	calls, _ = st.snapshotSweep()
+	if calls != 2 {
+		t.Fatalf("sweepCalls = %d, want 2: a sweep that FAILED consumed the whole "+
+			"RetentionSweepInterval, so the next attempt is an hour away while the table keeps "+
+			"growing — the interval bounds successful sweeps, not retries after a fault", calls)
+	}
+}
+
+// TestStoppedLaneKeepsReportingLag pins the restart-proof wedge signal the outbox
+// README now tells operators to alert on.
+//
+// StuckLaneError's 15-minute clock lives in process memory, so a relay restarting
+// more often than the threshold never escalates. The README therefore directs
+// operators to a store-derived signal instead — OnDrained's oldestAge — on the claim
+// that a STOPPED page still reports it. That claim is load-bearing advice about how to
+// detect a wedge, so it is asserted here rather than trusted: a stopped drain must
+// still emit OnDrained with the age of the row it is stuck on, and with sent == 0.
+func TestStoppedLaneKeepsReportingLag(t *testing.T) {
+	st := newFakeStore()
+	// A row committed well in the past, so its age is unmistakable.
+	stuck := msg()
+	stuck.CreateTime = time.Now().Add(-42 * time.Minute)
+	st.append(stuck)
+
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+		return errors.New("broker refuses this message")
+	})
+
+	type drain struct {
+		count int
+		age   time.Duration
+		more  bool
+	}
+	var drains []drain
+	obs := relay.Observer{OnDrained: func(_ string, count int, oldestAge time.Duration, more bool) {
+		drains = append(drains, drain{count, oldestAge, more})
+	}}
+
+	r, err := sequence.NewRelay("c", st, sender,
+		sequence.WithStartFromBeginning(), sequence.WithObserver(obs))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(drains) == 0 {
+		t.Fatal("a stopped lane reported no OnDrained at all: the README directs operators to " +
+			"oldestAge as the restart-proof wedge signal, so a wedge that emits nothing leaves " +
+			"them with only the per-process StuckLaneError clock")
+	}
+	last := drains[len(drains)-1]
+	if last.count != 0 {
+		t.Fatalf("OnDrained count = %d on a stopped lane, want 0 (nothing was delivered)", last.count)
+	}
+	if last.age < 40*time.Minute {
+		t.Fatalf("OnDrained oldestAge = %v, want >= 40m (the stuck row's age): an alarm on lag "+
+			"cannot detect a wedge if the reported age does not grow with it", last.age)
+	}
+	if !last.more {
+		t.Fatal("OnDrained more = false on a stopped lane, want true: the log still has work")
 	}
 }

@@ -8,6 +8,8 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/quarks-tech/amqpx/connpool"
+
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/publish"
 )
 
 // TestDefaultReceiverLoggerIsNotNil pins the default this receiver needs even
@@ -47,9 +49,11 @@ func TestPutIntoParkingLotDetachesCanceledContext(t *testing.T) {
 	// before the ctx ever reaches the publish, and the assertion below would pass
 	// for the wrong reason.
 	ch := &amqp.Channel{}
+	confirms := publish.NewConfirms()
+	confirms.AssumeEnabled(ch)
 	receiver := &Receiver{
-		options:    receiverOptions{dlxExchange: "events.dlx"},
-		confirming: map[*amqp.Channel]struct{}{ch: {}},
+		options:  receiverOptions{dlxExchange: "events.dlx"},
+		confirms: confirms,
 	}
 	conn := connpool.NewConn(nil, ch)
 
@@ -200,5 +204,49 @@ func deliveryWithDeathCount(count any) *amqp.Delivery {
 				amqp.Table{"queue": "events.incoming", "count": count},
 			},
 		},
+	}
+}
+
+// TestHasExceededRetryCountBoundsAMismatchedFirstDeathQueue pins that the retry
+// budget stays bounded when x-first-death-queue names a queue that appears in no
+// x-death entry.
+//
+// The existing tests cover an ABSENT first-death queue, where returning false is the
+// deliberate fail-safe. Present-but-non-matching is a different story: it is a value
+// that arrived with the message rather than one the broker wrote for this consumer,
+// and it made the cap silently unreachable — the delivery loops
+// incoming -> DLX -> wait -> retry forever, re-running the handler's side effects on
+// every lap, with no log line at all (unlike the unreadable-count branch, which
+// logs).
+//
+// Reachable with no malice: RabbitMQ writes x-first-death-* once and does not update
+// them, and a service that consumes a once-dead-lettered event and re-publishes its
+// Metadata carries the ORIGINAL consumer's queue name onward. That name will never
+// match the new consumer's own x-death entries. (The binary marshaler no longer
+// promotes these headers into Extensions, which closes the outbox path — this closes
+// the delivery path.)
+func TestHasExceededRetryCountBoundsAMismatchedFirstDeathQueue(t *testing.T) {
+	// x-first-death-queue names a queue nobody in x-death is; the real entry is far
+	// past the budget.
+	d := &amqp.Delivery{
+		Headers: amqp.Table{
+			"x-first-death-queue": "some-other-services.incoming",
+			"x-death": []any{
+				amqp.Table{"queue": "events.incoming", "count": int64(9999)},
+			},
+		},
+	}
+
+	if !receiverWithMaxRetries(5).hasExceededRetryCount(d) {
+		t.Fatal("hasExceededRetryCount = false for a delivery whose x-death count is 9999 against " +
+			"a budget of 5, because x-first-death-queue named a queue not present in x-death: " +
+			"the retry cap is unbounded and the message loops through the wait queue forever, " +
+			"re-running side effects, with nothing logged")
+	}
+
+	// The budget must still be a budget: under it, keep retrying.
+	if receiverWithMaxRetries(100000).hasExceededRetryCount(d) {
+		t.Fatal("hasExceededRetryCount = true with a budget of 100000 against count 9999: the " +
+			"fallback must compare against the budget, not park unconditionally")
 	}
 }

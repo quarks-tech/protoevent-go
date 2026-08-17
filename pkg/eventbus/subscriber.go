@@ -3,6 +3,7 @@ package eventbus
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
@@ -210,11 +211,16 @@ func (s *Subscriber) Subscribe(ctx context.Context, r Receiver) error {
 }
 
 // process is the Processor the transport drives. ctx comes FROM the transport
-// (see Processor): deriving it from context.Background() instead — which this
-// used to do — left handlers with no way to observe shutdown at all, so under a
-// drain-capable receiver a slow handler ran past the drain budget, the
-// connection was force-closed under it, and the unacked delivery was redelivered
-// after restart — running any non-idempotent side effect twice.
+// (see Processor) rather than from a context.Background() minted here, so a
+// handler sees whatever the transport chose to give it — trace values, deadlines,
+// and cancellation where the transport propagates any.
+//
+// ctx is NOT a shutdown signal under the RabbitMQ receiver: amqpx derives delivery
+// contexts from context.Background() so its drain can let in-flight handlers finish.
+// So a handler slower than the client's DrainTimeout is still running when the
+// connection is force-closed, and its delivery is requeued and redelivered after
+// restart — running any non-idempotent side effect twice. A handler that must bail out
+// early on shutdown needs a signal of its own.
 func (s *Subscriber) process(ctx context.Context, md *event.Metadata, data []byte) error {
 	// md.Type arrives from the incoming message, so it is untrusted: a dot-less
 	// type must be rejected as unprocessable, never sliced (that panics).
@@ -252,6 +258,39 @@ func (s *Subscriber) process(ctx context.Context, md *event.Metadata, data []byt
 	}
 
 	ctx = event.NewIncomingContext(ctx, md)
+
+	return s.dispatch(ctx, md, df, ei)
+}
+
+// dispatch invokes the registered handler and contains a panic from it.
+//
+// The panic comes from the CALLER's code, where this library cannot prevent it and
+// can only decide what it costs. Uncontained it costs the whole process: the panic
+// unwinds past the transport's per-delivery policy before anything is acked or
+// rejected, so the delivery stays unacknowledged, the broker redelivers it to the
+// replacement instance, and that one dies the same way — one bad event becomes an
+// unbounded crash loop that also takes down every other subscription sharing the
+// process.
+//
+// Reported as an UNPROCESSABLE event, not a transient failure, because a panic is
+// deterministic in the payload: retrying it reproduces it. That routes the delivery
+// to the dead-letter/parking path a human can inspect instead of back onto the
+// queue it would crash on again.
+//
+// The recover deliberately wraps ONLY the handler call. A panic anywhere else in
+// process is a bug in this library, and those must stay loud.
+func (s *Subscriber) dispatch(ctx context.Context, md *event.Metadata, df func(any) error, ei *eventInfo) (err error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		// The stack is the only way to find the offending line: by the time this
+		// error reaches the transport the frames are gone, and the message alone
+		// ("assignment to entry in nil map") names no handler.
+		err = NewUnprocessableEventError(fmt.Errorf("panic in handler for %s: %v\n%s",
+			md.Type, r, debug.Stack()))
+	}()
 
 	return ei.handler(ctx, md, df, s.opts.interceptor)
 }

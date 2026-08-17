@@ -6,4 +6,5 @@ use (
 	./pkg/transport/outbox/mongodb
 	./pkg/transport/outbox/tidb
 	./pkg/transport/rabbitmq
+	./test/e2e
 )

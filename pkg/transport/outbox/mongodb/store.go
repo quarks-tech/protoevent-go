@@ -15,6 +15,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 )
@@ -356,6 +359,38 @@ type RelayStore struct {
 	collLocks    string
 }
 
+// coll returns one of this store's collections with the relay's OWN durability
+// settings pinned, rather than whatever the caller configured on its client.
+//
+// The relay store makes two decisions on behalf of the entire deployment — who
+// leads, and where a consumer group resumes — and both must be correct under the
+// failures they exist to survive. Inheriting the application's settings put them at
+// the mercy of choices made for unrelated reasons:
+//
+//   - w:1, a normal throughput choice for business writes, lets a partitioned
+//     primary acknowledge a lock write locally. That relay believes it leads and
+//     drains, while the majority side elects a primary that never saw the write and
+//     hands the lock to a standby: two leaders over one log. The same setting lets
+//     an acknowledged SaveToken be rolled back while the relay has already reported
+//     the position persisted.
+//   - readPreference=secondaryPreferred, a normal read-heavy default, makes
+//     LoadToken read the resume position from a lagging secondary, so every reopen
+//     redelivers the lag window — and once the secondary trails past the oplog
+//     window, resumeAfter is rejected as ChangeStreamHistoryLost, which this module
+//     treats as FATAL and which sends an operator into a break-glass runbook whose
+//     restart-at-"now" step opens a real loss window. All from a healthy stream.
+//
+// Majority on both halves and reads from the primary make these operations depend
+// only on the deployment being a replica set, which NewRelayStore already requires.
+// The publish Store deliberately does NOT do this: its write joins the caller's
+// business transaction, whose concerns are the caller's to choose.
+func (rs *RelayStore) coll(name string) *mongo.Collection {
+	return rs.db.Collection(name, options.Collection().
+		SetWriteConcern(writeconcern.Majority()).
+		SetReadConcern(readconcern.Majority()).
+		SetReadPreference(readpref.Primary()))
+}
+
 // NewRelayStore creates the relay-side store over db. Use the same
 // WithCollectionPrefix as the instance's publish Store (NewStore) — the two
 // sides address one three-collection outbox instance — and WithRetention to
@@ -401,7 +436,7 @@ func (rs *RelayStore) EnsureIndexes(ctx context.Context) error {
 	if secs < 1 || secs > math.MaxInt32 {
 		return fmt.Errorf("outbox: ensure ttl index: retention %v outside the TTL range [1s, ~68y]", rs.retention)
 	}
-	_, err := rs.db.Collection(rs.collMessages).Indexes().CreateOne(ctx, mongo.IndexModel{
+	_, err := rs.coll(rs.collMessages).Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "create_time", Value: 1}},
 		Options: options.Index().SetExpireAfterSeconds(int32(secs)),
 	})
@@ -420,7 +455,7 @@ func (rs *RelayStore) EnsureIndexes(ctx context.Context) error {
 // and the anchor clusterTime. The stored bytes are carried verbatim.
 func (rs *RelayStore) LoadToken(ctx context.Context, name string) (string, time.Time, error) {
 	var doc offsetDoc
-	err := rs.db.Collection(rs.collOffsets).FindOne(ctx, bson.M{"_id": name}).Decode(&doc)
+	err := rs.coll(rs.collOffsets).FindOne(ctx, bson.M{"_id": name}).Decode(&doc)
 	if errors.Is(err, mongo.ErrNoDocuments) {
 		return "", time.Time{}, nil
 	}
@@ -458,7 +493,7 @@ func (rs *RelayStore) LoadToken(ctx context.Context, name string) (string, time.
 // manual repair, or rows written before token_key existed) also matches, so a
 // legacy/damaged row is healed by the next save instead of freezing the token
 // forever behind the same duplicate-key path.
-func (rs *RelayStore) SaveToken(ctx context.Context, name string, token string, clusterTime time.Time) (bool, error) {
+func (rs *RelayStore) SaveToken(ctx context.Context, name, token string, clusterTime time.Time) (bool, error) {
 	if token == "" {
 		return false, fmt.Errorf("outbox: save token: empty resume token for group %q; an empty token is never a valid position (it would erase the stored one)", name)
 	}
@@ -486,7 +521,7 @@ func (rs *RelayStore) SaveToken(ctx context.Context, name string, token string, 
 			bson.M{"cluster_time": bson.M{"$exists": false}},
 		}
 	}
-	_, err := rs.db.Collection(rs.collOffsets).UpdateOne(ctx,
+	_, err := rs.coll(rs.collOffsets).UpdateOne(ctx,
 		bson.M{"_id": name, "$or": guard},
 		update,
 		options.UpdateOne().SetUpsert(true),
@@ -509,7 +544,7 @@ func (rs *RelayStore) SaveToken(ctx context.Context, name string, token string, 
 // (a retired group's token row otherwise alerts on committed-token age
 // forever). Deleting a missing token is a no-op.
 func (rs *RelayStore) DeleteToken(ctx context.Context, name string) error {
-	if _, err := rs.db.Collection(rs.collOffsets).DeleteOne(ctx, bson.M{"_id": name}); err != nil {
+	if _, err := rs.coll(rs.collOffsets).DeleteOne(ctx, bson.M{"_id": name}); err != nil {
 		return fmt.Errorf("outbox: delete token: %w", err)
 	}
 	return nil
@@ -552,7 +587,7 @@ func (rs *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID s
 	var doc struct {
 		Holder string `bson:"holder_id"`
 	}
-	err := rs.db.Collection(rs.collLocks).FindOneAndUpdate(ctx,
+	err := rs.coll(rs.collLocks).FindOneAndUpdate(ctx,
 		bson.M{"_id": name},
 		update,
 		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
@@ -570,7 +605,7 @@ func (rs *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID s
 
 // ReleaseLeaderLock drops the lock if still held by holderID (graceful shutdown).
 func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
-	_, err := rs.db.Collection(rs.collLocks).DeleteOne(ctx, bson.M{"_id": name, "holder_id": holderID})
+	_, err := rs.coll(rs.collLocks).DeleteOne(ctx, bson.M{"_id": name, "holder_id": holderID})
 	if err != nil {
 		return fmt.Errorf("outbox: release lock: %w", err)
 	}

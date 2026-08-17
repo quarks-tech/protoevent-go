@@ -86,11 +86,17 @@ type Hooks struct {
 
 // DefaultLease returns the shared lease defaults.
 //
-// 15s, deliberately shorter than a store-operation budget would want: this is
-// the failover stall an ungraceful leader loss costs, and a clean shutdown
-// releases the lock explicitly, so only crashes pay it.
+// This is the failover stall an ungraceful leader loss costs, and a clean
+// shutdown releases the lock explicitly, so only crashes pay it.
+//
+// 60s, not the 15s this used to be: the lease must be able to CONTAIN a pass, and
+// a pass is renewal cadence plus one store call (see Ops.Validate). At 15s against
+// the 30s OpTimeout the shipped pair violated that by 2x, so one slow-but-
+// successful store call returned onto an expired lease and the relay then drained
+// and committed a whole page as a stale leader. Shortening failover below this
+// means shortening OpTimeout with it.
 func DefaultLease() Lease {
-	return Lease{LeaseTTL: 15 * time.Second}
+	return Lease{LeaseTTL: 60 * time.Second}
 }
 
 // DefaultOps returns the shared store-operation defaults.
@@ -149,13 +155,34 @@ func (l *Lease) Validate(runtime, name, tickName string, tick time.Duration) err
 // the change stream's maxAwaitTime: a Next call legitimately blocks server-side
 // for a whole window, so an OpTimeout at or below it would fire on every idle
 // window and reopen a cursor that was working perfectly.
-func (o *Ops) Validate(runtime, tickName string, tick time.Duration) error {
+// leaseTTL relates the two budgets to each other, which neither guard above nor
+// Lease.Validate can do alone: each of them checks the tick against ONE budget,
+// while a stale-leader pass is a violation of their SUM.
+func (o *Ops) Validate(runtime, tickName string, tick, leaseTTL time.Duration) error {
 	if o.OpTimeout <= 0 {
 		return fmt.Errorf("%s: OpTimeout must be > 0, got %v", runtime, o.OpTimeout)
 	}
 	if tick >= o.OpTimeout {
 		return fmt.Errorf("%s: %s (%v) must be < OpTimeout (%v) — a single store call has to be "+
 			"able to outlast one pass, or every pass times out mid-flight", runtime, tickName, tick, o.OpTimeout)
+	}
+	// The lease must be able to CONTAIN a pass. The lease is renewed between
+	// pages, so in a caught-up steady state exactly once per tick; a store call
+	// that runs longer than what is left of the lease returns onto an EXPIRED
+	// lease, and the relay then commits an offset as a stale leader. Nothing
+	// fences that write — CommitOffset is an unconditional GREATEST upsert with no
+	// holder check — so two leaders interleave positions and TOTAL ORDER breaks.
+	// event_id dedup absorbs the duplicates; it cannot restore order.
+	//
+	// This bounds ONE store call. A drain window whose every call is slow can
+	// still overrun the lease in aggregate (worst for the stream runtime, which
+	// may make TokenBatchSize bounded calls inside one window); closing that
+	// completely needs a holder-checked commit, not a bigger number here.
+	if tick+o.OpTimeout >= leaseTTL {
+		return fmt.Errorf("%s: %s (%v) + OpTimeout (%v) must be < LeaseTTL (%v) — the lease is renewed "+
+			"once per pass, so a longer store call returns onto an expired lease and the relay commits "+
+			"as a stale leader; raise LeaseTTL or lower OpTimeout",
+			runtime, tickName, tick, o.OpTimeout, leaseTTL)
 	}
 
 	return nil

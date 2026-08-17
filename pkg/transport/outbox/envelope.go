@@ -112,9 +112,54 @@ func ValidateMetadata(md *event.Metadata) error {
 		if event.ReservedExtensionName(k) {
 			return fmt.Errorf("outbox: extension %q collides with a core CloudEvents attribute; rename it", k)
 		}
-		if err := event.ValidExtensionValue(v); err != nil {
+		if err := validExtension(v); err != nil {
 			return fmt.Errorf("outbox: extension %q: %w", k, err)
 		}
+	}
+
+	return nil
+}
+
+// validExtension applies both extension-value rules: the transports' shared type
+// rule, and this envelope's narrower exact-integer rule.
+func validExtension(v any) error {
+	if err := event.ValidExtensionValue(v); err != nil {
+		return err
+	}
+
+	return exactInEnvelope(v)
+}
+
+// maxExactEnvelopeInt is the largest integer the outbox envelope round-trips
+// exactly: encoding/json unmarshals every JSON number into float64, whose
+// mantissa holds 53 bits.
+const maxExactEnvelopeInt = int64(1) << 53
+
+// exactInEnvelope rejects an extension value whose VALUE cannot survive the JSON
+// envelope, as opposed to one whose Go type merely changes.
+//
+// event.ValidExtensionValue accepts int64 at any magnitude, and for its own
+// purpose that is correct — the AMQP encoder writes int64 as a 64-bit field, so a
+// direct publish loses nothing. The outbox is a narrower channel: the same value
+// stored in a row and read back comes through float64 and is silently off by
+// however much 53 bits could not hold. Rejecting it costs the caller's transaction
+// one error; accepting it corrupts a durable record with nothing anywhere
+// reporting it. See TestEnvelopeRoundTripLosesLargeIntegerExtensions.
+//
+// Only int64 needs the check: ValidExtensionValue already caps plain int to the
+// int32 range, and every other accepted numeric type fits in 53 bits. []byte and
+// time.Time are deliberately NOT rejected — their values survive as base64 and
+// RFC3339 and only the Go type changes, which loses no data.
+func exactInEnvelope(v any) error {
+	n, ok := v.(int64)
+	if !ok {
+		return nil
+	}
+	if n > maxExactEnvelopeInt || n < -maxExactEnvelopeInt {
+		return fmt.Errorf("int64 value %d cannot survive the outbox envelope: it is persisted as "+
+			"JSON and read back through float64, which represents integers exactly only up to "+
+			"%d, so the stored row would differ from what was published; carry it as a string",
+			n, maxExactEnvelopeInt)
 	}
 
 	return nil

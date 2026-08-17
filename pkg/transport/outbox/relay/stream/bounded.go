@@ -33,7 +33,7 @@ func (s boundedStore) LoadToken(ctx context.Context, name string) (string, time.
 // losing it to a canceled run context would redeliver up to TokenBatchSize-1
 // acknowledged sends per deploy. The consumer test suite pins the detachment
 // (saveHadDeadline/saveCtxErr).
-func (s boundedStore) SaveToken(ctx context.Context, name string, token string, commitTime time.Time) (bool, error) {
+func (s boundedStore) SaveToken(ctx context.Context, name, token string, commitTime time.Time) (bool, error) {
 	ctx, cancel := bound.Commit(ctx, s.ttl)
 	defer cancel()
 

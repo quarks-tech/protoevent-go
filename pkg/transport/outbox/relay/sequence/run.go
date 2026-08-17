@@ -132,10 +132,42 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 		return nil
 	}
 
-	passErr := r.sequence(ctx)
-	if passErr == nil {
-		passErr = r.drain(ctx)
+	// Prime BEFORE sequencing. InitOffsetLatest registers a new group at the
+	// current maximum ASSIGNED seq, so priming after a sequencer pass registers it
+	// at the top of the backlog that pass had just labeled — permanently
+	// discarding every committed, undelivered row, silently. Priming first is what
+	// makes InitOffsetLatest's own contract true: "a group primed before the
+	// sequencer catches up will receive that backlog once it is sequenced."
+	offset, primeErr := r.primeOffset(ctx)
+
+	seqErr := r.sequence(ctx)
+	// A sequencer fault does not implicate the drain, so it must not skip it: the
+	// drain reads rows that ALREADY carry a seq and advances a monotone offset,
+	// with no data dependency on this tick's sequencer pass. Skipping it means a
+	// store-side fault with nothing to do with delivery halts delivery of the
+	// whole readable backlog — and the trigger is the DEFAULT multi-group
+	// configuration, where every group runs the sequencer and contends on the one
+	// pessimistic counter-row lock, so the loser of each contended pass never
+	// drains. (This is the same decoupling maybeSweep already gets below, applied
+	// where the blast radius is delivery itself.)
+	//
+	// The one exception is a lost lease, where the drain has no authority to run
+	// at all. A dead run context is NOT an exception: drain is what observes the
+	// cancellation and reports it as context.Cause, so skipping it here would
+	// return a nil error from a pass that never ran.
+	//
+	// A failed prime skips only the drain, which cannot run without a starting
+	// offset; the sequencer pass above is unaffected for the same reason the drain
+	// is unaffected by a sequencer fault.
+	var drainErr error
+	if primeErr == nil && !errors.Is(seqErr, errLostLeadership) {
+		drainErr = r.drain(ctx, offset)
 	}
+
+	// Joined in phase order, one named error each. errors.Is over a join is
+	// order-independent, so the leadership triage below reads the same either way —
+	// but a single rebound variable made the gate above depend on evaluation order.
+	passErr := errors.Join(primeErr, seqErr, drainErr)
 	if errors.Is(passErr, errLostLeadership) {
 		r.reporter.Leadership(false)
 		if errors.Is(passErr, errLeaseRenewFailed) {
@@ -214,14 +246,9 @@ const (
 // bounded by maxPagesPerTick so a sustained backlog cannot starve the sweep,
 // renewing the leader lease between pages so a long backlog cannot outlive the
 // lease — bounding stale-leader overlap to a single page.
-func (r *Relay) drain(ctx context.Context) error {
+func (r *Relay) drain(ctx context.Context, offset int64) error {
 	// One store-clock read per pass, not per page (see oldestAge).
 	r.passStoreNow = time.Time{}
-
-	offset, err := r.primeOffset(ctx)
-	if err != nil {
-		return err
-	}
 
 	for range maxPagesPerTick {
 		next, outcome, err := r.drainPage(ctx, offset)
@@ -299,6 +326,19 @@ func (r *Relay) drainPage(ctx context.Context, offset int64) (int64, pageOutcome
 	msgs, listErr := r.store.ListMessages(ctx, offset, r.options.BatchSize)
 	poison, isPoison := errors.AsType[*DecodeError](listErr)
 	if listErr != nil && !isPoison {
+		// A page the store cannot read wedges the lane at this offset exactly as a
+		// send failure does, and unlike a poison row no PoisonHandler can clear it:
+		// parking is reachable only from the poison branch below. Without this call
+		// the 15-minute escalation was structurally unreachable for the worst class
+		// of wedge — a create_time that will not scan (a DSN missing
+		// parseTime=true), an event_id that is not a UUID — leaving a relay that
+		// delivers nothing for the group's lifetime looking like a two-second blip.
+		//
+		// A dead run context is a shutdown, not a wedge, and must not escalate.
+		if ctx.Err() == nil {
+			r.lane.Stuck(offset, "", listErr)
+		}
+
 		return offset, pageDone, listErr
 	}
 	if len(msgs) == 0 && poison == nil {
@@ -464,12 +504,25 @@ func (r *Relay) maybeSweep(ctx context.Context) error {
 	if !r.lastSweep.IsZero() && time.Since(r.lastSweep) < r.options.RetentionSweepInterval {
 		return nil
 	}
-	r.lastSweep = time.Now()
 	for range maxPagesPerTick {
 		n, err := r.retention.SweepMessages(ctx, r.options.RetentionSweepBatch)
 		if err != nil {
+			// Deliberately WITHOUT latching lastSweep: a sweep that deleted nothing
+			// must not buy a full RetentionSweepInterval of silence. Latching before
+			// the call meant any transient fault — a lock wait, a query-memory
+			// cancellation, a connection blip — deferred the next attempt by an hour
+			// on the default cadence while the table kept growing, and turned the
+			// retry cadence for a momentary fault into an hourly one.
+			//
+			// The interval bounds how often a SUCCESSFUL sweep runs; it is not a
+			// ration of attempts. A permanently failing sweep therefore retries once
+			// per tick, which is the same cadence every other store fault gets and is
+			// reported through PassFailed just like them.
 			return err
 		}
+		// Latched on the first page that actually completed, so the interval is
+		// measured from work done rather than from work attempted.
+		r.lastSweep = time.Now()
 		// Reported even for n == 0. A zero sweep is not always the healthy
 		// idle case: the cutoff is MIN(last_seq) across ALL groups, so one lagging
 		// or replaying group (a WithStartFromBeginning group registers at 0) pins it

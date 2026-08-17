@@ -84,7 +84,7 @@ type Store interface {
 	// classified stale and skipped — the caller must not advance its local
 	// committed-position trackers on a false return, or its lag/cliff
 	// reporting diverges from what is actually stored.
-	SaveToken(ctx context.Context, name string, token string, commitTime time.Time) (persisted bool, err error)
+	SaveToken(ctx context.Context, name, token string, commitTime time.Time) (persisted bool, err error)
 
 	// Watch opens a change stream on the outbox collection, filtered to inserts,
 	// resumed from token (or from "now" when token is ""). maxAwait is the longest
@@ -289,6 +289,18 @@ type Relay struct {
 	committedCT  time.Time
 	lastSavedTok string // last token successfully persisted (skip no-op saves on idle windows)
 
+	// baselineTok is a fresh group's resume baseline held in memory, for the case
+	// where PERSISTING it failed. Without it, a failed baseline save sends the next
+	// pass back through LoadToken == "" and into a fresh "now", silently skipping
+	// every event committed in between — the very gap the baseline exists to close.
+	// It is only ever consulted while the store still has no row for the group.
+	//
+	// In memory and not durable on purpose: a process that dies here has persisted
+	// nothing at all, which is indistinguishable from a group that never started,
+	// and inventing a durable pre-start position is not this runtime's job.
+	baselineTok string
+	baselineCT  time.Time
+
 	// clockOffset is (MongoDB server clock - this host's clock), calibrated from a
 	// clusterTime read while the relay was CAUGHT UP, where that reading is the
 	// stream head and therefore the server's "now". It lets committedTokenAge
@@ -351,7 +363,7 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	if err := options.Lease.Validate("stream", name, "DrainWindow", options.DrainWindow); err != nil {
 		return nil, err
 	}
-	if err := options.Ops.Validate("stream", "DrainWindow", options.DrainWindow); err != nil {
+	if err := options.Ops.Validate("stream", "DrainWindow", options.DrainWindow, options.LeaseTTL); err != nil {
 		return nil, err
 	}
 	if err := options.Hooks.Validate("stream"); err != nil {
@@ -389,6 +401,9 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 			Poison:     options.PoisonHandler,
 			Unsendable: options.Unsendable,
 			Label:      stuckLabel,
+			// A send is bounded by the same budget as a store call: both are a
+			// remote peer that can hold the connection open and never answer.
+			SendTimeout: options.OpTimeout,
 			// A poison event's token and id are both best-effort extractions, so
 			// a key can be empty — an episode nothing can be said about.
 			Identified: identified,

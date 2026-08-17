@@ -13,6 +13,8 @@ import (
 	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
@@ -626,6 +628,72 @@ func TestSaveTokenHealsRowWithoutClusterTime(t *testing.T) {
 	}
 	if tok != "tok1" || !gotCT.Equal(ct) {
 		t.Fatalf("legacy row not healed: token = %q ct = %v, want tok1 %v", tok, gotCT, ct)
+	}
+}
+
+// TestRelayStoreDoesNotInheritTheCallersWriteConcern pins that the two decisions
+// this store makes on behalf of the whole deployment — who leads, and where the
+// consumer group resumes — are durable regardless of how the caller configured its
+// own client.
+//
+// Nothing in this module pinned a write concern, read concern, or read preference,
+// so the leader lock and the resume token ran at whatever the application chose for
+// its BUSINESS writes. Two ordinary choices break correctness:
+//
+//   - w:1 for throughput. A partitioned primary acknowledges relay A's lock write
+//     locally, so A believes it leads and drains; the majority side elects a primary
+//     that never saw that write, B takes the lock and drains the same stream. Two
+//     leaders. The same relaxed concern lets an acked SaveToken be rolled back while
+//     the relay reports the position persisted.
+//   - readPreference=secondaryPreferred, a routine read-heavy default. LoadToken
+//     then reads the resume position from a lagging secondary, so every reopen
+//     redelivers the lag window — and if the secondary trails past the oplog window,
+//     the primary rejects resumeAfter with ChangeStreamHistoryLost, which this
+//     module classifies as FATAL and which routes an operator into a break-glass
+//     runbook whose restart-at-"now" step opens a genuine loss window. From a
+//     perfectly healthy stream and one stale read.
+//
+// A partition cannot be staged here, so the test uses an UNSATISFIABLE write
+// concern instead: w:5 against a single-node replica set. A store that inherits it
+// cannot write at all; a store that pins majority is unaffected. Same dependency,
+// observable in one node.
+func TestRelayStoreDoesNotInheritTheCallersWriteConcern(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	reset(t)
+	ctx := context.Background()
+
+	// The application's own database handle, tuned for its business writes.
+	unsatisfiable := &writeconcern.WriteConcern{W: 5}
+	appDB := testDB.Client().Database(testDB.Name(), options.Database().SetWriteConcern(unsatisfiable))
+
+	// Sanity: the concern really is unsatisfiable on this deployment, so a pass
+	// below cannot be a false negative.
+	if _, err := appDB.Collection("wc_probe").InsertOne(ctx, bson.M{"_id": "x"}); err == nil {
+		t.Skip("w:5 is satisfiable on this deployment; this test needs an unsatisfiable concern")
+	}
+
+	rs := mongodbstore.NewRelayStore(appDB)
+
+	ok, err := rs.TryAcquireLeaderLock(ctx, "wc-lock", "holder-a", time.Minute)
+	if err != nil {
+		t.Fatalf("TryAcquireLeaderLock inherited the caller's write concern: %v\n"+
+			"the lock decides who leads; at the caller's concern a partitioned primary can "+
+			"acknowledge it locally and produce two simultaneous leaders", err)
+	}
+	if !ok {
+		t.Fatal("TryAcquireLeaderLock = false on a free lock")
+	}
+
+	persisted, err := rs.SaveToken(ctx, "wc-group", "tok-1", time.Unix(1000, 0).UTC())
+	if err != nil {
+		t.Fatalf("SaveToken inherited the caller's write concern: %v\n"+
+			"a resume token acked below majority can be rolled back while the relay reports "+
+			"it persisted", err)
+	}
+	if !persisted {
+		t.Fatal("SaveToken reported persisted=false for a fresh group")
 	}
 }
 

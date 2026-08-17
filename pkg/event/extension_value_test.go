@@ -51,8 +51,10 @@ func TestValidExtensionValueRangeChecksPlainInt(t *testing.T) {
 	})
 
 	t.Run("the rest of the accepted set is unchanged", func(t *testing.T) {
-		for _, v := range []any{"s", true, int8(1), int16(1), int32(1), uint8(1), uint16(1), uint32(1),
-			float32(1), float64(1), []byte("b"), time.Now()} {
+		for _, v := range []any{
+			"s", true, int8(1), int16(1), int32(1), uint8(1), uint16(1), uint32(1),
+			float32(1), float64(1), []byte("b"), time.Now(),
+		} {
 			if err := event.ValidExtensionValue(v); err != nil {
 				t.Fatalf("ValidExtensionValue(%T) = %v, want nil", v, err)
 			}

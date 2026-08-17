@@ -11,6 +11,7 @@ import (
 	"github.com/quarks-tech/amqpx/connpool"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq/internal/publish"
 )
 
 type commandProcessorFunc func(context.Context, amqpx.Command) error
@@ -33,9 +34,9 @@ func TestSenderSendPassesCommandContextToPublish(t *testing.T) {
 	options := defaultSenderOptions()
 	WithoutPublisherConfirms()(&options)
 	sender := &Sender{
-		client:     client,
-		options:    options,
-		confirming: make(map[*amqp.Channel]struct{}),
+		client:   client,
+		options:  options,
+		confirms: publish.NewConfirms(),
 	}
 
 	err := sender.Send(t.Context(), event.NewMetadata("books.v1.BookCreated"), []byte("event"))
@@ -143,9 +144,9 @@ func TestSendRoutesOnMetadataTypeNotMarshalerType(t *testing.T) {
 			WithoutPublisherConfirms()(&options)
 			WithMessageMarshaler(retypingMarshaler{publishingType: publishingType})(&options)
 			sender := &Sender{
-				client:     client,
-				options:    options,
-				confirming: make(map[*amqp.Channel]struct{}),
+				client:   client,
+				options:  options,
+				confirms: publish.NewConfirms(),
 			}
 
 			err := sender.Send(t.Context(), event.NewMetadata("books.v1.BookCreated"), []byte("event"))
