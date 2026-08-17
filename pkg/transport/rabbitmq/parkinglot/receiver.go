@@ -3,7 +3,6 @@ package parkinglot
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"math"
 	"strconv"
 	"sync"
@@ -47,23 +46,12 @@ func defaultReceiverOptions() receiverOptions {
 		prefetchCount:   consume.DefaultPrefetchCount,
 		maxRetries:      3,
 		minRetryBackoff: time.Second * 15,
-		logger:          slogLogger{},
+		// Not nil: the failures this receiver reports through the logger are all
+		// "the delivery policy could not do its job" — a park that could not be
+		// acked, an x-death count that could not be read — and a nil logger made
+		// every one of those branches a no-op. See rabbitmq.DefaultLogger.
+		logger: rabbitmq.DefaultLogger(),
 	}
-}
-
-// slogLogger is the default logger: the failures this receiver reports through
-// it are all "the delivery policy could not do its job" — a park that could not
-// be acked, an x-death count that could not be read. Defaulting to nil made
-// every one of those branches a no-op, so a consumer could stall on unacked
-// deliveries holding QoS slots with no error, log or metric anywhere. Pass
-// WithLogger to route them somewhere else.
-//
-// slog.Default() is read per call, not captured once, so a logger installed
-// after NewReceiver still applies.
-type slogLogger struct{}
-
-func (slogLogger) Errorf(format string, args ...any) {
-	slog.Default().Error(fmt.Sprintf(format, args...))
 }
 
 type ReceiverOption func(o *receiverOptions)
@@ -110,9 +98,14 @@ func WithMarshaler(m rabbitmq.Marshaler) ReceiverOption {
 	}
 }
 
+// WithLogger routes the receiver's error reports somewhere other than
+// rabbitmq.DefaultLogger. A nil l is ignored — pass a discarding Logger to opt
+// into silence deliberately.
 func WithLogger(l rabbitmq.Logger) ReceiverOption {
 	return func(opts *receiverOptions) {
-		opts.logger = l
+		if l != nil {
+			opts.logger = l
+		}
 	}
 }
 

@@ -30,6 +30,7 @@ func defaultReceiverOptions() receiverOptions {
 	return receiverOptions{
 		marshaler:     message.Marshaler{},
 		prefetchCount: consume.DefaultPrefetchCount,
+		logger:        DefaultLogger(),
 	}
 }
 
@@ -80,9 +81,15 @@ func WithMarshaler(m Marshaler) ReceiverOption {
 	}
 }
 
+// WithLogger routes the receiver's error reports somewhere other than
+// DefaultLogger. A nil l is ignored: it used to mean "log nowhere", which is now
+// what the receiver must never silently be — pass a discarding Logger to opt
+// into silence deliberately.
 func WithLogger(l Logger) ReceiverOption {
 	return func(opts *receiverOptions) {
-		opts.logger = l
+		if l != nil {
+			opts.logger = l
+		}
 	}
 }
 

@@ -10,6 +10,26 @@ import (
 	"github.com/quarks-tech/amqpx/connpool"
 )
 
+// TestDefaultReceiverLoggerIsNotNil pins the default this receiver needs even
+// more than the plain one: the branch reporting a failed d.Ack after a DURABLE
+// park is log-and-continue by design (returning would requeue and re-park), so
+// a nil logger left the delivery unacked, holding a QoS slot, with no error, no
+// log and no metric. The unreadable-x-death branch is the same shape.
+func TestDefaultReceiverLoggerIsNotNil(t *testing.T) {
+	if defaultReceiverOptions().logger == nil {
+		t.Fatal("default logger is nil: a failed ack after a successful park would be silent")
+	}
+}
+
+func TestWithLoggerNilKeepsTheDefault(t *testing.T) {
+	o := defaultReceiverOptions()
+	WithLogger(nil)(&o)
+
+	if o.logger == nil {
+		t.Fatal("WithLogger(nil) cleared the default logger")
+	}
+}
+
 // TestPutIntoParkingLotDetachesCanceledContext pins the drain-mode contract:
 // under amqpx ProcessWithDrain the command ctx IS the canceled shutdown ctx,
 // and amqp091's PublishWithContext fast-path rejects a canceled ctx before
