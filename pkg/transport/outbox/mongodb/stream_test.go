@@ -243,16 +243,43 @@ func TestWatchSurfacesInvalidateOnDrop(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(15 * time.Second)
+	invalidated := false
 	for time.Now().Before(deadline) {
 		_, _, err := strm.Next(ctx)
 		if errors.Is(err, stream.ErrInvalidated) {
-			return // the claim: invalidate must surface as the sentinel
+			invalidated = true // the claim: invalidate must surface as the sentinel
+
+			break
 		}
 		if err != nil {
 			t.Fatalf("next returned an unexpected error instead of ErrInvalidated: %v", err)
 		}
 	}
-	t.Fatal("drop of the outbox collection never surfaced ErrInvalidated")
+	if !invalidated {
+		t.Fatal("drop of the outbox collection never surfaced ErrInvalidated")
+	}
+
+	// The server has now CLOSED the cursor, and that state must not read as an
+	// ordinary caught-up empty window.
+	//
+	// The driver reports both outcomes as TryNext()==false, and after the close it
+	// clears its own error and returns on cursor id 0 — so keying only on Err()
+	// yields (nil, false, nil) forever. drainWindow reads that as "caught up",
+	// finds the token unchanged, reports a healthy empty window, and never closes
+	// the stream, so Run never reopens either: a permanently dead relay whose only
+	// symptom is committedTokenAge climbing. An error here is what makes Run drop
+	// the stream and reopen.
+	for range 3 {
+		e, ok, err := strm.Next(ctx)
+		if err != nil {
+			return
+		}
+		if ok || e != nil {
+			t.Fatalf("Next after invalidate returned an event (%v); the cursor is closed", e)
+		}
+	}
+	t.Fatal("Next on a server-closed change stream kept reporting empty windows: " +
+		"the relay idles forever on a dead cursor instead of reopening")
 }
 
 // TestWatchJSONNullMetadataIsPoison is the regression test for the JSON-null

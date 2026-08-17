@@ -134,9 +134,13 @@ func (r *Receiver) setupTopology(conn *connpool.Conn, infos []eventbus.ServiceIn
 			"x-dead-letter-exchange": dlxExchange,
 		}
 
+		// Fanout, fronting one dead-letter queue. The parking-lot receiver declares
+		// the SAME derived name as a topic exchange, so the two must not share an
+		// incoming queue name — see consume.DLXSuffix, and DLXConflictError for the
+		// 406 that says so.
 		err := conn.Channel().ExchangeDeclare(dlxExchange, amqp.ExchangeFanout, true, false, false, false, nil)
 		if err != nil {
-			return fmt.Errorf("declare exchange %q: %w", dlxExchange, err)
+			return consume.DLXConflictError(dlxExchange, err)
 		}
 
 		_, err = conn.Channel().QueueDeclare(dlxQueue, true, false, false, false, nil)

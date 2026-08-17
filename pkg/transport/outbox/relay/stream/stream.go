@@ -93,6 +93,26 @@ type Store interface {
 	Watch(ctx context.Context, token string, maxAwait time.Duration) (Stream, error)
 }
 
+// IndexEnsurer is the optional Store capability for creating the indexes the
+// backend's own retention depends on — for the MongoDB store, the TTL index on
+// create_time. Run calls it once at start when the store has it.
+//
+// It is called by the relay rather than left to the operator because this
+// runtime has no sweep of its own, and therefore no signal when retention is
+// simply absent. The sequence runtime's retention is a delivery-gated sweep that
+// reports every pass through OnSwept, so a misconfigured one shows up as a
+// stalled counter; here the whole mechanism is a server-side TTL index, and a
+// deployment that constructed its store WithRetention but never called
+// EnsureIndexes got no error, no log and no observer signal — just a collection
+// growing to a disk incident. Making the relay ensure it closes that gap without
+// a second thing for the operator to remember.
+//
+// Implementations MUST be idempotent for an unchanged retention, since a relay
+// calls this on every start.
+type IndexEnsurer interface {
+	EnsureIndexes(ctx context.Context) error
+}
+
 // Stream is a live change-stream cursor.
 type Stream interface {
 	// Next returns the next insert event. It blocks up to maxAwait (as passed
@@ -251,6 +271,10 @@ type Relay struct {
 	reporter *notify.Reporter
 	lane     *lane.Lane[string]
 
+	// ensurer is the store's optional IndexEnsurer; nil when the backend manages
+	// its retention indexes elsewhere. Run calls it once, before the first pass.
+	ensurer IndexEnsurer
+
 	// Runtime state, populated by Run/RunOnce (pkg/.../stream/run.go).
 	stream       Stream
 	committedCT  time.Time
@@ -329,6 +353,12 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 
 	reporter := options.Reporter("stream", name)
 
+	// Asserted on the raw store, before boundedStore wraps it: the wrapper
+	// implements Store and nothing else, so the capability would be invisible
+	// afterwards. Its absence is legitimate (a backend whose retention indexes are
+	// managed by migrations, or a test double), so it is not an error.
+	ensurer, _ := store.(IndexEnsurer)
+
 	return &Relay{
 		name: name,
 		// Every store operation is decorated with its bound at construction —
@@ -337,6 +367,7 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		options:  options,
 		leader:   elector,
 		reporter: reporter,
+		ensurer:  ensurer,
 		lane: &lane.Lane[string]{
 			Reporter:   reporter,
 			Sender:     sender,

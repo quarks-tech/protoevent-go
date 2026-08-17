@@ -192,6 +192,7 @@ type relayQueries struct {
 	assignSeq     string
 	bumpSequencer string
 	acquireLock   string
+	readLockHold  string
 	releaseLock   string
 	sweep         string
 	storeNow      string
@@ -199,22 +200,29 @@ type relayQueries struct {
 
 // Leader-lock outcomes, as reported by acquireLock's LastInsertId.
 //
-//   - lockInserted (0) is not a value the statement writes: it is what the OK
-//     packet carries when the INSERT succeeded outright, because ON DUPLICATE
-//     KEY UPDATE never ran and relay_locks has no AUTO_INCREMENT column (see
-//     migrations/000001_create_outbox.up.sql — a generated id there would
-//     collide with the sentinels below). A fresh insert means the lock was free
-//     and is now ours.
 //   - lockTaken (1): the row existed and the conditional took or renewed it.
 //   - lockLost (2): the row existed, belongs to a live holder, and was left
 //     untouched.
+//   - lockUnreported (0) is not a value the statement writes, and it does not
+//     identify an outcome at all. It is what the OK packet carries whenever
+//     LAST_INSERT_ID(expr) did not set one — which happens for the fresh INSERT
+//     (ON DUPLICATE KEY UPDATE never ran, and relay_locks has no AUTO_INCREMENT
+//     column; see migrations/000001_create_outbox.up.sql, where a generated id
+//     would collide with the sentinels here) AND equally for any driver, proxy
+//     or server build that does not propagate LAST_INSERT_ID(expr) at all.
 //
-// Any other value is treated as an error, not as leadership: this is the one
-// place where guessing "probably ours" turns into two active leaders.
+// Those two are not distinguishable in the packet, and they demand opposite
+// answers: the first won the lock, the second may well have LOST it. Reading 0
+// as leadership — which this used to do, sharing a `case` with lockTaken —
+// therefore made the fail-closed default branch below unreachable for the one
+// outcome it was written for, and in an environment where LAST_INSERT_ID does
+// not survive, EVERY replica read 0 on EVERY tick and ran as leader. So 0 is
+// resolved by reading the row back (see TryAcquireLeaderLock) rather than
+// guessed at. Any OTHER value is an error, not leadership.
 const (
-	lockInserted = 0
-	lockTaken    = 1
-	lockLost     = 2
+	lockUnreported = 0
+	lockTaken      = 1
+	lockLost       = 2
 )
 
 func buildRelayQueries(c config) relayQueries {
@@ -292,7 +300,11 @@ ON DUPLICATE KEY UPDATE
     holder_id   = IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), VALUES(holder_id), holder_id),
     expire_time = IF(LAST_INSERT_ID(IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), %d, %d)) = %d,
                      VALUES(expire_time), expire_time)`, locks, lockTaken, lockLost, lockTaken),
-		releaseLock: fmt.Sprintf(`DELETE FROM %s WHERE name = ? AND holder_id = ?`, locks),
+		// Only issued on the lockUnreported path — a fresh insert, or an
+		// environment that does not propagate LAST_INSERT_ID at all — never on the
+		// steady-state renewal. See TryAcquireLeaderLock.
+		readLockHold: fmt.Sprintf(`SELECT holder_id FROM %s WHERE name = ?`, locks),
+		releaseLock:  fmt.Sprintf(`DELETE FROM %s WHERE name = ? AND holder_id = ?`, locks),
 		// The cutoff is evaluated against the DATABASE clock (NOW(6)), per the
 		// Sweeper contract: a skewed relay host must not sweep early or
 		// pin rows forever. The bound parameter is the store's own retention
@@ -647,11 +659,22 @@ func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, err
 // TryAcquireLeaderLock acquires or renews the lock; the incoming holder wins if
 // the lock is free (expired) or already theirs. TTL is applied via DB clock.
 //
-// One statement, no read-back: the upsert reports its own outcome through
+// One statement in the steady state: the upsert reports its own outcome through
 // LastInsertId (see acquireLock and the lock* constants). Beyond saving a round
-// trip per tick this removes a race the read-back had — between the upsert and
-// the SELECT, a graceful ReleaseLeaderLock could delete the row we had just
-// won, and we reported false for a lock we held.
+// trip per tick this removes a race the unconditional read-back had — between
+// the upsert and the SELECT, a graceful ReleaseLeaderLock could delete the row
+// we had just won, and we reported false for a lock we held.
+//
+// The one outcome the packet cannot express is lockUnreported (0), which covers
+// both the fresh INSERT and an environment where LAST_INSERT_ID(expr) does not
+// survive to the client. That case, and only that case, pays for a read-back:
+// whoever's holder_id is in the row is the leader, which is the same question
+// the sentinel was answering, asked of the authoritative place. It costs one
+// extra round trip once per lock-row lifetime in a healthy deployment, and one
+// per tick in a broken one — where the alternative was every replica leading.
+// The read-back's own race is benign in the safe direction: a row deleted by a
+// concurrent ReleaseLeaderLock reads as "not ours" and costs at most one tick of
+// leadership, never a second leader.
 func (rs *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
 	res, err := rs.db.ExecContext(ctx, rs.q.acquireLock, name, holderID, ttl.Microseconds())
 	if err != nil {
@@ -662,19 +685,39 @@ func (rs *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID s
 		return false, fmt.Errorf("outbox: acquire lock outcome: %w", err)
 	}
 	switch outcome {
-	case lockInserted, lockTaken:
+	case lockTaken:
 		return true, nil
 	case lockLost:
 		return false, nil
+	case lockUnreported:
+		return rs.holdsLeaderLock(ctx, name, holderID)
 	default:
 		// Fail closed and loudly. An unrecognized value means the statement no
-		// longer means what the constants say (a schema with an AUTO_INCREMENT
-		// on relay_locks, a driver that does not surface LAST_INSERT_ID), and
-		// the safe reading of "I don't know" is "not the leader" — guessing the
-		// other way runs every replica as leader.
+		// longer means what the constants say (a schema with an AUTO_INCREMENT on
+		// relay_locks would collide with the sentinels), and the safe reading of
+		// "I don't know" is "not the leader" — guessing the other way runs every
+		// replica as leader.
 		return false, fmt.Errorf("outbox: acquire lock: unexpected outcome %d from the leader-lock upsert "+
-			"(want %d inserted, %d taken, or %d lost)", outcome, lockInserted, lockTaken, lockLost)
+			"(want %d taken, %d lost, or %d unreported)", outcome, lockTaken, lockLost, lockUnreported)
 	}
+}
+
+// holdsLeaderLock resolves the lockUnreported outcome by reading the row the
+// upsert just wrote. A missing row (a concurrent ReleaseLeaderLock, or a delete
+// by hand) is answered "not the leader": the conservative direction, and the
+// next tick's upsert re-creates it.
+func (rs *RelayStore) holdsLeaderLock(ctx context.Context, name, holderID string) (bool, error) {
+	var holder string
+
+	err := rs.db.QueryRowContext(ctx, rs.q.readLockHold, name).Scan(&holder)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("outbox: read lock holder: %w", err)
+	}
+
+	return holder == holderID, nil
 }
 
 // ReleaseLeaderLock drops the lock if still held by holderID.

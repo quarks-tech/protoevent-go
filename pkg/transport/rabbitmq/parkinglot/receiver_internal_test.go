@@ -22,10 +22,16 @@ func TestPutIntoParkingLotDetachesCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
+	// The channel is pre-marked as already in confirm mode so enableConfirms
+	// short-circuits: otherwise ch.Confirm panics on the zero-value channel
+	// before the ctx ever reaches the publish, and the assertion below would pass
+	// for the wrong reason.
+	ch := &amqp.Channel{}
 	receiver := &Receiver{
-		options: receiverOptions{dlxExchange: "events.dlx"},
+		options:    receiverOptions{dlxExchange: "events.dlx"},
+		confirming: map[*amqp.Channel]struct{}{ch: {}},
 	}
-	conn := connpool.NewConn(nil, &amqp.Channel{})
+	conn := connpool.NewConn(nil, ch)
 
 	var err error
 	panicked := func() (panicked bool) {

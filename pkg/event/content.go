@@ -145,11 +145,14 @@ func isMediaTypeToken(s string) bool {
 // dot-less type into a panic in two of them.
 //
 // The type may come from an incoming message or a persisted outbox row, so a
-// malformed value is always an error and never a panic.
+// malformed value is always an error and never a panic. That error wraps
+// ErrUnsendable: a type without a dot is a property of the value, not of the
+// downstream, so a relay holding such a row must be able to park it rather than
+// retry it forever.
 func SplitType(eventType string) (service, name string, err error) {
 	pos := strings.LastIndex(eventType, ".")
 	if pos <= 0 || pos == len(eventType)-1 {
-		return "", "", fmt.Errorf("malformed event type %q: want <service>.<event>", eventType)
+		return "", "", fmt.Errorf("%w: malformed event type %q: want <service>.<event>", ErrUnsendable, eventType)
 	}
 
 	return eventType[:pos], eventType[pos+1:], nil

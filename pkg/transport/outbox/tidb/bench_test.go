@@ -26,9 +26,18 @@ func BenchmarkPublish(b *testing.B) {
 }
 
 // BenchmarkSequenceMessages measures the batch-sequence pass (the FOR UPDATE
-// + ROW_NUMBER pass) over 500 pre-inserted pending rows. The 500 rows are
-// inserted OUTSIDE the timed region each iteration so only the sequencer
-// pass itself is measured.
+// + ROW_NUMBER pass) over 500 pending rows.
+//
+// The 500 rows are inserted ONCE, before the loop; each iteration only unsets
+// their seq and rewinds the counter so the same pass can run again. That reset
+// is two statements, against the ~500 the insert would cost.
+//
+// The ratio is the point, not the tidiness. b.Loop() sizes the run by the
+// TIMED duration, so untimed setup inside the loop is invisible to it and
+// inflates wall clock without bound: at 500 untimed round trips per millisecond
+// of measured work, `go test -bench=.` with the default 1s benchtime does not
+// finish in any useful time. Keeping the reset comparable to the measured pass
+// keeps the benchmark's wall clock proportional to its benchtime.
 func BenchmarkSequenceMessages(b *testing.B) {
 	if testDB == nil {
 		b.Skip("no TiDB")
@@ -37,16 +46,33 @@ func BenchmarkSequenceMessages(b *testing.B) {
 	ctx := context.Background()
 	st := tidb.NewRelayStore(testDB)
 
+	truncate(b)
+	for range 500 {
+		publish(b, "s")
+	}
+
 	for b.Loop() {
 		b.StopTimer()
-		truncate(b)
-		for range 500 {
-			publish(b, "s")
-		}
+		resequence(b)
 		b.StartTimer()
 
 		if _, err := st.SequenceMessages(ctx, 1000); err != nil {
 			b.Fatalf("sequence: %v", err)
+		}
+	}
+}
+
+// resequence returns every row to the unsequenced state and rewinds the
+// sequencer counter, so a sequencer pass can be measured repeatedly over the
+// same rows. Deliberately cheap — see BenchmarkSequenceMessages.
+func resequence(tb testing.TB) {
+	tb.Helper()
+	for _, q := range []string{
+		"UPDATE outbox_messages SET seq = NULL",
+		"UPDATE outbox_sequencers SET next_seq = 1 WHERE name = 'default'",
+	} {
+		if _, err := testDB.ExecContext(context.Background(), q); err != nil {
+			tb.Fatalf("resequence (%s): %v", q, err)
 		}
 	}
 }

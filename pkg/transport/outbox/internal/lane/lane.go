@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/notify"
@@ -81,8 +82,9 @@ type Lane[P comparable] struct {
 //
 //   - A canceled run context is a shutdown, not a message fault: stop without
 //     parking a healthy message and without reporting an incident.
-//   - A failure the Unsendable classifier calls PERMANENT for this message is
-//     parked like a poison row. Retrying it could never succeed, and leaving it
+//   - A failure that is PERMANENT for this message — claimed by the Unsendable
+//     classifier, or carrying the transports' own event.ErrUnsendable marker (see
+//     permanent) — is parked like a poison row. Retrying it could never succeed, and leaving it
 //     at the head of the log would wedge every message behind it indefinitely,
 //     recoverable only by hand-editing positions in a live database. Only a
 //     CONFIRMED park advances past it; an unconfirmed one stops the lane and
@@ -103,7 +105,7 @@ func (l *Lane[P]) Send(ctx context.Context, pos P, msg *outbox.Message) Disposit
 		return Canceled
 	}
 
-	if l.Unsendable != nil && l.Unsendable(sendErr) {
+	if l.permanent(sendErr) {
 		// MessageFailure has already reported this failure, so the stop path
 		// below must not report it a second time — double-counting OnError
 		// misrepresents the incident's size.
@@ -126,6 +128,31 @@ func (l *Lane[P]) Send(ctx context.Context, pos P, msg *outbox.Message) Disposit
 	l.Stuck(pos, msg.ID, sendErr)
 
 	return Stopped
+}
+
+// permanent reports whether a send failure is permanent for THIS message, and so
+// may be parked rather than retried forever.
+//
+// Two sources, and the built-in one is why this is a method rather than a bare
+// call to Unsendable. event.ErrUnsendable is the transports' own marker for
+// metadata they can never serialize — a dot-less event type, a reserved
+// extension name, a value the wire format cannot carry. Publish-time validation
+// keeps such metadata out of the store, but an outbox row is DURABLE: rows
+// written before those checks existed still arrive here, and without the marker
+// their rejection is an opaque error no classifier claims, so the lane stops on
+// that row every tick forever with nothing behind it delivered.
+//
+// It is honored only when a PoisonHandler exists, because "permanent" authorizes
+// advancing past the message and there would be nowhere to put it — parking with
+// a nil handler silently drops the event (Reporter.MessageFailure returns nil
+// when no handler is configured). With no handler the lane stops instead, which
+// is exactly how it already treats an undecodable poison row.
+func (l *Lane[P]) permanent(err error) bool {
+	if l.Poison != nil && errors.Is(err, event.ErrUnsendable) {
+		return true
+	}
+
+	return l.Unsendable != nil && l.Unsendable(err)
 }
 
 // Park hands a message the relay can never deliver — one whose persisted payload

@@ -15,6 +15,7 @@ package consume
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -27,10 +28,51 @@ import (
 )
 
 // DLXSuffix names the dead-letter exchange (and queue) a receiver derives from its
-// incoming queue. Both receivers derive it, and they must agree: a plain receiver
-// and a parking-lot receiver pointed at the same queue name would otherwise declare
-// two different broker-side topologies for the same logical DLX.
+// incoming queue: "<incoming queue>.dlx". It is defined once so the two receivers
+// cannot drift to different names for it by accident.
+//
+// The two DO NOT agree on its topology, and cannot: rabbitmq.Receiver declares it
+// as a FANOUT exchange fronting a single dead-letter queue, while
+// parkinglot.Receiver declares it as a TOPIC exchange routing wait / retry /
+// parkingLot. Both shapes long predate this constant, and each is right for its
+// own receiver.
+//
+// The consequence is a hard rule: a plain receiver with WithDLX() and a
+// parking-lot receiver MUST NOT be pointed at the same incoming queue name.
+// Whichever declares second gets AMQP 406 PRECONDITION_FAILED on the exchange
+// type, which tears the channel down and fails Setup — and therefore
+// eventbus.Subscribe — at startup. Making the types match would not help either:
+// the plain receiver dead-letters with the original routing key, which a topic
+// exchange bound only on wait/retry/parkingLot drops as unroutable, so every
+// dead-lettered message would vanish instead. Give the two receivers different
+// queue names (WithIncomingQueue). DLXConflictError turns the raw 406 into that
+// sentence.
 const DLXSuffix = ".dlx"
+
+// preconditionFailedCode is AMQP's 406 PRECONDITION_FAILED: a passive-equivalent
+// redeclaration whose arguments differ from the existing entity's.
+const preconditionFailedCode = 406
+
+// DLXConflictError annotates a failed DLX exchange declaration with the one cause
+// an operator cannot guess from the raw AMQP error.
+//
+// A 406 here means the exchange already exists with different arguments, and in
+// practice that means the other receiver declared it first — see DLXSuffix. The
+// broker's own message says only "inequivalent arg 'type'", names no receiver, and
+// arrives with the channel already torn down, so the failure reads as a broker
+// problem rather than as two receivers sharing one queue name.
+func DLXConflictError(exchange string, err error) error {
+	var aErr *amqp.Error
+	if errors.As(err, &aErr) && aErr.Code == preconditionFailedCode {
+		return fmt.Errorf("declare exchange %q: %w — it already exists with a different type, "+
+			"which is what happens when a rabbitmq.Receiver with WithDLX() and a parkinglot.Receiver "+
+			"share an incoming queue name (they declare this exchange as fanout and as topic "+
+			"respectively, and the two topologies are not interchangeable); give them different "+
+			"WithIncomingQueue names", exchange, err)
+	}
+
+	return fmt.Errorf("declare exchange %q: %w", exchange, err)
+}
 
 // DefaultPrefetchCount is the prefetch a receiver starts with when the caller
 // configures none.
@@ -144,7 +186,14 @@ func processDelivery(
 	}
 
 	if spec.Logger != nil {
-		spec.Logger.Errorf("unmarshaling event [%+v]: %s", delivery, err)
+		// Identify the delivery, never dump it. `%+v` of an amqp.Delivery prints
+		// Body and Headers, so an undecodable message would spill its payload —
+		// and any credential a publisher put in a header — into the logs, for a
+		// failure whose cause is the decode error, not the content. Routing key,
+		// message id and content type are what an operator needs to find it on
+		// the broker.
+		spec.Logger.Errorf("unmarshaling event (exchange=%q routing_key=%q message_id=%q content_type=%q): %s",
+			delivery.Exchange, delivery.RoutingKey, delivery.MessageId, delivery.ContentType, err)
 	}
 
 	return eventbus.NewUnprocessableEventError(err)

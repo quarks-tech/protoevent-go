@@ -26,6 +26,8 @@ func (r *Relay) Run(ctx context.Context) error {
 	defer r.closeStream()
 	defer r.reporter.ReleaseLeadership(r.leader)
 
+	r.ensureIndexes(ctx)
+
 	for {
 		if ctx.Err() != nil {
 			// context.Cause degrades to ctx.Err() under a plain WithCancel and
@@ -62,6 +64,29 @@ func (r *Relay) Run(ctx context.Context) error {
 			r.closeStream()
 			r.sleep(ctx)
 		}
+	}
+}
+
+// ensureIndexes creates the store's retention indexes once at start, when the
+// store offers that capability (IndexEnsurer). Idempotent by contract, so every
+// replica may call it.
+//
+// A failure is logged, never returned. The two ways it fails are both survivable
+// and neither is a reason to refuse to deliver events: the relay's credentials
+// may not permit DDL because indexes are managed by migrations, and a retention
+// value changed against an existing collection is rejected outright
+// (IndexOptionsConflict — MongoDB requires collMod, see the store's own hint).
+// Failing Run on either would turn a retention misconfiguration into a total
+// delivery outage, which is strictly worse than the unbounded growth it warns
+// about.
+func (r *Relay) ensureIndexes(ctx context.Context) {
+	if r.ensurer == nil {
+		return
+	}
+	if err := r.ensurer.EnsureIndexes(ctx); err != nil {
+		r.options.Logger.Warn("stream relay: could not ensure the store's retention indexes; "+
+			"the outbox collection may grow without bound until this is resolved",
+			"relay", r.name, "err", err)
 	}
 }
 
@@ -139,15 +164,24 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		e, ok, err := r.stream.Next(ctx)
 		if err != nil {
 			de, isPoison := errors.AsType[*DecodeError](err)
-			if isPoison && de.ResumeToken != "" && de.ID != "" && r.options.PoisonHandler != nil && ctx.Err() == nil {
+			if isPoison && de.ResumeToken != "" && r.options.PoisonHandler != nil && ctx.Err() == nil {
 				// lane.Park owns the confirmed-park rule (advance only on nil).
-				// The GATE above it is this runtime's own: parking needs BOTH the
-				// resume token and the id, and both extractions are best-effort. An
-				// empty TOKEN would later persist "" and erase the group's position;
-				// an empty ID leaves the parked stub unanswerable, since the stub is
-				// all the handler receives and fetching the row by ID is its
-				// documented recovery. Either way, stopping the lane is loud and
-				// recoverable where advancing past it is neither.
+				// The GATE above it is this runtime's own, and it turns on the
+				// resume TOKEN alone: without one there is no position to advance
+				// to, and saving "" would erase the group's stored position
+				// outright, so stopping the lane really is the lesser harm.
+				//
+				// A missing ID is NOT part of the gate, though it used to be. Both
+				// extractions are best-effort and independent (watch.go pulls the
+				// token from _id and the row id from fullDocument._id), so a
+				// corrupted fullDocument yields a perfectly good token with an
+				// empty id — and refusing to park that left the stream reopening
+				// onto the same event every window forever, with a PoisonHandler
+				// installed and willing to take it. A wedge is not the lesser harm
+				// there; an idless stub is. The handler gets a stub it cannot look
+				// up by id, but it also gets the DecodeError, whose resume token
+				// positions the event in the oplog — and the sequence runtime, which
+				// gates on the handler alone, has always behaved this way.
 				parkErr := r.lane.Park(ctx, stuckKey(de.ResumeToken, de.ID), &outbox.Message{ID: de.ID}, err)
 				if parkErr == nil {
 					// Poison event parked: resume past it. CommitTime
@@ -324,10 +358,24 @@ func (r *Relay) saveToken(ctx context.Context, tok string, ct time.Time) error {
 	if err != nil {
 		return err
 	}
-	if persisted {
-		r.lastSavedTok = tok
-		r.committedCT = ct
+	if !persisted {
+		// Not an error — the store's monotone guard did its job — but not a
+		// non-event either: this relay believed it was the leader and delivered a
+		// window whose position another writer had already moved past, so those
+		// events were very likely delivered twice. Silence made a split-brain
+		// leader look identical to a healthy one, since every other signal
+		// (OnDrained, leadership) reports success. Logged rather than returned:
+		// failing the pass would close and reopen the stream on a condition the
+		// next tick's TryAcquire resolves anyway.
+		r.options.Logger.Warn("stream relay: resume token rejected as stale; another writer holds a newer position",
+			"relay", r.name)
+
+		return nil
 	}
+
+	r.lastSavedTok = tok
+	r.committedCT = ct
+
 	return nil
 }
 

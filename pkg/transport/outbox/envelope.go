@@ -15,6 +15,24 @@ import (
 // the row does not actually contain.
 var ErrPoisonEnvelope = errors.New("outbox: persisted metadata is unusable")
 
+// Compile-time pin on event.Metadata's OWN JSON codec, which is what the
+// persisted envelope below depends on: a *url.URL does not survive the reflected
+// struct encoding (see event.Metadata.MarshalJSON), so a DataSchema written that
+// way is read back with a spurious "//@" authority — durably, in every relayed
+// event.
+//
+// It has to be pinned at COMPILE time because nothing here NAMES the codec:
+// json.Marshal accepts any value, so a build against a protoevent-go that
+// predates the marshaler silently degrades to the corrupting encoding instead of
+// failing. That build is not hypothetical — it is what an external
+// `go get` of this module resolves whenever this go.mod's protoevent-go require
+// is a tag older than the marshaler, and go.work hides it in-repo. With these
+// assertions such a build fails and `make check-modules` reports it.
+var (
+	_ json.Marshaler   = event.Metadata{}
+	_ json.Unmarshaler = (*event.Metadata)(nil)
+)
+
 // MarshalMetadata encodes event metadata for persistence.
 //
 // It lives here, in the module both backends depend on, rather than in each
@@ -61,18 +79,42 @@ func UnmarshalMetadata(b []byte) (*event.Metadata, error) {
 }
 
 // ValidateMetadata checks the write-side preconditions every backend shares: a
-// message must carry metadata, and that metadata must carry a time.
+// message must carry metadata, that metadata must carry a time, its event type
+// must have the shape a transport can route, and every extension must be one a
+// transport can serialize.
 //
 // The zero-time rejection is the write half of UnmarshalMetadata's poison rule.
 // It also keeps a zero time out of SQL DATETIME columns, where 0001-01-01 is
 // below the minimum and surfaces as an opaque driver error from inside the
 // caller's business transaction.
+//
+// The type and extension rules are the SAME ones eventbus.publish enforces, and
+// they are repeated here rather than trusted to it because the outbox Sender is
+// reachable without the bus: a forwarder that re-publishes an incoming
+// event.Metadata straight through outboxSender.Send (the shape the README shows)
+// never passes through publish at all. The consequence of letting one such row
+// commit is not a failed publish but a wedged relay — the RabbitMQ sender needs
+// the dot to split exchange from routing key and the AMQP field encoder refuses a
+// nested extension, both at SEND time, and neither failure is a DecodeError any
+// classifier claims, so the lane stops on that row every tick forever. Rejecting
+// it here costs the caller's transaction one error instead.
 func ValidateMetadata(md *event.Metadata) error {
 	if md == nil {
 		return errors.New("outbox: message metadata is nil")
 	}
 	if md.Time.IsZero() {
 		return errors.New("outbox: message metadata time is zero; set Metadata.Time before publishing")
+	}
+	if _, _, err := event.SplitType(md.Type); err != nil {
+		return fmt.Errorf("outbox: message metadata type: %w", err)
+	}
+	for k, v := range md.Extensions {
+		if event.ReservedExtensionName(k) {
+			return fmt.Errorf("outbox: extension %q collides with a core CloudEvents attribute; rename it", k)
+		}
+		if err := event.ValidExtensionValue(v); err != nil {
+			return fmt.Errorf("outbox: extension %q: %w", k, err)
+		}
 	}
 
 	return nil

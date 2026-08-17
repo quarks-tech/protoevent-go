@@ -115,6 +115,18 @@ type UnsendableClassifier func(err error) bool
 
 // LeaderStore enables running multiple relay instances with automatic failover.
 // Only the lock holder processes; others idle. Shared by both runtimes.
+//
+// Each runtime's NewRelay discovers this capability with a plain type assertion,
+// and a store that does not satisfy it is a construction ERROR unless the caller
+// waives election with WithoutLeaderElection.
+//
+// That used to be a soft check — a miss meant always-leader single-instance mode
+// — backed by a reflective probe for the two method NAMES, so a store that meant
+// to elect but had drifted would fail loudly instead of silently running dual
+// leaders. The probe could not see a drift that kept both names (the likely one:
+// a signature change), so it never closed the hole it was written for. An
+// explicit waiver does: absence is now either declared or an error, and no store
+// can be silently downgraded to always-leader.
 type LeaderStore interface {
 	// TryAcquireLeaderLock acquires or renews the lock. Returns true if holderID
 	// holds it after the call. The lock expires after ttl if not renewed.
@@ -166,15 +178,3 @@ func (e *StuckLaneError) Error() string {
 }
 
 func (e *StuckLaneError) Unwrap() error { return e.Err }
-
-// Leadership discovery is a plain type assertion in each runtime's NewRelay, and
-// a store that does not satisfy LeaderStore is a construction ERROR unless the
-// caller waives election with WithoutLeaderElection.
-//
-// It used to be a soft check — a miss meant always-leader single-instance mode —
-// backed by a reflective probe for the two method NAMES, so that a store which
-// meant to elect but had drifted would fail loudly instead of silently running
-// dual leaders. That probe could not see a drift that kept both names (the likely
-// one: a signature change), so it did not close the hole it was written for. An
-// explicit waiver does close it: absence is now either declared or an error, and
-// no store can be silently downgraded to always-leader.

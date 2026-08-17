@@ -22,8 +22,9 @@ import (
 // always-leader. Both contracts belong to *RelayStore — the publish *Store
 // deliberately implements neither.
 var (
-	_ stream.Store      = (*RelayStore)(nil)
-	_ relay.LeaderStore = (*RelayStore)(nil)
+	_ stream.Store        = (*RelayStore)(nil)
+	_ relay.LeaderStore   = (*RelayStore)(nil)
+	_ stream.IndexEnsurer = (*RelayStore)(nil)
 )
 
 // resumeTokenTimestampMarker is the KeyString type marker that opens a resume
@@ -109,6 +110,23 @@ func (m *mongoStream) Next(ctx context.Context) (*stream.Event, bool, error) {
 	if !m.cs.TryNext(ctx) {
 		err := m.cs.Err()
 		if err == nil {
+			// Err() == nil is NOT enough to call this an empty window: the driver
+			// reports a stream the SERVER closed the same way. Its loopNext clears
+			// cs.err and returns on `cs.ID() == 0` (change_stream.go), so a closed
+			// cursor yields (false, nil) forever — and reading that as "caught up"
+			// leaves the relay idling on a dead stream while drainWindow keeps
+			// reporting healthy empty windows and Run never reopens, because
+			// r.stream is still non-nil. The only symptom is committedTokenAge
+			// climbing. Both checks are required; the driver's own docs say so.
+			//
+			// Surfaced as an ordinary transient error, not a fatal: Run's default
+			// branch closes the stream and reopens from the persisted token, which
+			// is exactly the recovery. Only when that token has fallen off the
+			// oplog does the reopen escalate to ErrHistoryLost, from Watch.
+			if m.cs.ID() == 0 {
+				return nil, false, errors.New("outbox: change stream closed by the server; reopening from the persisted token")
+			}
+
 			return nil, false, nil // empty window
 		}
 		if isHistoryLost(err) {

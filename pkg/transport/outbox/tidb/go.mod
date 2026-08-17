@@ -11,16 +11,20 @@ require (
 	// one affected. It uses outbox APIs (Message.Seq, relay/sequence) absent from the
 	// pinned outbox v0.4.3, and the branch also adds root-module APIs (event.SplitType,
 	// event.Metadata's JSON marshaler) absent from the pinned protoevent-go v0.4.2 —
-	// which puts ../mongodb and ../../rabbitmq in the same position. Everything builds
-	// only inside the repo's go.work; `make check-modules` reproduces what an external
-	// `go get` sees.
+	// which puts ../mongodb, ../../rabbitmq AND pkg/transport/outbox itself in the same
+	// position. Everything builds only inside the repo's go.work; `make check-modules`
+	// reproduces what an external `go get` sees.
 	//
 	// Publishing order — a `replace` cannot substitute, because Go ignores replace
 	// directives in a non-main module, so a consumer would still resolve the tags below:
 	//  1. merge, then tag the ROOT module vX.Y.Z from master (event.SplitType et al.);
-	//  2. bump the protoevent-go pin here, in ../mongodb, and in ../../rabbitmq;
+	//  2. bump the protoevent-go pin in pkg/transport/outbox FIRST — it is the module
+	//     every store depends on, and its envelope.go is what needs the root's JSON
+	//     marshaler — then here, in ../mongodb, and in ../../rabbitmq;
 	//  3. tag pkg/transport/outbox/vX.Y.Z;
-	//  4. bump the outbox pin here and in ../mongodb;
+	//  4. bump the outbox pin here and in ../mongodb, then run `go mod tidy` in BOTH so
+	//     go.sum carries the new outbox hashes — a require without them fails the
+	//     GOWORK=off build on go.sum verification, which step 5 catches;
 	//  5. verify with `make check-modules` — it must report OK for all five modules;
 	//  6. only then tag pkg/transport/outbox/tidb, .../mongodb and .../rabbitmq.
 	github.com/quarks-tech/protoevent-go v0.4.2

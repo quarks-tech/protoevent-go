@@ -17,8 +17,6 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
-	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/stream"
 )
 
 // The three collections of one outbox instance. One prefix applies to all of
@@ -74,10 +72,14 @@ func WithCollectionPrefix(prefix string) Option {
 	return func(c *config) { c.prefix = prefix }
 }
 
-// WithRetention sets the outbox TTL applied by RelayStore.EnsureIndexes —
-// which MUST be called for the TTL to exist at all; the option alone changes
-// nothing. (It is therefore meaningful only on NewRelayStore: the publish
-// Store creates no indexes.) Default 7 days; it MUST exceed the oplog window
+// WithRetention sets the outbox TTL applied by RelayStore.EnsureIndexes. It is
+// meaningful only on NewRelayStore: the publish Store creates no indexes.
+// stream.Relay.Run calls EnsureIndexes for you at start (the RelayStore is a
+// stream.IndexEnsurer), so a relayed outbox gets its TTL without a separate
+// call; a deployment that creates no relay — or whose relay credentials cannot
+// issue DDL, where Run only warns — must still call it explicitly, because the
+// option alone changes nothing.
+// Default 7 days; it MUST exceed the oplog window
 // (see the README's resume-token-cliff sizing rule). The value is stored as
 // given — a non-positive or fractional-second d is rejected loudly by
 // EnsureIndexes rather than silently ignored here: a zero from a miscomputed
@@ -189,16 +191,61 @@ func (s *Store) WithSession(sess *mongo.Session) *Store {
 // ctx is the driver's session context, so the caller's own writes join the
 // same transaction with no extra wiring. Retry semantics (transient errors,
 // unknown commit results) are the driver's own Session.WithTransaction.
+//
+// An AMBIENT transaction is JOINED, never shadowed. MongoDB has no nested
+// transactions, so starting a second session here — which is what this used to
+// do unconditionally — would commit the outbox row on its own the moment fn
+// returned, independently of the caller's business write. If the outer
+// transaction then aborted, the business row was never written while the event
+// WAS relayed: the phantom event this whole store exists to prevent, produced by
+// the very helper whose name promises atomicity. It is reachable through this
+// package alone — `st.WithTransaction(sc, …)` inside a caller's own
+// sess.WithTransaction, or on the *Store handed to an outer callback — and
+// CreateOutboxMessage's competing-session guard cannot see it, because by then
+// the ctx session IS the new one.
+//
+// So the session is resolved first, in the same order CreateOutboxMessage
+// resolves it, and for the same reason: the driver takes the session from the
+// CONTEXT, so the transaction can legitimately arrive either as a bound value or
+// through the ctx, and two DIFFERENT ones must never be reconciled by silently
+// picking one. When the resolved session already has a transaction running, fn
+// runs inside it — committing or aborting stays the outer owner's call, so an
+// error from fn propagates for that owner to act on.
 func (s *Store) WithTransaction(ctx context.Context, fn func(ctx context.Context, tx *Store) error) error {
+	ctxSess := mongo.SessionFromContext(ctx)
+	switch {
+	case s.sess != nil:
+		if ctxSess != nil && ctxSess != s.sess {
+			return errors.New("outbox: with transaction: ctx carries a different session than the store is bound to; " +
+				"use one transaction, not two")
+		}
+
+		return s.runInSession(ctx, s.sess, fn)
+	case ctxSess != nil:
+		return s.runInSession(ctx, ctxSess, fn)
+	}
+
 	sess, err := s.db.Client().StartSession()
 	if err != nil {
 		return fmt.Errorf("outbox: start session: %w", err)
 	}
 	defer sess.EndSession(ctx)
 
-	_, err = sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
+	return s.runInSession(ctx, sess, fn)
+}
+
+// runInSession runs fn on sess: joining the transaction already running on it,
+// or starting one when there is none. Splitting it out keeps the three arms of
+// WithTransaction's session resolution to one line each.
+func (s *Store) runInSession(ctx context.Context, sess *mongo.Session, fn func(ctx context.Context, tx *Store) error) error {
+	if sess.TransactionRunning() {
+		return fn(mongo.NewSessionContext(ctx, sess), s.WithSession(sess))
+	}
+
+	_, err := sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
 		return nil, fn(sc, s.WithSession(sess))
 	})
+
 	return err
 }
 
@@ -330,13 +377,9 @@ func NewRelayStore(db *mongo.Database, opts ...Option) *RelayStore {
 	}
 }
 
-// Compile-time capability pins for *RelayStore: the stream runtime discovers
-// LeaderStore by type assertion, so signature drift would otherwise downgrade
-// silently to always-leader (or fail NewRelay outright).
-var (
-	_ stream.Store      = (*RelayStore)(nil)
-	_ relay.LeaderStore = (*RelayStore)(nil)
-)
+// The compile-time capability pins for *RelayStore live in watch.go, next to
+// the Watch implementation that makes it a stream.Store — one block, so a
+// reader cannot find a partial list and take it for the whole set.
 
 // EnsureIndexes creates the TTL index on outbox.create_time. Idempotent for an
 // unchanged retention; when the index already exists with a DIFFERENT

@@ -3,6 +3,7 @@ package sequence
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -26,6 +27,33 @@ const maxPagesPerTick = 64
 // leadership is not an error; a persistent leader-store error resurfaces via
 // the next tick's opening TryAcquire.
 var errLostLeadership = errors.New("sequence: leadership lost mid-pass")
+
+// errLeaseRenewFailed additionally marks a renewal that could not be EVALUATED —
+// the leader store itself errored — as opposed to one that cleanly reported the
+// lock lost. It always accompanies errLostLeadership, because the two demand the
+// same caution: a renewal whose answer we never got is not a lease we may claim
+// to hold, so the pass stops and the sweep is skipped either way.
+//
+// They are told apart only in what RunOnce RETURNS. A clean loss is nil — losing
+// an election is not a fault. A failed renewal is the store error itself, so the
+// tick is reported through PassFailed instead of vanishing: swallowing it left a
+// leader store that errored on every renewal indistinguishable from a relay that
+// simply is not the leader, which is silence in front of a real outage.
+var errLeaseRenewFailed = errors.New("sequence: leader lease renewal failed")
+
+// renewLease re-acquires the leader lease between pages. See the two sentinels
+// above for how its three outcomes are reported.
+func (r *Relay) renewLease(ctx context.Context) error {
+	isLeader, err := r.leader.TryAcquire(ctx)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%w: %w: %w", errLostLeadership, errLeaseRenewFailed, err)
+	case !isLeader:
+		return errLostLeadership
+	}
+
+	return nil
+}
 
 // Run drives the relay until ctx is canceled, then releases leadership so a
 // planned shutdown fails over in well under LeaseTTL.
@@ -77,6 +105,23 @@ func (r *Relay) Run(ctx context.Context) error {
 // over a long backlog cannot outlive it. Losing leadership at one of those
 // renewals stops the whole pass cleanly (nil): the remaining phases are
 // skipped rather than run as a known non-leader.
+//
+// The sweep runs even when sequence or drain FAILED, and its error is joined
+// rather than replacing theirs. Returning early on a delivery error — which is
+// what this used to do — coupled retention to delivery in the one case where
+// they must be independent: a single undecodable row makes drainPage return an
+// error every tick under the default no-PoisonHandler config, so the sweep was
+// never reached again and the log grew unbounded toward disk-full. Worse, the
+// documented alarm for exactly that ("OnSwept keeps reporting 0 while the table
+// keeps growing") could not fire either, because OnSwept stopped being called
+// rather than reporting 0. Sweeping is safe here regardless: the cutoff is
+// MIN(last_seq) across committed offsets, so a stalled lane simply pins it and
+// the sweep reports 0 — visibly.
+//
+// Two cases still skip it, both because sweeping would be wrong rather than
+// merely unhelpful: a lost lease (a known non-leader must not sweep) and a dead
+// run context (a shutdown, where the sweep would only latch its own interval
+// clock forward without doing any work).
 func (r *Relay) RunOnce(ctx context.Context) error {
 	isLeader, err := r.leader.TryAcquire(ctx)
 	if err != nil {
@@ -87,26 +132,24 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 		return nil
 	}
 
-	if err := r.sequence(ctx); err != nil {
-		if errors.Is(err, errLostLeadership) {
-			r.reporter.Leadership(false)
-
-			return nil // clean stop: losing leadership is not an error
+	passErr := r.sequence(ctx)
+	if passErr == nil {
+		passErr = r.drain(ctx)
+	}
+	if errors.Is(passErr, errLostLeadership) {
+		r.reporter.Leadership(false)
+		if errors.Is(passErr, errLeaseRenewFailed) {
+			// Not an election we lost — one we could not run. Report it.
+			return passErr
 		}
 
-		return err
+		return nil // clean stop: losing leadership is not an error
 	}
-	if err := r.drain(ctx); err != nil {
-		if errors.Is(err, errLostLeadership) {
-			r.reporter.Leadership(false)
-
-			return nil
-		}
-
-		return err
+	if ctx.Err() != nil {
+		return passErr
 	}
 
-	return r.maybeSweep(ctx)
+	return errors.Join(passErr, r.maybeSweep(ctx))
 }
 
 // sequence assigns offsets to committed pending rows, looping while pages are
@@ -137,11 +180,10 @@ func (r *Relay) sequence(ctx context.Context) error {
 		// Full page: renew the lease before the next pass. A renewal that
 		// reports the lock lost — or fails outright — stops the whole pass
 		// via errLostLeadership: a known non-leader must not keep sequencing,
-		// draining, or sweeping. RunOnce maps the sentinel to a clean nil
-		// stop; a persistent leader-store error resurfaces via the next
-		// tick's opening TryAcquire.
-		if isLeader, err := r.leader.TryAcquire(ctx); err != nil || !isLeader {
-			return errLostLeadership
+		// draining, or sweeping. RunOnce maps a clean loss to a nil stop and a
+		// failed renewal to a reported error (see renewLease).
+		if err := r.renewLease(ctx); err != nil {
+			return err
 		}
 	}
 
@@ -203,14 +245,13 @@ func (r *Relay) drain(ctx context.Context) error {
 		// concurrently with a new leader. A renewal that reports the lock
 		// lost — or fails outright — stops the whole pass via
 		// errLostLeadership: what is already committed stands, and RunOnce
-		// skips the sweep instead of running it as a known non-leader; a
-		// persistent leader-store error resurfaces via the next tick's
-		// opening TryAcquire.
+		// skips the sweep instead of running it as a known non-leader (see
+		// renewLease for how the two outcomes are reported).
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if isLeader, err := r.leader.TryAcquire(ctx); err != nil || !isLeader {
-			return errLostLeadership
+		if err := r.renewLease(ctx); err != nil {
+			return err
 		}
 	}
 

@@ -79,7 +79,7 @@ func TestCreateOutboxMessageRejectsNilMetadata(t *testing.T) {
 // with a far-from-cause duplicate-key error.
 func TestCreateOutboxMessageRejectsEmptyID(t *testing.T) {
 	st := mongodbstore.NewStore(nil)
-	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{Metadata: event.NewMetadata("t")})
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{Metadata: event.NewMetadata("svc.Event")})
 	if err == nil {
 		t.Fatal("expected error for empty ID, got nil")
 	}
@@ -106,7 +106,7 @@ func TestCreateOutboxMessageRejectsZeroCreateTime(t *testing.T) {
 // phantom event), before any driver call — same nil-*mongo.Database trick.
 func TestCreateOutboxMessageRejectsTransactionlessCtx(t *testing.T) {
 	st := mongodbstore.NewStore(nil)
-	md := event.NewMetadata("t")
+	md := event.NewMetadata("svc.Event")
 	md.Time = time.Now()
 	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id", Metadata: md, CreateTime: time.Now()})
 	if err == nil || !strings.Contains(err.Error(), "transaction") {
@@ -121,7 +121,7 @@ func TestCreateOutboxMessageRejectsTransactionlessCtx(t *testing.T) {
 // Fires before any driver call (nil db).
 func TestCreateOutboxMessageRejectsZeroMetadataTime(t *testing.T) {
 	st := mongodbstore.NewStore(nil)
-	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id", Metadata: event.NewMetadata("t"), CreateTime: time.Now()})
+	err := st.CreateOutboxMessage(context.Background(), &outbox.Message{ID: "id", Metadata: event.NewMetadata("svc.Event"), CreateTime: time.Now()})
 	if err == nil || !strings.Contains(err.Error(), "metadata time is zero") {
 		t.Fatalf("err = %v, want descriptive zero-metadata-time error", err)
 	}
@@ -794,6 +794,102 @@ func TestStoreWithTransactionRollsBackOnError(t *testing.T) {
 	if err != nil || n != 0 {
 		t.Fatalf("count = %d err = %v, want 0 (rolled back)", n, err)
 	}
+}
+
+// TestStoreWithTransactionJoinsAnAmbientTransaction pins the phantom-event hole
+// this helper used to open by itself.
+//
+// MongoDB has no nested transactions, so a WithTransaction that unconditionally
+// started a new session committed the outbox row on its own the moment fn
+// returned — independently of the caller's business write. When the OUTER
+// transaction then aborted, the business row was never written while the event
+// WAS relayed: exactly the phantom event the store exists to prevent, produced by
+// the helper whose name promises atomicity.
+//
+// Both ways in are covered, because they resolve the session differently: the
+// ctx handed to a caller's own sess.WithTransaction callback, and the *Store
+// handed to an outer Store.WithTransaction callback. In both the abort must take
+// the outbox row with it.
+func TestStoreWithTransactionJoinsAnAmbientTransaction(t *testing.T) {
+	if testDB == nil {
+		t.Skip("no MongoDB")
+	}
+	boom := errors.New("business write failed")
+	count := func(t *testing.T, id string) int64 {
+		t.Helper()
+		n, err := testDB.Collection("outbox_messages").CountDocuments(context.Background(), bson.M{"_id": id})
+		if err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n
+	}
+
+	t.Run("inside a driver session ctx", func(t *testing.T) {
+		reset(t)
+		st := mongodbstore.NewStore(testDB)
+		msg := newTestMessage()
+
+		sess, err := testDB.Client().StartSession()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sess.EndSession(context.Background())
+
+		_, err = sess.WithTransaction(context.Background(), func(sc context.Context) (any, error) {
+			if err := st.WithTransaction(sc, func(ctx context.Context, tx *mongodbstore.Store) error {
+				return tx.CreateOutboxMessage(ctx, msg)
+			}); err != nil {
+				return nil, err
+			}
+			return nil, boom // the business write fails after the outbox row
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("outer transaction error = %v, want %v", err, boom)
+		}
+		if n := count(t, msg.ID); n != 0 {
+			t.Fatalf("count = %d, want 0: the nested WithTransaction committed the outbox row "+
+				"independently of the aborted business transaction — a phantom event", n)
+		}
+	})
+
+	t.Run("on the tx store of an outer WithTransaction", func(t *testing.T) {
+		reset(t)
+		st := mongodbstore.NewStore(testDB)
+		msg := newTestMessage()
+
+		err := st.WithTransaction(context.Background(), func(ctx context.Context, tx *mongodbstore.Store) error {
+			if err := tx.WithTransaction(ctx, func(ctx context.Context, inner *mongodbstore.Store) error {
+				return inner.CreateOutboxMessage(ctx, msg)
+			}); err != nil {
+				return err
+			}
+			return boom
+		})
+		if !errors.Is(err, boom) {
+			t.Fatalf("outer transaction error = %v, want %v", err, boom)
+		}
+		if n := count(t, msg.ID); n != 0 {
+			t.Fatalf("count = %d, want 0: the nested WithTransaction escaped the outer transaction", n)
+		}
+	})
+
+	t.Run("commits with the outer transaction", func(t *testing.T) {
+		reset(t)
+		st := mongodbstore.NewStore(testDB)
+		msg := newTestMessage()
+
+		err := st.WithTransaction(context.Background(), func(ctx context.Context, tx *mongodbstore.Store) error {
+			return tx.WithTransaction(ctx, func(ctx context.Context, inner *mongodbstore.Store) error {
+				return inner.CreateOutboxMessage(ctx, msg)
+			})
+		})
+		if err != nil {
+			t.Fatalf("WithTransaction: %v", err)
+		}
+		if n := count(t, msg.ID); n != 1 {
+			t.Fatalf("count = %d, want 1 (a joined transaction must still commit)", n)
+		}
+	})
 }
 
 // TestWithSessionBindsWithoutMagicCtx pins variant A's whole point: a

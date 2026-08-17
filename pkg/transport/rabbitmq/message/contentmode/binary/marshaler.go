@@ -84,10 +84,15 @@ func marshalMetadata(meta *event.Metadata) (amqp.Table, error) {
 	// survive it: a publisher does not choose the mode its consumers use, and over an
 	// outbox the metadata is persisted and may be relayed by a transport the
 	// publisher never saw. See its doc.
+	// Both rejections wrap event.ErrUnsendable. They are properties of the
+	// METADATA, so retrying is futile — and an outbox row persisted before
+	// publish-time validation existed reaches this exact point, where an
+	// unclassified error stops the relay lane forever. See event.ErrUnsendable.
 	for k, v := range meta.Extensions {
 		if event.ReservedExtensionName(k) {
 			return nil, fmt.Errorf(
-				"extension %q is a reserved CloudEvents attribute name and would overwrite a core attribute; rename the extension", k)
+				"%w: extension %q is a reserved CloudEvents attribute name and would overwrite a core attribute; rename the extension",
+				event.ErrUnsendable, k)
 		}
 
 		// A nested extension value otherwise reaches amqp091-go's field encoder, which
@@ -95,7 +100,7 @@ func marshalMetadata(meta *event.Metadata) (amqp.Table, error) {
 		// outbox that is after the row committed with the caller's business
 		// transaction, leaving the lane stuck on that row every tick.
 		if err := event.ValidExtensionValue(v); err != nil {
-			return nil, fmt.Errorf("extension %q: %w", k, err)
+			return nil, fmt.Errorf("%w: extension %q: %w", event.ErrUnsendable, k, err)
 		}
 
 		headers[k] = v
@@ -143,21 +148,35 @@ func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 		return nil, err
 	}
 
-	// The OPTIONAL attributes treat a present-but-empty header as ABSENT, matching
-	// the structured mode's `optional` helper. A publisher that emits every header
-	// unconditionally is not sending malformed input, and the two modes disagreeing
-	// on it is a bug that depends only on which mode the upstream chose:
+	// The STRING-valued optional attributes treat a present-but-empty header as
+	// ABSENT, matching the structured mode's `optional` helper. A publisher that
+	// emits every header unconditionally is not sending malformed input, and for
+	// these the empty string genuinely means "not set":
 	//
-	//   - an empty dataschema through url.Parse("") succeeds and yields a NON-NIL
-	//     &url.URL{}, which event.Metadata.MarshalJSON now rejects — so
-	//     re-publishing such an event through an outbox store fails inside the
-	//     caller's business transaction and rolls the whole request back;
-	//   - an empty time fails time.Parse and dead-letters the entire delivery.
+	//   - an empty subject is no subject;
+	//   - an empty dataschema is no schema — and taking it literally is actively
+	//     harmful, since url.Parse("") succeeds and yields a NON-NIL &url.URL{},
+	//     which event.Metadata.MarshalJSON rejects, so re-publishing such an event
+	//     through an outbox store fails inside the caller's business transaction
+	//     and rolls the whole request back.
+	//
+	// `time` is the exception, and it must stay in lockstep with structured mode
+	// (see the matching comment there). It is a TYPED attribute: an empty string
+	// is not a timestamp and is not "absent" either. Mapping it to absent hands
+	// the subscriber a zero Metadata.Time — the exact value the outbox read path
+	// uses as its poison marker — so the malformed value would survive this
+	// boundary only to fail later, either inside a caller's business transaction
+	// via outbox.ValidateMetadata or as a poison row on the relay's read path.
+	// Failing here dead-letters one delivery instead.
 	if v, ok := consume.HeaderString(d.Headers[hdrSubject]); ok && v != "" {
 		md.Subject = v
 	}
 
-	if v, ok := consume.HeaderString(d.Headers[hdrTime]); ok && v != "" {
+	if v, ok := consume.HeaderString(d.Headers[hdrTime]); ok {
+		if v == "" {
+			return nil, errors.New("attribute 'time' is present but empty; omit the header instead")
+		}
+
 		var err error
 
 		md.Time, err = time.Parse(time.RFC3339, v)
@@ -175,14 +194,37 @@ func unmarshalMetadata(d *amqp.Delivery) (*event.Metadata, error) {
 		}
 	}
 
+	// Only headers that are actually CloudEvents extensions are lifted into
+	// Extensions, and the filter is the SAME pair of rules marshalMetadata
+	// enforces on the way out — so Marshal(Unmarshal(d)) stays closed.
+	//
+	// Copying every non-prefixed header, which is what this used to do, broke that
+	// as soon as marshalMetadata started rejecting instead of merging. The broker
+	// writes its own bookkeeping into the same flat namespace: a delivery that has
+	// been dead-lettered once carries `x-death`, an []any, so re-sending the
+	// Metadata a subscriber just received failed with "value of type
+	// []interface {} is not a CloudEvents extension value". Over an outbox that is
+	// fatal rather than merely noisy — a marshal failure is not a *DecodeError, no
+	// UnsendableClassifier claims it, and the lane stops on that row every tick
+	// forever.
+	//
+	// Dropped silently, not reported: these are transport-layer headers that were
+	// never part of the event, and the alternative — failing the delivery — would
+	// dead-letter every once-retried message in the system. A publisher's own
+	// extension is unaffected, because publish already rejects the names and
+	// values this skips.
 	for k, v := range d.Headers {
-		if !strings.HasPrefix(k, event.BinaryAttrPrefix) {
-			if md.Extensions == nil {
-				md.Extensions = make(map[string]any)
-			}
-
-			md.Extensions[k] = v
+		if strings.HasPrefix(k, event.BinaryAttrPrefix) || event.ReservedExtensionName(k) {
+			continue
 		}
+		if err := event.ValidExtensionValue(v); err != nil {
+			continue
+		}
+		if md.Extensions == nil {
+			md.Extensions = make(map[string]any)
+		}
+
+		md.Extensions[k] = v
 	}
 
 	return md, nil

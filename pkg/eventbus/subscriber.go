@@ -31,12 +31,19 @@ type Setuper interface {
 // and transport-specific redelivery/parking semantics apply.
 //
 // ctx is the per-delivery context and becomes the handler's own: the transport
-// supplies the narrowest context that still covers this delivery, so a handler
-// can observe shutdown and stop work the transport is about to abandon. A
-// drain-capable transport (the rabbitmq receivers) passes the consumer group's
-// context — canceled when the drain budget is spent or the connection dies, NOT
-// at the first shutdown signal, so in-flight handlers still get their drain
-// window.
+// supplies the narrowest context that still covers this delivery. It is NOT
+// canceled at the first shutdown signal, so an in-flight handler still gets its
+// drain window.
+//
+// Do NOT treat ctx as a shutdown deadline. For the rabbitmq receivers it is
+// amqpx's consumer-group context, which amqpx derives from context.Background()
+// and cancels only when the group's stop watcher itself fails — a CLEAN shutdown
+// and an expired DrainTimeout both leave it live (amqpx v0.3.5 consume.go:224,
+// client.go:204). A handler that blocks on ctx.Done() to abandon work therefore
+// never wakes on those paths; it may finish against a connection that is already
+// gone, and its Ack is lost, so the delivery is redelivered after restart. Bound
+// long handler work with a timeout of your own, and make the work idempotent —
+// which at-least-once delivery requires regardless.
 type Processor func(ctx context.Context, md *event.Metadata, data []byte) error
 
 // EventHandler handles a single event. The handler implementation is captured

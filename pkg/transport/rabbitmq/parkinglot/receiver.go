@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -102,6 +103,14 @@ type Receiver struct {
 	client       *amqpx.Client
 	options      receiverOptions
 	consumerName string
+
+	// mu guards confirming, the set of pooled channels already switched into
+	// publisher-confirm mode. Confirm mode is per channel and lasts for the
+	// channel's life, so tracking it makes confirm.select a once-per-channel round
+	// trip instead of a once-per-park one. Deliveries are handled concurrently, and
+	// the pool hands out one channel per connection. Mirrors rabbitmq.Sender.
+	mu         sync.Mutex
+	confirming map[*amqp.Channel]struct{}
 }
 
 func NewReceiver(client *amqpx.Client, opts ...ReceiverOption) *Receiver {
@@ -112,9 +121,44 @@ func NewReceiver(client *amqpx.Client, opts ...ReceiverOption) *Receiver {
 	}
 
 	return &Receiver{
-		client:  client,
-		options: options,
+		client:     client,
+		options:    options,
+		confirming: make(map[*amqp.Channel]struct{}),
 	}
+}
+
+// enableConfirms puts ch into publisher-confirm mode, once per channel.
+func (r *Receiver) enableConfirms(ch *amqp.Channel) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.confirming[ch]; ok {
+		return nil
+	}
+
+	if err := ch.Confirm(false); err != nil {
+		return fmt.Errorf("enable publisher confirms: %w", err)
+	}
+
+	if r.confirming == nil {
+		// A Receiver built as a struct literal rather than through NewReceiver
+		// (tests do this) has no map; assigning into a nil one panics.
+		r.confirming = make(map[*amqp.Channel]struct{})
+	}
+
+	// Forget channels the pool has retired, so the set tracks the live pool
+	// instead of growing with every reconnect for the process lifetime. Swept on
+	// the miss path only: that is once per new channel, i.e. exactly as often as
+	// the set grows.
+	for c := range r.confirming {
+		if c.IsClosed() {
+			delete(r.confirming, c)
+		}
+	}
+
+	r.confirming[ch] = struct{}{}
+
+	return nil
 }
 
 func (r *Receiver) Setup(ctx context.Context, consumerName string, infos ...eventbus.ServiceInfo) error {
@@ -169,9 +213,13 @@ func (r *Receiver) setupTopology(conn *connpool.Conn) error {
 		"x-message-ttl":             r.options.minRetryBackoff.Milliseconds(),
 	}
 
+	// Topic, routing wait / retry / parkingLot. The plain rabbitmq.Receiver
+	// declares the SAME derived name as a fanout exchange, so the two must not
+	// share an incoming queue name — see consume.DLXSuffix, and DLXConflictError
+	// for the 406 that says so.
 	err := conn.Channel().ExchangeDeclare(r.options.dlxExchange, amqp.ExchangeTopic, true, false, false, false, nil)
 	if err != nil {
-		return fmt.Errorf("declare exchange %q: %w", r.options.dlxExchange, err)
+		return consume.DLXConflictError(r.options.dlxExchange, err)
 	}
 
 	_, err = conn.Channel().QueueDeclare(r.options.waitQueue, true, false, false, false, waitQueueArgs)
@@ -268,6 +316,15 @@ func (r *Receiver) doAcknowledge(ctx context.Context, conn *connpool.Conn, d *am
 	return nil
 }
 
+// parkConfirmTimeout bounds the wait for the broker's confirm of a park.
+//
+// The publish runs on a DETACHED context (see below), so without a bound of its
+// own a broker that never answers would block this delivery's handler forever,
+// and with it the drain and the whole shutdown. It is deliberately generous: the
+// cost of waiting is one stalled delivery, while giving up early requeues a
+// message the broker may yet have accepted, so it is parked twice.
+const parkConfirmTimeout = 30 * time.Second
+
 func (r *Receiver) putIntoParkingLot(ctx context.Context, conn *connpool.Conn, d *amqp.Delivery) error {
 	msg := amqp.Publishing{
 		Headers:         d.Headers,
@@ -281,14 +338,64 @@ func (r *Receiver) putIntoParkingLot(ctx context.Context, conn *connpool.Conn, d
 	// Parking a poison delivery must succeed DURING drain, when ctx is the
 	// already-canceled shutdown context (amqpx drain mode hands the command
 	// its own canceled ctx) — detach for the broker op, or amqp091's ctx
-	// fast-path rejects the publish and the delivery is never parked.
-	err := conn.Channel().PublishWithContext(context.WithoutCancel(ctx), r.options.dlxExchange, parkingLot, false, false, msg)
+	// fast-path rejects the publish and the delivery is never parked. The
+	// detached context gets its own deadline so the wait below cannot be
+	// unbounded.
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), parkConfirmTimeout)
+	defer cancel()
+
+	// Wait for the broker's confirm before acking the original. This publish is
+	// the one place in the whole receiver where the message exists ONLY on the
+	// wire: the Ack below destroys the sole remaining copy of a delivery whose
+	// entire purpose is to be kept for a human to look at. Unconfirmed, the
+	// publish returns nil the instant the frame is written, so a broker that
+	// refuses it — a resource alarm, a DLX that was never declared (404), a failed
+	// persist — reports that asynchronously on a channel nobody reads, long after
+	// the original was acked and gone. rabbitmq.Sender takes exactly this
+	// precaution for ordinary publishes; losing a poison message is worse, not
+	// better.
+	//
+	// mandatory stays false. Detecting an unroutable park would need the return to
+	// be correlated to THIS publish, and the channel comes from a shared pool that
+	// handles deliveries concurrently, so a NotifyReturn listener cannot tell whose
+	// return it saw. A missing binding is a topology error that WithTopologySetup
+	// prevents; what confirms catch is the broker refusing the publish outright.
+	if err := r.enableConfirms(conn.Channel()); err != nil {
+		return fmt.Errorf("put into parking lot: %w", err)
+	}
+
+	conf, err := conn.Channel().PublishWithDeferredConfirmWithContext(
+		pubCtx, r.options.dlxExchange, parkingLot, false, false, msg)
 	if err != nil {
 		return fmt.Errorf("put into parking lot: %w", err)
 	}
 
+	acked, err := conf.WaitContext(pubCtx)
+	if err != nil {
+		return fmt.Errorf("await parking-lot publisher confirm: %w", err)
+	}
+	if !acked {
+		// A nack, or a channel exception that closed the channel with the publish
+		// still outstanding (amqp091 nacks everything unconfirmed when the channel
+		// goes down). Either way the broker does not have the message, so the
+		// original must NOT be acked — it is requeued by the consume loop and
+		// retried instead.
+		return fmt.Errorf("parking-lot publish to exchange %q was not confirmed by the broker "+
+			"(nacked, or the channel closed before the confirm arrived)", r.options.dlxExchange)
+	}
+
 	if err = d.Ack(false); err != nil {
-		return fmt.Errorf("ack delivery: %w", err)
+		// The park IS durable at this point, so the failed ack must not be reported
+		// as a failed park: the consume loop requeues on any error from this policy,
+		// and the redelivered message would be parked a second time, filling the
+		// human-inspection queue with duplicates of one event on every lap. Say so
+		// instead, and report success — the broker redelivers the unacked original
+		// on its own once the channel closes, and the parked copy is what the
+		// operator needs either way.
+		if r.options.logger != nil {
+			r.options.logger.Errorf("parkinglot: parked delivery %q but could not ack the original "+
+				"(it will be redelivered and re-parked once): %s", d.MessageId, err)
+		}
 	}
 
 	return nil

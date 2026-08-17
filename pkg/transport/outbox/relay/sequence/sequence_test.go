@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1166,6 +1167,36 @@ func TestStuckLaneTrackingResetsOnProgress(t *testing.T) {
 		if stuck != 0 {
 			t.Fatalf("escalated %d times after the lane recovered, want 0", stuck)
 		}
+
+		// Positive control, on the SAME timings. Without it "want 0" is satisfied
+		// by escalation being broken outright — a relay that never escalates
+		// passes the assertion above perfectly, and the wedge alarm this whole
+		// mechanism exists for is gone with nothing to show for it.
+		stuckCtl := 0
+		ctl := newFakeStore()
+		ctl.append(msg())
+		ctl.append(msg())
+		rc, err := sequence.NewRelay("c", ctl,
+			senderFunc(func(context.Context, *event.Metadata, []byte) error { return errors.New("transient") }),
+			sequence.WithStartFromBeginning(),
+			sequence.WithObserver(relay.Observer{OnError: func(_ string, err error) {
+				if _, ok := errors.AsType[*sequence.StuckLaneError](err); ok {
+					stuckCtl++
+				}
+			}}))
+		if err != nil {
+			t.Fatalf("NewRelay (control): %v", err)
+		}
+
+		_ = rc.RunOnce(t.Context())
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		_ = rc.RunOnce(t.Context())
+
+		if stuckCtl == 0 {
+			t.Fatal("control lane never escalated after an hour wedged on one message: " +
+				"the recovery assertion above proves nothing if escalation cannot fire at all")
+		}
 	})
 }
 
@@ -1507,7 +1538,14 @@ func TestRunTicksThenReleasesOnCancel(t *testing.T) {
 			t.Fatalf("NewRelay: %v", err)
 		}
 
+		// defer cancel(): a t.Fatalf before the explicit cancel() below would
+		// otherwise leave Run blocked inside the synctest bubble, and an exiting
+		// bubble with a live goroutine panics the whole package binary. t.Context()
+		// happens to cover this one, but relying on that makes the test's safety a
+		// property of which context constructor was used.
 		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
 		go func() { _ = r.Run(ctx) }()
 
 		time.Sleep(1500 * time.Millisecond)
@@ -1951,8 +1989,11 @@ func TestWithLoggerReceivesTransientError(t *testing.T) {
 		t.Fatalf("NewRelay: %v", err)
 	}
 	_ = r.RunOnce(t.Context())
-	if msgs := h.snapshot(); len(msgs) == 0 {
-		t.Fatal("custom logger was never called on send failure")
+	// The MESSAGE, not just a non-empty log. Every first pass emits an
+	// unconditional "became leader" Info, so `len(msgs) == 0` was satisfied
+	// whether or not the send failure was ever logged.
+	if msgs := h.snapshot(); !slices.Contains(msgs, "sequence relay: message failed") {
+		t.Fatalf("custom logger was never called for the send failure (records: %v)", msgs)
 	}
 }
 
@@ -2137,12 +2178,18 @@ func (s *erroringLeaderStore) TryAcquireLeaderLock(ctx context.Context, name, ho
 	return s.fakeStore.TryAcquireLeaderLock(ctx, name, holderID, ttl)
 }
 
-// TestRenewalErrorMidDrainEndsPassCleanly proves a between-pages renewal that
-// fails with an I/O ERROR (not just a lost lock) takes the same route as a
-// lost lease: the pass ends cleanly with what is already committed and no
-// further pages are drained. The persistent store error is not swallowed for
-// good — the next tick's opening TryAcquire surfaces it.
-func TestRenewalErrorMidDrainEndsPassCleanly(t *testing.T) {
+// TestRenewalErrorMidDrainEndsPassAndIsReported proves a between-pages renewal
+// that fails with an I/O ERROR (not just a lost lock) stops the pass the same way
+// a lost lease does — what is already committed stands, no further pages are
+// drained, and the sweep is skipped — but is REPORTED rather than reduced to a
+// clean nil stop.
+//
+// The distinction is the point. A lost election is not a fault and returning nil
+// for it is right; a leader store that ERRORS is a fault, and folding the two
+// together made a store failing on every renewal indistinguishable from a replica
+// that simply is not the leader. That is silence in front of a real outage, from
+// the one call site that noticed it.
+func TestRenewalErrorMidDrainEndsPassAndIsReported(t *testing.T) {
 	sentinel := errors.New("lock store boom")
 	st := &erroringLeaderStore{fakeStore: newFakeStore(), failFrom: 2, err: sentinel}
 	for range 6 {
@@ -2157,9 +2204,10 @@ func TestRenewalErrorMidDrainEndsPassCleanly(t *testing.T) {
 		t.Fatalf("NewRelay: %v", err)
 	}
 	// First pass: the opening acquire (call 1) succeeds; the renewal after
-	// the first full page (call 2) errors — clean stop, one page committed.
-	if runErr := r.RunOnce(t.Context()); runErr != nil {
-		t.Fatalf("RunOnce = %v, want nil (a renewal error ends the pass cleanly)", runErr)
+	// the first full page (call 2) errors — pass ends, one page committed, and
+	// the store error is surfaced rather than swallowed.
+	if runErr := r.RunOnce(t.Context()); !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce = %v, want %v (a failed renewal is a fault, not a lost election)", runErr, sentinel)
 	}
 	if sent != 2 {
 		t.Fatalf("sent = %d, want 2 (no further pages after the renewal error)", sent)
@@ -2168,7 +2216,7 @@ func TestRenewalErrorMidDrainEndsPassCleanly(t *testing.T) {
 		t.Fatalf("offset = %d, want 2 (first page committed before the pass ended)", off)
 	}
 	// Next tick: the opening TryAcquire (call 3) surfaces the persistent
-	// leader-store error.
+	// leader-store error too.
 	if runErr := r.RunOnce(t.Context()); !errors.Is(runErr, sentinel) {
 		t.Fatalf("next RunOnce err = %v, want %v (opening TryAcquire must surface the store error)", runErr, sentinel)
 	}
@@ -2555,5 +2603,67 @@ func TestPoisonOnlyPageObservesDrained(t *testing.T) {
 	}
 	if off := st.offsets["c"]; off != 1 {
 		t.Fatalf("offset = %d, want 1 (advanced past the parked poison row)", off)
+	}
+}
+
+// TestSweepRunsEvenWhenTheDrainFails pins that retention is INDEPENDENT of
+// delivery, which is the whole reason the relay can survive a wedged lane.
+//
+// RunOnce used to return on any sequence/drain error before reaching the sweep,
+// which coupled the two in the one case where they must not be: under the default
+// no-PoisonHandler config a single undecodable row makes the drain error on every
+// tick, so the sweep was never reached again and the log grew without bound toward
+// a disk incident. The documented alarm for exactly that — OnSwept reporting 0
+// while the table keeps growing — could not fire either, because OnSwept stopped
+// being called rather than reporting 0.
+//
+// Sweeping here is safe by construction: the cutoff is MIN(last_seq) across
+// committed offsets, so a stalled lane just pins it and the sweep reports 0.
+func TestSweepRunsEvenWhenTheDrainFails(t *testing.T) {
+	sentinel := errors.New("list boom")
+	st := newFakeStore()
+	st.listErr = sentinel
+	st.append(msg())
+
+	var swept []int
+	r, err := sequence.NewRelay("c", st, noopSender,
+		sequence.WithStartFromBeginning(),
+		sequence.WithObserver(relay.Observer{OnSwept: func(_ string, n int) { swept = append(swept, n) }}))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	runErr := r.RunOnce(t.Context())
+	if !errors.Is(runErr, sentinel) {
+		t.Fatalf("RunOnce = %v, want the drain error %v (it must still be reported)", runErr, sentinel)
+	}
+	if calls, _ := st.snapshotSweep(); calls == 0 {
+		t.Fatal("sweep never ran after a failed drain: a permanently failing lane would grow the log to disk-full")
+	}
+	if len(swept) == 0 {
+		t.Fatal("OnSwept never fired after a failed drain: the falling-behind alarm is silenced by the very " +
+			"condition it exists to report")
+	}
+}
+
+// TestSweepIsSkippedOnAShutdown pins the one case that must NOT sweep despite the
+// rule above: a dead run context. The sweep would do no work and would still latch
+// its own interval clock forward, so the next live tick would skip its turn.
+func TestSweepIsSkippedOnAShutdown(t *testing.T) {
+	st := newFakeStore()
+	st.append(msg())
+
+	r, err := sequence.NewRelay("c", st, noopSender, sequence.WithStartFromBeginning())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_ = r.RunOnce(ctx)
+
+	if calls, _ := st.snapshotSweep(); calls != 0 {
+		t.Fatalf("sweepCalls = %d on a canceled ctx, want 0", calls)
 	}
 }

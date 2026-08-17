@@ -3,7 +3,9 @@ package stream_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -500,10 +502,20 @@ func TestCommittedTokenAgeGrowsDuringStopTheLane(t *testing.T) {
 	})
 }
 
-// TestCommittedTokenAgeNeverNegative pins the floor: a stale head observation
-// must not produce a negative lag, which no gauge can represent.
+// TestCommittedTokenAgeNeverNegative pins the floor: a committed position that
+// appears to LEAD the present must not produce a negative lag, which no gauge can
+// represent.
+//
+// The commit time is therefore in the FUTURE relative to this host, which is what
+// an uncalibrated relay whose clock trails the primary actually observes. A past
+// commit time — which is what this test used to use — can never go negative, so
+// the floor could be deleted with the test still passing.
+//
+// Uncalibrated is load-bearing too: the fake stream's Checkpoint returns a zero
+// head, which calibrateClock refuses, so serverNow() degrades to the raw host
+// clock and the subtraction really does come out below zero.
 func TestCommittedTokenAgeNeverNegative(t *testing.T) {
-	serverNow := time.Now().Add(-24 * time.Hour)
+	serverNow := time.Now().Add(24 * time.Hour)
 	st := &fakeStore{stream: &fakeStream{events: []*stream.Event{evAt("a", serverNow)}}}
 
 	var ages []time.Duration
@@ -1275,7 +1287,14 @@ func TestStopBackoffThenReopens(t *testing.T) {
 			t.Fatalf("NewRelay: %v", err)
 		}
 
+		// defer cancel(), not just the cancel() at the end of the happy path: any
+		// t.Fatalf before it would otherwise leave Run blocked inside the synctest
+		// bubble forever, and an exiting bubble with a live goroutine panics the
+		// whole package binary — so one regression here silently takes every later
+		// test in the file with it.
 		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
 		done := make(chan struct{})
 		go func() {
 			_ = r.Run(ctx)
@@ -1316,26 +1335,39 @@ func TestStopBackoffThenReopens(t *testing.T) {
 	})
 }
 
-// countingHandler is a slog.Handler recording how many records it received.
+// countingHandler is a slog.Handler recording the records it received.
+//
+// It keeps the MESSAGES, not just a count. A bare count is satisfied by any log
+// line at all, and this relay emits an unconditional "became leader" Info on its
+// first pass — so every "the logger was invoked" assertion passed with the exact
+// call it claimed to pin deleted.
 type countingHandler struct {
-	mu    sync.Mutex
-	count int
+	mu   sync.Mutex
+	msgs []string
 }
 
 func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
-func (h *countingHandler) Handle(context.Context, slog.Record) error {
+func (h *countingHandler) Handle(_ context.Context, rec slog.Record) error {
 	h.mu.Lock()
-	h.count++
+	h.msgs = append(h.msgs, rec.Message)
 	h.mu.Unlock()
 	return nil
 }
 func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
 
-func (h *countingHandler) snapshot() int {
+// logged reports whether any record carried exactly msg.
+func (h *countingHandler) logged(msg string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.count
+	return slices.Contains(h.msgs, msg)
+}
+
+// messages returns every recorded message, for failure output.
+func (h *countingHandler) messages() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.msgs)
 }
 
 func TestNewRelayRejectsZeroLeaseTTL(t *testing.T) {
@@ -1420,8 +1452,9 @@ func TestCloseStreamErrorIsLoggedNotFatal(t *testing.T) {
 	if fs.closeCount != 1 {
 		t.Fatalf("closeCount = %d, want 1", fs.closeCount)
 	}
-	if handler.snapshot() == 0 {
-		t.Fatal("failed Close was not logged; the informational error must not be silently discarded")
+	if !handler.logged("stream relay: close stream") {
+		t.Fatalf("failed Close was not logged; the informational error must not be silently discarded (records: %v)",
+			handler.messages())
 	}
 	// The reopen path is unaffected: re-promotion opens a fresh cursor.
 	st.mu.Lock()
@@ -1556,8 +1589,8 @@ func TestWithLoggerReceivesTransientError(t *testing.T) {
 	if runErr := <-done; !errors.Is(runErr, context.Canceled) {
 		t.Fatalf("Run err = %v, want context.Canceled", runErr)
 	}
-	if handler.snapshot() == 0 {
-		t.Fatal("custom slog handler was never invoked on the transient error")
+	if !handler.logged("stream relay: pass failed") {
+		t.Fatalf("custom slog handler was never invoked for the transient error (records: %v)", handler.messages())
 	}
 }
 
@@ -1649,16 +1682,21 @@ func TestDrainWindowSaveTokenErrorOnEmptyWindowPropagates(t *testing.T) {
 	}
 }
 
-// TestDecodeErrorWithEmptyIDIsNotParkable proves an empty DecodeError.ID makes a
-// poison event non-parkable, for the same reason an empty ResumeToken does.
+// TestDecodeErrorWithEmptyIDIsParkable proves an empty DecodeError.ID does NOT
+// make a poison event non-parkable, as long as the resume token survived.
 //
-// The stub handed to the PoisonHandler is ALL it ever receives — no metadata, no
-// payload — so the id is the only thing that makes the parked record answerable,
-// and the handler's documented recovery is to fetch the row by ID from the store.
-// Parking an anonymous stub and then irreversibly advancing past the event (the
-// token save is what authorizes that) drops it permanently with no way to learn
-// which event it was. Stopping the lane is loud, recoverable, and loses nothing.
-func TestDecodeErrorWithEmptyIDIsNotParkable(t *testing.T) {
+// The two extractions are independent and both best-effort (watch.go pulls the
+// token from the change document's _id and the row id from fullDocument._id), so
+// a corrupted fullDocument yields a good token with an empty id. Refusing to park
+// that used to leave the stream reopening onto the same event every window
+// forever, with a PoisonHandler installed and willing to take it — nothing behind
+// it ever delivered. An idless stub is a worse record than an identified one, but
+// it is not a wedge, and the sequence runtime (which gates on the handler alone)
+// has always made the same trade.
+//
+// The token is what remains load-bearing: see
+// TestDecodeErrorWithEmptyTokenIsNotParkable.
+func TestDecodeErrorWithEmptyIDIsParkable(t *testing.T) {
 	de := &stream.DecodeError{ID: "", ResumeToken: "ptok", CommitTime: time.Now(), Err: errors.New("bad bson")}
 	fs := &fakeStream{
 		events: []*stream.Event{ev("a"), nil},
@@ -1667,21 +1705,171 @@ func TestDecodeErrorWithEmptyIDIsNotParkable(t *testing.T) {
 	st := &fakeStore{stream: fs, loadTok: "existing"}
 	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
 
-	var parked []string
-	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, msg *outbox.Message, _ error) error {
-		parked = append(parked, msg.ID)
+	parked := 0
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(func(_ context.Context, _ *outbox.Message, _ error) error {
+		parked++
 		return nil
 	}))
 
-	runErr := r.RunOnce(t.Context())
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce err = %v, want nil (the poison event is parked and the lane advances)", err)
+	}
+	if parked != 1 {
+		t.Fatalf("parked %d events, want 1", parked)
+	}
+	if st.savedTok != "ptok" {
+		t.Fatalf("savedTok = %q, want %q (the lane must resume past the parked poison event)", st.savedTok, "ptok")
+	}
+}
 
-	if _, ok := errors.AsType[*stream.DecodeError](runErr); !ok {
-		t.Fatalf("RunOnce err = %v, want a *DecodeError (lane must stop)", runErr)
+// --- IndexEnsurer ---------------------------------------------------------------
+
+// ensuringStore is a fakeStore that also offers the optional IndexEnsurer
+// capability, so the relay's start-up call can be observed.
+type ensuringStore struct {
+	*fakeStore
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+func (s *ensuringStore) EnsureIndexes(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return s.err
+}
+
+func (s *ensuringStore) snapshotEnsure() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestRunEnsuresTheStoresRetentionIndexes pins that a capability implied by
+// configuration actually exists.
+//
+// This runtime has no sweep of its own — MongoDB retention is a server-side TTL
+// index — so it also has no signal when retention is simply absent. A deployment
+// that built its store WithRetention but never called EnsureIndexes got no error,
+// no log and no observer signal, just a collection growing to a disk incident.
+// The sequence runtime solves the same problem for TiDB explicitly; this closes
+// the gap here without adding a second thing for the operator to remember.
+func TestRunEnsuresTheStoresRetentionIndexes(t *testing.T) {
+	st := &ensuringStore{fakeStore: &fakeStore{stream: &fakeStream{}}}
+	r := mustRelay(t, st, senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil }),
+		stream.WithDrainWindow(time.Millisecond), stream.WithLeaseTTL(time.Second))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	if got := st.snapshotEnsure(); got != 1 {
+		t.Fatalf("EnsureIndexes called %d times, want exactly 1 at start "+
+			"(a store configured with a retention whose index is never created grows without bound)", got)
 	}
-	if len(parked) != 0 {
-		t.Fatalf("parked %v, want none (an unidentifiable poison event is non-parkable)", parked)
+}
+
+// TestRunSurvivesAFailedEnsureIndexes pins that the call above is advisory.
+//
+// The two ways it fails are both survivable: relay credentials that cannot issue
+// DDL because indexes are managed by migrations, and a retention value changed
+// against an existing collection (which MongoDB rejects outright, requiring
+// collMod). Failing Run on either would turn a retention misconfiguration into a
+// total delivery outage — strictly worse than the unbounded growth it warns about.
+func TestRunSurvivesAFailedEnsureIndexes(t *testing.T) {
+	st := &ensuringStore{fakeStore: &fakeStore{stream: &fakeStream{}}, err: errors.New("not authorized on outbox")}
+	handler := &countingHandler{}
+
+	var delivered int
+	r := mustRelay(t, st, senderFunc(func(context.Context, *event.Metadata, []byte) error {
+		delivered++
+		return nil
+	}), stream.WithDrainWindow(time.Millisecond), stream.WithLeaseTTL(time.Second),
+		stream.WithLogger(slog.New(handler)))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+
+	if err := r.Run(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run = %v, want the ctx error: a failed EnsureIndexes must not stop delivery", err)
 	}
-	if st.savedTok == "ptok" {
-		t.Fatal("resume token advanced past an unparked poison event: the event is now permanently skipped")
+	if !handler.logged("stream relay: could not ensure the store's retention indexes; " +
+		"the outbox collection may grow without bound until this is resolved") {
+		t.Fatalf("the failed EnsureIndexes was not logged (records: %v)", handler.messages())
+	}
+}
+
+// --- event.ErrUnsendable ---------------------------------------------------------
+
+// TestUnsendableMetadataIsParkedWithoutAClassifier pins the built-in permanent
+// class the transports themselves declare.
+//
+// event.ErrUnsendable marks metadata no transport can serialize — a dot-less
+// event type, a reserved extension name, a value the wire format cannot carry.
+// Publish-time validation keeps such metadata out of the store, but an outbox row
+// is DURABLE: rows written before those checks existed still reach the sender.
+// Without the marker their rejection is an opaque error no classifier claims, so
+// the lane stops on that row every tick forever with nothing behind it delivered
+// — and requiring every caller to hand-write a WithUnsendableClassifier for a
+// failure mode this library itself produces is not a contract anyone can be
+// expected to discover before the outage.
+func TestUnsendableMetadataIsParkedWithoutAClassifier(t *testing.T) {
+	st := &fakeStore{stream: &fakeStream{events: []*stream.Event{ev("a"), ev("bad"), ev("c")}}}
+
+	unsendable := fmt.Errorf("%w: malformed event type \"nodots\"", event.ErrUnsendable)
+	var delivered []string
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if md.ID == "bad" {
+			return unsendable
+		}
+		delivered = append(delivered, md.ID)
+		return nil
+	})
+
+	var parked []string
+	// No WithUnsendableClassifier: the marker alone must be enough.
+	r := mustRelay(t, st, sender, stream.WithPoisonHandler(
+		func(_ context.Context, m *outbox.Message, _ error) error {
+			parked = append(parked, m.ID)
+			return nil
+		}))
+
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(parked) != 1 || parked[0] != "bad" {
+		t.Fatalf("parked = %v, want [bad]", parked)
+	}
+	if len(delivered) != 2 || delivered[0] != "a" || delivered[1] != "c" {
+		t.Fatalf("delivered = %v, want [a c] (the lane must advance past the unsendable event)", delivered)
+	}
+	if st.savedTok != "c" {
+		t.Fatalf("savedTok = %q, want %q", st.savedTok, "c")
+	}
+}
+
+// TestUnsendableMetadataStopsTheLaneWithNoPoisonHandler pins the other half:
+// "permanent" authorizes advancing PAST the message, and with no PoisonHandler
+// there is nowhere to put it, so advancing would silently drop the event. Stopping
+// is what the runtime already does for an undecodable poison row, and this is the
+// same situation from the other side of the wire.
+func TestUnsendableMetadataStopsTheLaneWithNoPoisonHandler(t *testing.T) {
+	st := &fakeStore{stream: &fakeStream{events: []*stream.Event{ev("a"), ev("bad")}}}
+
+	sender := senderFunc(func(_ context.Context, md *event.Metadata, _ []byte) error {
+		if md.ID == "bad" {
+			return fmt.Errorf("%w: malformed event type", event.ErrUnsendable)
+		}
+		return nil
+	})
+
+	r := mustRelay(t, st, sender)
+
+	if err := r.RunOnce(t.Context()); !errors.Is(err, stream.ErrLaneStopped) {
+		t.Fatalf("RunOnce = %v, want ErrLaneStopped (nowhere to park means the event must not be skipped)", err)
+	}
+	if st.savedTok == "bad" {
+		t.Fatal("resume token advanced past an unparked event: it is now permanently skipped")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"strings"
 	"time"
@@ -277,12 +278,18 @@ func ReservedExtensionName(name string) bool {
 // ValidExtensionValue reports whether v is an extension value every transport here
 // can actually serialize, returning a descriptive error when it is not.
 //
-// The accepted set is the intersection of the CloudEvents extension-value types and
-// what an AMQP field table encodes: strings, booleans, the AMQP-representable
-// integer and float widths, binary, and timestamps. Structured mode would take
-// anything json.Marshal takes, but the mode is the CONSUMER's choice and the
-// publisher does not know it — and over an outbox the metadata is persisted and may
-// be relayed by a transport the publisher never saw.
+// The accepted set is a SUBSET of the CloudEvents extension-value types that every
+// transport here round-trips: strings, booleans, the AMQP-representable integer and
+// float widths, binary, and timestamps. Structured mode would take anything
+// json.Marshal takes, but the mode is the CONSUMER's choice and the publisher does
+// not know it — and over an outbox the metadata is persisted and may be relayed by a
+// transport the publisher never saw.
+//
+// It is deliberately NARROWER than what amqp091-go's field encoder accepts. That
+// encoder also writes nil ('V'), []any ('A') and amqp.Table ('F'), and those are
+// rejected here anyway: a nil extension is indistinguishable from an absent one on
+// the far side, and a nested value has no CloudEvents meaning while forcing every
+// consumer to guess at a shape the spec does not define.
 //
 // A nested value (map, struct, slice) is the case that matters: amqp091-go's field
 // encoder matches only the defined amqp.Table type, so a map[string]any extension
@@ -290,13 +297,27 @@ func ReservedExtensionName(name string) bool {
 // caller's business transaction, as a non-DecodeError that no classifier claims. The
 // lane then stops on that row every tick forever. Rejecting the value at publish is
 // the cheap end of that, exactly as ReservedExtensionName is for names.
+//
+// A plain `int` is RANGE-checked rather than simply accepted. amqp091-go writes Go's
+// `int` as a 32-bit signed AMQP field ('I', see its write.go), so a value above
+// MaxInt32 is silently truncated on a 64-bit host — WithEventExtension("account",
+// 3_000_000_000) arrives as -1294967296, with the publisher told the value was safe.
+// An out-of-range int is therefore an error naming int64, which the encoder writes
+// as a 64-bit field ('l').
 func ValidExtensionValue(v any) error {
-	switch v.(type) {
+	switch v := v.(type) {
 	case string, bool,
-		int, int8, int16, int32, int64,
+		int8, int16, int32, int64,
 		uint8, uint16, uint32,
 		float32, float64,
 		[]byte, time.Time:
+		return nil
+	case int:
+		if v > math.MaxInt32 || v < math.MinInt32 {
+			return fmt.Errorf("int value %d does not fit the 32-bit AMQP field an untyped int is "+
+				"encoded as (it would be silently truncated on the wire); use an int64 value instead", v)
+		}
+
 		return nil
 	case nil:
 		return errors.New("value is nil; omit the extension instead")
@@ -306,6 +327,22 @@ func ValidExtensionValue(v any) error {
 			"structs and slices cannot be carried in binary content mode)", v)
 	}
 }
+
+// ErrUnsendable marks metadata no transport here can turn into a message — a
+// malformed event type, a reserved extension name, an extension value the wire
+// format cannot carry. It is a property of the VALUE, so retrying with the same
+// metadata can never succeed.
+//
+// It exists so a relay can tell that class apart from downstream trouble without
+// a caller-supplied classifier. Publish-time validation (eventbus.publish,
+// outbox.ValidateMetadata) keeps such metadata from being persisted in the first
+// place, but an outbox row is durable: rows written before those checks existed,
+// or by an older version of this library, still arrive at a Sender that must
+// reject them. Without a marker the rejection is an opaque error no classifier
+// claims, and the relay lane stops on that row every tick forever with nothing
+// behind it delivered. With it, a relay configured with a PoisonHandler parks the
+// row and moves on.
+var ErrUnsendable = errors.New("event: metadata cannot be serialized for delivery")
 
 // NewMetadata returns a Metadata for event type t with SpecVersion pinned to
 // CloudEvents 1.0; every other field is left for the caller (or the bus's

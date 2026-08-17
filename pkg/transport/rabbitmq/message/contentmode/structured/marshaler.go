@@ -56,10 +56,14 @@ func (m Marshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, er
 	// envelope alone would survive it: a publisher does not choose the mode its
 	// consumers use, and over an outbox the metadata is persisted and may be relayed
 	// by a transport the publisher never saw. See its doc.
+	// Wrapped in event.ErrUnsendable, as binary mode does: a reserved name is a
+	// property of the metadata, so a relay holding such a persisted row can park
+	// it instead of stopping the lane on it forever.
 	for k, v := range md.Extensions {
 		if event.ReservedExtensionName(k) {
 			return amqp.Publishing{}, fmt.Errorf(
-				"extension %q is a reserved CloudEvents attribute name and would overwrite a core attribute; rename the extension", k)
+				"%w: extension %q is a reserved CloudEvents attribute name and would overwrite a core attribute; rename the extension",
+				event.ErrUnsendable, k)
 		}
 
 		dto[k] = v

@@ -58,7 +58,9 @@ func GenerateUUIDv4(_ *event.Metadata) (string, error) {
 // Delivery order is the log order (assigned seq for the TiDB runtime, oplog
 // commit order for the MongoDB runtime), never the row ID, so the ID format
 // does not affect ordering. The only requirement is that Metadata.ID be
-// unique (it is the row's identity: MongoDB's _id, TiDB's unique event_id).
+// unique and non-empty (it is the row's identity: MongoDB's _id, TiDB's unique
+// event_id). Sender.Send rejects an empty ID for every generator — see there
+// for why neither backend reports it usefully on its own.
 func ReuseMetadataID(md *event.Metadata) (string, error) {
 	return md.ID, nil
 }
@@ -125,6 +127,22 @@ func (s *Sender) Send(ctx context.Context, metadata *event.Metadata, data []byte
 	id, err := s.options.idGenerator(metadata)
 	if err != nil {
 		return err
+	}
+	// An empty row ID is rejected HERE, for every generator, because neither
+	// backend reports it usefully. MongoDB accepts "" as an _id, so the first
+	// such publish succeeds and every later one fails with a duplicate-key error
+	// that names the index, not the cause. TiDB fails it at uuid.Parse, whose
+	// message describes a malformed UUID rather than a missing ID. Both surface
+	// inside the caller's business transaction, rolling back the whole request.
+	//
+	// Under the default ReuseMetadataID this means Metadata.ID was empty: the
+	// eventbus mints one when the caller does not, so it is reachable mainly by
+	// hand-built metadata passed straight to Send.
+	if id == "" {
+		return errors.New("outbox: row ID generator returned an empty ID " +
+			"(the row's identity: MongoDB's _id, TiDB's unique event_id) — under the default " +
+			"ReuseMetadataID this means Metadata.ID was empty; set it, or pass " +
+			"outbox.WithRowIDGenerator(outbox.GenerateUUIDv4) to mint row IDs independently")
 	}
 
 	msg := &Message{

@@ -135,6 +135,48 @@ Option mapping while you are there:
 | `WithErrorHandler` (called per failed send, relay continued) | no equivalent by default — a send failure now stops the lane. Use `WithUnsendableClassifier` + `WithPoisonHandler` for the messages that can never succeed, and watch `relay.StuckLaneError` for the rest |
 | retention by deletion on delivery | the store's retention window (`tidb.WithRetentionWindow`, 7 days by default) plus a relay-side sweep cadence (`sequence.WithRetention` / `WithoutRetention`, on by default) |
 | single relay per store | still one **sequencer** owner per store; extra consumer groups add `WithoutSequencer()`, and may add `WithoutRetention()` to leave sweeping to one relay |
+| leader election inferred from the store (a store without it silently ran always-leader) | election is **required**: a store that does not implement `relay.LeaderStore` fails `NewRelay` unless you pass `WithoutLeaderElection()` |
+
+### Breaking: leader election must be declared
+
+Both reference stores implement `relay.LeaderStore`, so a relay built on
+`tidb.NewRelayStore` or `mongodb.NewRelayStore` is unaffected. What changes is the
+*miss* case. Previously a store without the capability degraded to always-leader
+with one `Info` line; now it is a construction error naming the waiver.
+
+That degradation was never a safe default — under it every replica considers
+itself leader and forwards the whole log, so the failure shows up as duplicate
+delivery long after the deploy that caused it. If you genuinely run one instance,
+say so:
+
+```go
+r, err := sequence.NewRelay(name, store, sender, sequence.WithoutLeaderElection())
+```
+
+A custom store that *meant* to elect but whose method set drifted now fails
+loudly at construction instead of silently running dual leaders — check it against
+`TryAcquireLeaderLock(ctx, name, holderID string, ttl time.Duration) (bool, error)`
+and `ReleaseLeaderLock(ctx, name, holderID string) error`.
+
+### Breaking: removed and renamed API
+
+v2 removes exported API rather than deprecating it, so `go get -u` from a v1 tag
+does not compile until the call sites below are updated. **The next tag for this
+module is therefore a MINOR bump (`v0.5.0`), not a patch.** The module stays on
+`v0.x`, where a minor bump is the semver signal for a breaking change and no `/v2`
+import path applies — a `/v2` suffix would be wrong here, since there was never a
+`v1.x` line to leave behind. Pin an exact version if you are not ready to move.
+
+| removed / renamed | replacement |
+| --- | --- |
+| `outbox.WithIDGenerator` | `outbox.WithRowIDGenerator` |
+| `outbox.GenerateV4` | `outbox.GenerateUUIDv4` |
+| `relay.NewRelay`, `relay.With*` | `sequence.NewRelay` / `stream.NewRelay` and their own `With*` — one relay runtime per log shape (see **Package layout**) |
+| `outbox.Message.SentTime` | gone: v2 never mutates a row after insert, so there is nothing to stamp. Delivery timing is observer state (`relay.Observer.OnDrained`), not row state |
+
+The `relay` package keeps only what both runtimes share (`Observer`,
+`PoisonHandler`, `UnsendableClassifier`, `LeaderStore`, `StuckLaneError`); the
+runtime-specific options moved with their runtimes.
 
 ## Schema (TiDB)
 

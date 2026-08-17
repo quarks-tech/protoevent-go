@@ -1,7 +1,9 @@
 package binary
 
 import (
+	"errors"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,16 +116,17 @@ func TestMarshalAcceptsOrdinaryExtensions(t *testing.T) {
 	}
 }
 
-// TestUnmarshalTreatsEmptyOptionalHeadersAsAbsent pins binary mode's optional
-// attributes against structured mode's behavior. A publisher that emits every
-// header unconditionally is not sending malformed input, and the two modes must not
-// disagree about it:
+// TestUnmarshalTreatsEmptyStringOptionalHeadersAsAbsent pins binary mode's
+// STRING-valued optional attributes against structured mode's behavior. A
+// publisher that emits every header unconditionally is not sending malformed
+// input, and for these the empty string genuinely means "not set":
 //
 //   - an empty dataschema through url.Parse("") yields a NON-NIL &url.URL{}, which
 //     event.Metadata.MarshalJSON rejects — so re-publishing the event through an
-//     outbox store would fail inside the caller's business transaction;
-//   - an empty time would fail time.Parse and dead-letter the whole delivery.
-func TestUnmarshalTreatsEmptyOptionalHeadersAsAbsent(t *testing.T) {
+//     outbox store would fail inside the caller's business transaction.
+//
+// `time` is deliberately NOT in this set — see the test below.
+func TestUnmarshalTreatsEmptyStringOptionalHeadersAsAbsent(t *testing.T) {
 	d := &amqp.Delivery{
 		Type: "books.v1.BookCreated",
 		Headers: amqp.Table{
@@ -131,23 +134,73 @@ func TestUnmarshalTreatsEmptyOptionalHeadersAsAbsent(t *testing.T) {
 			"cloudEvents:id":          "id-1",
 			"cloudEvents:source":      "/svc",
 			"cloudEvents:subject":     "",
-			"cloudEvents:time":        "",
 			"cloudEvents:dataschema":  "",
 		},
 	}
 
 	md, _, err := Marshaler{}.Unmarshal(d)
 	if err != nil {
-		t.Fatalf("Unmarshal: %v (empty optional headers must read as absent)", err)
+		t.Fatalf("Unmarshal: %v (empty string-valued optional headers must read as absent)", err)
 	}
 	if md.DataSchema != nil {
 		t.Fatalf("DataSchema = %v, want nil: a non-nil empty URL later fails Metadata.MarshalJSON", md.DataSchema)
 	}
-	if !md.Time.IsZero() {
-		t.Fatalf("Time = %v, want zero", md.Time)
-	}
 	if md.Subject != "" {
 		t.Fatalf("Subject = %q, want empty", md.Subject)
+	}
+}
+
+// TestUnmarshalRejectsEmptyTimeHeader pins the ONE optional attribute that does
+// not treat present-but-empty as absent, in lockstep with structured mode (whose
+// twin test rejects `"time":""`).
+//
+// The two modes used to disagree here, so the same publisher was accepted over
+// one and dead-lettered over the other. Strict is the right side of that
+// disagreement: `time` is typed, and mapping an empty value to absent yields a
+// zero Metadata.Time — the exact value the outbox read path uses as its poison
+// marker. The malformed value would then survive this boundary only to fail
+// somewhere worse: inside a caller's business transaction via
+// outbox.ValidateMetadata, or as a poison row stopping a relay lane.
+func TestUnmarshalRejectsEmptyTimeHeader(t *testing.T) {
+	d := &amqp.Delivery{
+		Type: "books.v1.BookCreated",
+		Headers: amqp.Table{
+			"cloudEvents:specversion": "1.0",
+			"cloudEvents:id":          "id-1",
+			"cloudEvents:source":      "/svc",
+			"cloudEvents:time":        "",
+		},
+	}
+
+	md, _, err := Marshaler{}.Unmarshal(d)
+	if err == nil {
+		t.Fatalf("Unmarshal accepted an empty 'time' header (Time = %v); want it rejected, "+
+			"or a zero Metadata.Time reaches the outbox poison path", md.Time)
+	}
+	if !strings.Contains(err.Error(), "time") {
+		t.Fatalf("error = %v, want it to name the 'time' attribute", err)
+	}
+}
+
+// TestUnmarshalOmittedTimeHeaderIsAbsent pins that the strictness above is about
+// a present-but-empty header, not about `time` being mandatory: CloudEvents makes
+// it optional, so an omitted header stays a zero Time without error.
+func TestUnmarshalOmittedTimeHeaderIsAbsent(t *testing.T) {
+	d := &amqp.Delivery{
+		Type: "books.v1.BookCreated",
+		Headers: amqp.Table{
+			"cloudEvents:specversion": "1.0",
+			"cloudEvents:id":          "id-1",
+			"cloudEvents:source":      "/svc",
+		},
+	}
+
+	md, _, err := Marshaler{}.Unmarshal(d)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v (an omitted 'time' is legal — CloudEvents marks it optional)", err)
+	}
+	if !md.Time.IsZero() {
+		t.Fatalf("Time = %v, want zero", md.Time)
 	}
 }
 
@@ -262,4 +315,82 @@ func TestUnmarshalAcceptsByteArrayHeaders(t *testing.T) {
 	if md.DataSchema == nil || md.DataSchema.String() != "https://example.com/s.json" {
 		t.Fatalf("DataSchema = %v, want the byte-array URI parsed", md.DataSchema)
 	}
+}
+
+// TestUnmarshalMarshalIsClosedOverBrokerHeaders pins that what Unmarshal produces,
+// Marshal accepts — the property that broke the moment Marshal started REJECTING
+// extensions instead of merging them.
+//
+// The broker writes its own bookkeeping into the same flat header namespace
+// extensions live in. `x-death`, present on every delivery that has been
+// dead-lettered once, is an []any, so lifting it into Extensions made re-sending
+// the Metadata a subscriber just received fail with "value of type
+// []interface {} is not a CloudEvents extension value". Over an outbox that is
+// fatal rather than noisy: the marshal failure was not a *DecodeError, no
+// classifier claimed it, and the lane stopped on that row every tick forever.
+func TestUnmarshalMarshalIsClosedOverBrokerHeaders(t *testing.T) {
+	d := &amqp.Delivery{
+		Type: "books.v1.BookCreated",
+		Headers: amqp.Table{
+			event.BinaryAttrPrefix + "specversion": "1.0",
+			event.BinaryAttrPrefix + "id":          "id-1",
+			event.BinaryAttrPrefix + "source":      "/books",
+			// Broker bookkeeping, in the extension namespace, of a type no AMQP
+			// field table entry can carry back out.
+			"x-death":             []any{amqp.Table{"queue": "events", "count": int64(1)}},
+			"x-first-death-queue": "events",
+			// A genuine publisher extension must survive.
+			"tenant": "acme",
+		},
+	}
+
+	md, _, err := Marshaler{}.Unmarshal(d)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got, ok := md.Extensions["tenant"]; !ok || got != "acme" {
+		t.Fatalf("Extensions[tenant] = %v (present=%t), want acme: a real extension must not be dropped", got, ok)
+	}
+	if _, ok := md.Extensions["x-death"]; ok {
+		t.Fatal("x-death was lifted into Extensions: broker bookkeeping is not a CloudEvents extension, " +
+			"and re-marshaling it fails at send time")
+	}
+
+	if _, err := (Marshaler{}).Marshal(md, []byte("x")); err != nil {
+		t.Fatalf("Marshal(Unmarshal(d)) = %v, want nil: the round trip must be closed, or a "+
+			"once-dead-lettered event can never be re-sent", err)
+	}
+}
+
+// TestMarshalExtensionRejectionsAreUnsendable pins the marker that lets a relay
+// get PAST a persisted row it can never send.
+//
+// Publish-time validation keeps such metadata out of the store, but an outbox row
+// is durable: rows written before those checks existed still reach the sender. An
+// unmarked error there is claimed by no classifier, so the lane stops on that row
+// every tick forever with nothing behind it delivered. With the marker, a relay
+// configured with a PoisonHandler parks it and moves on.
+func TestMarshalExtensionRejectionsAreUnsendable(t *testing.T) {
+	base := func() *event.Metadata {
+		md := event.NewMetadata("books.v1.BookCreated")
+		md.ID = "id-1"
+		md.Source = "/books"
+		return md
+	}
+
+	t.Run("reserved name", func(t *testing.T) {
+		md := base()
+		md.Extensions = map[string]any{"source": "audit"}
+		if _, err := (Marshaler{}).Marshal(md, nil); !errors.Is(err, event.ErrUnsendable) {
+			t.Fatalf("Marshal error = %v, want it to wrap event.ErrUnsendable", err)
+		}
+	})
+
+	t.Run("unencodable value", func(t *testing.T) {
+		md := base()
+		md.Extensions = map[string]any{"ctx": map[string]any{"a": 1}}
+		if _, err := (Marshaler{}).Marshal(md, nil); !errors.Is(err, event.ErrUnsendable) {
+			t.Fatalf("Marshal error = %v, want it to wrap event.ErrUnsendable", err)
+		}
+	})
 }
