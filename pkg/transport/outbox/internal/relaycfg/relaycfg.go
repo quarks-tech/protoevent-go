@@ -45,14 +45,33 @@ const MaxNameLen = 64
 // through promotion — the useful spelling is options.LeaseTTL at the call sites,
 // not relaycfg.Lease.TTL at the declaration.
 type Lease struct {
-	// LeaseTTL is how long a leader lease is granted for, and doubles as the
-	// bound on every store operation (see internal/bound).
+	// LeaseTTL is how long a leader lease is granted for. It bounds failover:
+	// ungraceful leader loss stalls the relay for up to one TTL. It is NOT the
+	// store-operation bound — see Ops.
 	LeaseTTL time.Duration
 	// LeaderLockName defaults to the relay name.
 	LeaderLockName string
 	// LeaderElectionDisabled waives leader election entirely (single-instance
 	// mode). Without it, a store that cannot elect is a construction error.
 	LeaderElectionDisabled bool
+}
+
+// Ops is the store-operation timeout policy both runtimes share. Embedded
+// alongside Lease.
+//
+// It is a SEPARATE knob from LeaseTTL, and used to be the same one. The two
+// budgets answer unrelated questions — "how long may a wedged store call hang
+// before we give up on it" versus "how long may an ungraceful leader loss stall
+// the relay" — and tying them together meant every attempt to shorten failover
+// silently shortened every store deadline by the same factor, tightening an I/O
+// budget nobody meant to touch. Lowering LeaseTTL is a failover decision; it
+// should not decide what counts as a hung query.
+type Ops struct {
+	// OpTimeout bounds every individual store call (see internal/bound). Neither
+	// database/sql nor the mongo driver has a default operation timeout, so
+	// without it a call on a wedged connection stalls the single Run goroutine
+	// with no error and no log.
+	OpTimeout time.Duration
 }
 
 // Hooks is the observability and failure-policy configuration both runtimes
@@ -66,8 +85,17 @@ type Hooks struct {
 }
 
 // DefaultLease returns the shared lease defaults.
+//
+// 15s, deliberately shorter than a store-operation budget would want: this is
+// the failover stall an ungraceful leader loss costs, and a clean shutdown
+// releases the lock explicitly, so only crashes pay it.
 func DefaultLease() Lease {
 	return Lease{LeaseTTL: 15 * time.Second}
+}
+
+// DefaultOps returns the shared store-operation defaults.
+func DefaultOps() Ops {
+	return Ops{OpTimeout: 30 * time.Second}
 }
 
 // DefaultHooks returns the shared hook defaults. The zero relay.Observer discards
@@ -108,6 +136,26 @@ func (l *Lease) Validate(runtime, name, tickName string, tick time.Duration) err
 	// renewals and leadership silently flaps every tick.
 	if tick >= l.LeaseTTL/2 {
 		return fmt.Errorf("%s: %s (%v) must be < LeaseTTL/2 (%v)", runtime, tickName, tick, l.LeaseTTL/2)
+	}
+
+	return nil
+}
+
+// Validate checks the store-operation timeout for one relay. tick is the
+// runtime's own pass interval, named by tickName in errors — the same pair
+// Lease.Validate takes.
+//
+// The tick guard matters most for the stream runtime, where DrainWindow is also
+// the change stream's maxAwaitTime: a Next call legitimately blocks server-side
+// for a whole window, so an OpTimeout at or below it would fire on every idle
+// window and reopen a cursor that was working perfectly.
+func (o *Ops) Validate(runtime, tickName string, tick time.Duration) error {
+	if o.OpTimeout <= 0 {
+		return fmt.Errorf("%s: OpTimeout must be > 0, got %v", runtime, o.OpTimeout)
+	}
+	if tick >= o.OpTimeout {
+		return fmt.Errorf("%s: %s (%v) must be < OpTimeout (%v) — a single store call has to be "+
+			"able to outlast one pass, or every pass times out mid-flight", runtime, tickName, tick, o.OpTimeout)
 	}
 
 	return nil

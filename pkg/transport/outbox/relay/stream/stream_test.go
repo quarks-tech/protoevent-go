@@ -31,6 +31,59 @@ func TestNewRelayRejectsDrainWindowTooLarge(t *testing.T) {
 	}
 }
 
+func TestNewRelayRejectsOpTimeoutBelowDrainWindow(t *testing.T) {
+	// DrainWindow is the change stream's server-side maxAwaitTime, so an idle
+	// Next blocks for a whole window by design. An OpTimeout at or below it
+	// would fire on every healthy idle window and reopen a working cursor.
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	_, err := stream.NewRelay("c", &fakeStore{}, sender,
+		stream.WithDrainWindow(2*time.Second), stream.WithOpTimeout(2*time.Second))
+	if err == nil || !strings.Contains(err.Error(), "OpTimeout") {
+		t.Fatalf("err = %v, want the DrainWindow < OpTimeout validation error", err)
+	}
+}
+
+func TestNewRelayRejectsZeroOpTimeout(t *testing.T) {
+	// Zero would make every store call time out before it left the process.
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+	_, err := stream.NewRelay("c", &fakeStore{}, sender, stream.WithOpTimeout(0))
+	if err == nil || !strings.Contains(err.Error(), "OpTimeout must be > 0") {
+		t.Fatalf("err = %v, want the OpTimeout > 0 validation error", err)
+	}
+}
+
+// TestOpTimeoutIsIndependentOfLeaseTTL pins the decoupling: a short lease is a
+// failover decision and must not shrink the store-call budget with it. Before
+// the split, LeaseTTL was the bound on every store operation, so halving the
+// lease halved every store deadline too.
+func TestOpTimeoutIsIndependentOfLeaseTTL(t *testing.T) {
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error { return nil })
+
+	store := &fakeStore{stream: &fakeStream{}}
+
+	r, err := stream.NewRelay("c", store, sender,
+		// A lease far shorter than the operation budget: legal, and the store
+		// call must still get its full OpTimeout.
+		stream.WithLeaseTTL(2*time.Second), stream.WithDrainWindow(500*time.Millisecond),
+		stream.WithOpTimeout(30*time.Second), stream.WithoutLeaderElection())
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	store.mu.Lock()
+	budget := store.loadBudget
+	store.mu.Unlock()
+
+	// Generous slack: the assertion is "the 30s budget, not the 2s lease".
+	if budget < 25*time.Second {
+		t.Fatalf("store call budget = %v, want ~30s (OpTimeout), not the 2s LeaseTTL", budget)
+	}
+}
+
 func TestNewRelayRejectsZeroDrainWindow(t *testing.T) {
 	// A zero DrainWindow would busy-spin r.sleep (time.NewTimer(0) fires
 	// immediately), so it must be rejected at construction time.
@@ -168,11 +221,18 @@ type fakeStore struct {
 	// canceled) instead of the dead run ctx.
 	saveHadDeadline bool
 	saveCtxErr      error
+
+	// Recorded by LoadToken: the budget left on an ordinary bounded store call,
+	// which pins that the bound is OpTimeout and not LeaseTTL.
+	loadBudget time.Duration
 }
 
-func (s *fakeStore) LoadToken(context.Context, string) (string, time.Time, error) {
+func (s *fakeStore) LoadToken(ctx context.Context, _ string) (string, time.Time, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if d, ok := ctx.Deadline(); ok {
+		s.loadBudget = time.Until(d)
+	}
 	if s.loadErr != nil {
 		return "", time.Time{}, s.loadErr
 	}

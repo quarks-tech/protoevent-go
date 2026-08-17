@@ -267,9 +267,10 @@ one store, run the sequencer in exactly one relay and configure the others with
 serialize on the counter row) but waste serialized DB work every tick. `sender`
 is the downstream transport, any `eventbus.Sender`. `NewRelay` returns an error
 if `name` is empty (it keys the offset row and the default leader lock); if
-`PollInterval`, `BatchSize`, `SequenceBatchSize`, or `LeaseTTL` is not strictly
-positive; if `PollInterval` is not strictly less than `LeaseTTL/2` (the lease
-must be renewable at least twice per TTL); if `name` (or an overridden
+`PollInterval`, `BatchSize`, `SequenceBatchSize`, `LeaseTTL`, or `OpTimeout` is
+not strictly positive; if `PollInterval` is not strictly less than `LeaseTTL/2`
+(the lease must be renewable at least twice per TTL) or not strictly less than
+`OpTimeout` (a store call has to be able to outlast one pass); if `name` (or an overridden
 `LeaderLockName`) exceeds 64 bytes (the reference schema's `VARCHAR(64)` key
 columns — a relaxed `sql_mode` would silently truncate a longer name into
 another group's offset row and leader lock); if the sweep cadence
@@ -323,6 +324,19 @@ name for automatic failover; run relays with different names against the same
 store for independent consumer groups with independent offsets. When a consumer
 group is retired, decommission it with `DeleteOffset`: its stale offset row
 otherwise keeps pinning `MIN(last_seq)` and halts the retention sweep forever.
+
+**Two timeouts, deliberately separate** (both runtimes, same names):
+
+| Option | Default | Bounds |
+| --- | --- | --- |
+| `WithLeaseTTL` | 15s | How long an **ungraceful** leader loss stalls the relay. A clean shutdown releases the lock explicitly, so only crashes pay it. |
+| `WithOpTimeout` | 30s | Every individual **store call** (`internal/bound`). Neither `database/sql` nor the mongo driver has a default operation timeout, so without it a call on a wedged connection stalls the single `Run` goroutine with no error and no log. |
+
+These used to be one knob, and shortening the failover budget silently
+shortened every store deadline with it. They answer unrelated questions —
+a wedged connection is wedged whether or not the lease is still held — so
+tune them independently. The one relation the constructors enforce is that
+the runtime's tick (`PollInterval` / `DrainWindow`) stays below both.
 
 **A new consumer group starts at "latest"** — its offset is seeded at the current
 max seq, so it sees future events only (the same default as the MongoDB stream
@@ -477,9 +491,11 @@ carries exactly the ID the publisher assigned.
 `stream.Store` (`LoadToken`/`SaveToken`/`Watch`, all `string` resume
 tokens — `string` rather than the driver's `bson.Raw` keeps the runtime
 driver-free and the token immutable and comparable). It errors if `name` is empty, if `DrainWindow`,
-`LeaseTTL`, or `TokenBatchSize` is not strictly positive, or if
+`LeaseTTL`, `OpTimeout`, or `TokenBatchSize` is not strictly positive, if
 `DrainWindow >= LeaseTTL/2`, since the leader lease must be renewable within a
-single drain window. As with the sequence runtime, a `Relay` is not safe for
+single drain window, or if `DrainWindow >= OpTimeout`, since `DrainWindow` is
+also the change stream's server-side `maxAwaitTime` and an idle `Next` blocks
+for a whole window by design. As with the sequence runtime, a `Relay` is not safe for
 concurrent use: call `Run` from a single goroutine.
 
 ```go

@@ -8,7 +8,7 @@ import (
 )
 
 // boundedStore decorates the relay's Store with the shared operation-timeout
-// policy (internal/bound): every call carries the LeaseTTL bound, and the token
+// policy (internal/bound): every call carries the OpTimeout bound, and the token
 // save — which records already-completed work — is additionally detached from
 // the run context's cancellation.
 //
@@ -68,11 +68,15 @@ func (s boundedStore) Watch(ctx context.Context, token string, maxAwait time.Dur
 // and re-sends what the standby already delivered. That is precisely the silent
 // permanent stall the decorator exists to prevent.
 //
-// The bound is LeaseTTL, as everywhere else here: NewRelay requires DrainWindow <
-// LeaseTTL/2, so a legitimate maxAwait wait always finishes with room to spare,
-// and beyond the TTL the call's success is moot because the lease is already lost.
-// A timeout surfaces as an ordinary transient error, which Run handles by closing
-// and reopening the stream.
+// The bound is OpTimeout, as everywhere else here — deliberately NOT LeaseTTL,
+// which it used to be. An idle Next blocks server-side for a full maxAwait
+// (= DrainWindow) by design, so the client-side bound has to sit above it or it
+// fires on healthy idle windows; NewRelay requires DrainWindow < OpTimeout for
+// exactly that. Tying it to the lease instead made every shortening of the
+// failover budget also shorten this one, which is unrelated to leadership: a
+// wedged connection is a wedged connection whether or not the lease is still
+// held. A timeout surfaces as an ordinary transient error, which Run handles by
+// closing and reopening the stream.
 //
 // The bound is per CALL, not per drain window, even though a per-window deadline
 // would spend one timer instead of TokenBatchSize of them: a window also contains

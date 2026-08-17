@@ -26,6 +26,11 @@ func TestDefaultOptions(t *testing.T) {
 	if o.LeaseTTL != 15*time.Second {
 		t.Fatalf("LeaseTTL = %v, want 15s", o.LeaseTTL)
 	}
+	// Deliberately NOT LeaseTTL: the failover budget and the store-call budget
+	// are separate knobs, so lowering one cannot silently tighten the other.
+	if o.OpTimeout != 30*time.Second {
+		t.Fatalf("OpTimeout = %v, want 30s", o.OpTimeout)
+	}
 	if o.Logger == nil {
 		t.Fatal("default Logger must be non-nil (the runtime never nil-checks it)")
 	}

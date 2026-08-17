@@ -164,9 +164,10 @@ type Event struct {
 // alongside ...Option would make invalid states representable and force
 // defensive re-defaulting in NewRelay.
 type options struct {
-	// Lease and Hooks are what both runtimes configure the same way; the With*
-	// constructors below are one-liners over their promoted fields.
+	// Lease, Ops and Hooks are what both runtimes configure the same way; the
+	// With* constructors below are one-liners over their promoted fields.
 	relaycfg.Lease
+	relaycfg.Ops
 	relaycfg.Hooks
 
 	// DrainWindow is the single latency knob: it is both the relay loop tick
@@ -183,6 +184,7 @@ type options struct {
 func defaultOptions() options {
 	return options{
 		Lease:          relaycfg.DefaultLease(),
+		Ops:            relaycfg.DefaultOps(),
 		Hooks:          relaycfg.DefaultHooks(),
 		DrainWindow:    time.Second,
 		TokenBatchSize: 100,
@@ -196,8 +198,15 @@ type Option func(*options)
 // relay loop tick (idle/backoff sleep) and the change stream's maxAwaitTime.
 func WithDrainWindow(d time.Duration) Option { return func(o *options) { o.DrainWindow = d } }
 
-// WithLeaseTTL sets the leader-lease TTL.
+// WithLeaseTTL sets the leader-lease TTL — how long an ungraceful leader loss
+// stalls the relay. It does not bound store calls; see WithOpTimeout.
 func WithLeaseTTL(d time.Duration) Option { return func(o *options) { o.LeaseTTL = d } }
+
+// WithOpTimeout sets the bound on every individual store call, including a
+// single Next on the change stream. It must exceed DrainWindow, which is the
+// stream's server-side maxAwaitTime and so the floor on how long an idle Next
+// legitimately blocks.
+func WithOpTimeout(d time.Duration) Option { return func(o *options) { o.OpTimeout = d } }
 
 // WithLeaderLockName overrides the leader-lock name (defaults to the relay name).
 func WithLeaderLockName(s string) Option { return func(o *options) { o.LeaderLockName = s } }
@@ -303,9 +312,12 @@ type StuckLaneError = relay.StuckLaneError
 //   - name is empty (it keys the offset/token row and is the default leader
 //     lock name);
 //   - store or sender is nil;
-//   - DrainWindow, LeaseTTL, or TokenBatchSize is not strictly positive;
+//   - DrainWindow, LeaseTTL, OpTimeout, or TokenBatchSize is not strictly
+//     positive;
 //   - DrainWindow is not strictly less than LeaseTTL/2 (the lease must be
-//     renewable within a single drain window).
+//     renewable within a single drain window);
+//   - DrainWindow is not strictly less than OpTimeout (a single Next blocks
+//     server-side for a whole window when the stream is idle).
 //
 // Note the DrainWindow guard only bounds the *idle* wait inside a window (the
 // change stream's maxAwaitTime), not the total time a drainWindow call can
@@ -339,6 +351,9 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	if err := options.Lease.Validate("stream", name, "DrainWindow", options.DrainWindow); err != nil {
 		return nil, err
 	}
+	if err := options.Ops.Validate("stream", "DrainWindow", options.DrainWindow); err != nil {
+		return nil, err
+	}
 	if err := options.Hooks.Validate("stream"); err != nil {
 		return nil, err
 	}
@@ -363,7 +378,7 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		name: name,
 		// Every store operation is decorated with its bound at construction —
 		// see boundedStore (bounded.go).
-		store:    boundedStore{inner: store, ttl: options.LeaseTTL},
+		store:    boundedStore{inner: store, ttl: options.OpTimeout},
 		options:  options,
 		leader:   elector,
 		reporter: reporter,

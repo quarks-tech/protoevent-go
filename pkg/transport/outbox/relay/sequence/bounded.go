@@ -9,7 +9,7 @@ import (
 )
 
 // boundedStore decorates the relay's Store with the shared operation-timeout
-// policy (internal/bound): every call carries the LeaseTTL bound, and the two
+// policy (internal/bound): every call carries the OpTimeout bound, and the two
 // writes that record already-completed work are additionally detached from the
 // run context's cancellation.
 //

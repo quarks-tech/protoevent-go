@@ -143,9 +143,10 @@ type Sweeper interface {
 // surface — an exported mutable struct alongside ...Option would make invalid
 // states representable and force defensive re-defaulting in NewRelay.
 type options struct {
-	// Lease and Hooks are what both runtimes configure the same way; the With*
-	// constructors below are one-liners over their promoted fields.
+	// Lease, Ops and Hooks are what both runtimes configure the same way; the
+	// With* constructors below are one-liners over their promoted fields.
 	relaycfg.Lease
+	relaycfg.Ops
 	relaycfg.Hooks
 
 	BatchSize         int // drain page size (network sends)
@@ -191,6 +192,7 @@ const (
 func defaultOptions() options {
 	return options{
 		Lease:                  relaycfg.DefaultLease(),
+		Ops:                    relaycfg.DefaultOps(),
 		Hooks:                  relaycfg.DefaultHooks(),
 		BatchSize:              100,
 		SequenceBatchSize:      1000,
@@ -212,8 +214,13 @@ func WithSequenceBatchSize(size int) Option { return func(o *options) { o.Sequen
 // WithPollInterval sets the tick interval between relay passes.
 func WithPollInterval(d time.Duration) Option { return func(o *options) { o.PollInterval = d } }
 
-// WithLeaseTTL sets the leader-lease TTL.
+// WithLeaseTTL sets the leader-lease TTL — how long an ungraceful leader loss
+// stalls the relay. It does not bound store calls; see WithOpTimeout.
 func WithLeaseTTL(ttl time.Duration) Option { return func(o *options) { o.LeaseTTL = ttl } }
+
+// WithOpTimeout sets the bound on every individual store call — the list, the
+// offset commit, the sequencer pass, the sweep. It must exceed PollInterval.
+func WithOpTimeout(d time.Duration) Option { return func(o *options) { o.OpTimeout = d } }
 
 // WithLeaderLockName overrides the leader-lock name (defaults to the relay name).
 func WithLeaderLockName(name string) Option { return func(o *options) { o.LeaderLockName = name } }
@@ -364,8 +371,9 @@ type Relay struct {
 //   - name is empty, or name (or an overridden LeaderLockName) exceeds
 //     relaycfg.MaxNameLen bytes;
 //   - store or sender is nil;
-//   - PollInterval, BatchSize, SequenceBatchSize, or LeaseTTL is not strictly
-//     positive, or PollInterval is not strictly less than LeaseTTL/2;
+//   - PollInterval, BatchSize, SequenceBatchSize, LeaseTTL, or OpTimeout is not
+//     strictly positive, or PollInterval is not strictly less than either
+//     LeaseTTL/2 or OpTimeout;
 //   - the sweep cadence (interval, batch) is not positive and WithoutRetention()
 //     was not given, or WithRetention and WithoutRetention are both given;
 //   - WithUnsendableClassifier is given without WithPoisonHandler;
@@ -417,6 +425,9 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	if err := options.Lease.Validate("sequence", name, "PollInterval", options.PollInterval); err != nil {
 		return nil, err
 	}
+	if err := options.Ops.Validate("sequence", "PollInterval", options.PollInterval); err != nil {
+		return nil, err
+	}
 	if err := options.Hooks.Validate("sequence"); err != nil {
 		return nil, err
 	}
@@ -439,9 +450,9 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	reporter := options.Reporter("sequence", name)
 	r := &Relay{
 		name: name,
-		// Every store capability is decorated with the LeaseTTL operation
+		// Every store capability is decorated with the OpTimeout operation
 		// bound at construction — see boundedStore (bounded.go).
-		store:    boundedStore{inner: store, ttl: options.LeaseTTL},
+		store:    boundedStore{inner: store, ttl: options.OpTimeout},
 		options:  options,
 		leader:   elector,
 		reporter: reporter,
@@ -470,13 +481,13 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 			return nil, errors.New("sequence: store does not implement sequence.Sequencer; " +
 				"pass WithoutSequencer() if another relay runs the sequencer for this store")
 		}
-		r.sequencer = boundedSequencer{inner: seq, ttl: options.LeaseTTL}
+		r.sequencer = boundedSequencer{inner: seq, ttl: options.OpTimeout}
 	}
 	if !options.RetentionDisabled {
 		ret, ok := store.(Sweeper)
 		switch {
 		case ok:
-			r.retention = boundedRetention{inner: ret, ttl: options.LeaseTTL}
+			r.retention = boundedRetention{inner: ret, ttl: options.OpTimeout}
 		case options.RetentionConfigured:
 			// The caller ASKED for a sweep: a silently dead one grows the log
 			// unboundedly and surfaces as a disk incident long after the
@@ -495,7 +506,7 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	// Optional, and legitimately absent: without it lag is measured against the
 	// relay host's clock instead of the store's (see Clock).
 	if c, ok := store.(Clock); ok {
-		r.clock = boundedClock{inner: c, ttl: options.LeaseTTL}
+		r.clock = boundedClock{inner: c, ttl: options.OpTimeout}
 	}
 
 	return r, nil

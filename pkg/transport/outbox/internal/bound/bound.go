@@ -4,7 +4,9 @@
 // It exists because those rules are safety-critical and used to be written out at
 // every call site in both runtimes. Three policies, deliberately distinct:
 //
-//   - Call: the default. Bounded by the lease TTL, cancels with the run context.
+//   - Call: the default. Bounded by the relay's OpTimeout, cancels with the run
+//     context. (The leader lock is the exception: it self-bounds by LeaseTTL,
+//     since a lock call outliving the lease it is acquiring is pointless.)
 //   - Commit: for a write that records work the relay has ALREADY done (an
 //     offset commit, a resume-token save). Always detached from cancellation.
 //   - Salvaged: for a best-effort READ that legitimately runs after cancellation
