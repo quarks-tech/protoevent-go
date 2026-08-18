@@ -124,7 +124,7 @@ func TestReleaseNoOpWhenNotLeader(t *testing.T) {
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
-	if err := e.Release(); err != nil {
+	if err := e.Release(context.Background()); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 
@@ -138,7 +138,7 @@ func TestReleaseNoOpBeforeFirstAcquire(t *testing.T) {
 	e := leader.NewElector(store, "lock", "holder-1", time.Second)
 
 	// Release before ever calling TryAcquire: must be a no-op (nil error).
-	if err := e.Release(); err != nil {
+	if err := e.Release(context.Background()); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 
@@ -154,7 +154,7 @@ func TestReleaseCallsStoreForCurrentHolderWhenLeader(t *testing.T) {
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
-	if err := e.Release(); err != nil {
+	if err := e.Release(context.Background()); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 
@@ -186,11 +186,11 @@ func TestReleaseIsIdempotentAfterFirstCall(t *testing.T) {
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
-	if err := e.Release(); err != nil {
+	if err := e.Release(context.Background()); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 	// Second call: isLeader is now false, must not call the store again.
-	if err := e.Release(); err != nil {
+	if err := e.Release(context.Background()); err != nil {
 		t.Fatalf("second Release: %v", err)
 	}
 
@@ -211,11 +211,11 @@ func TestReleaseReturnsStoreErrorForInformation(t *testing.T) {
 	if _, err := e.TryAcquire(t.Context()); err != nil {
 		t.Fatalf("TryAcquire: %v", err)
 	}
-	if err := e.Release(); !errors.Is(err, sentinel) {
+	if err := e.Release(context.Background()); !errors.Is(err, sentinel) {
 		t.Fatalf("Release err = %v, want %v (returned for information, not swallowed)", err, sentinel)
 	}
 	// The latch flipped before the failed store call: no second delete.
-	if err := e.Release(); err != nil {
+	if err := e.Release(context.Background()); err != nil {
 		t.Fatalf("second Release err = %v, want nil (latch already down)", err)
 	}
 	if calls := store.snapshotReleaseCalls(); len(calls) != 1 {
@@ -242,7 +242,7 @@ func TestNilLeaderStoreReleaseIsNoop(t *testing.T) {
 		t.Fatalf("TryAcquire: %v", err)
 	}
 	// Must not panic despite isLeader==true: the nop store's release is nil.
-	if err := e.Release(); err != nil {
+	if err := e.Release(context.Background()); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
 }

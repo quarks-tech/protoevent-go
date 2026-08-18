@@ -9,6 +9,7 @@ import (
 
 type receiver struct {
 	ch    <-chan message
+	done  <-chan struct{}
 	onErr func(md *event.Metadata, err error)
 }
 
@@ -36,10 +37,13 @@ func (r receiver) Receive(ctx context.Context, processor eventbus.Processor) err
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case m, ok := <-r.ch:
-			if !ok {
-				return nil
-			}
+		case <-r.done:
+			// Close ends the subscription only after the buffer drains, so the
+			// events already accepted are still delivered. The channel itself is
+			// never closed (see SendReceiver.Close), so this is what "ok == false"
+			// used to mean.
+			return r.drain(ctx, processor)
+		case m := <-r.ch:
 			// Deliberately NOT re-checking ctx here. Cancellation can still win the
 			// race above and land between the dequeue and this point; dropping the
 			// message then would lose it outright, which is strictly worse for an
@@ -60,6 +64,31 @@ func (r receiver) Receive(ctx context.Context, processor eventbus.Processor) err
 			if err := processor(ctx, m.meta, m.data); err != nil && r.onErr != nil {
 				r.onErr(m.meta, err)
 			}
+		}
+	}
+}
+
+// drain delivers what is still buffered after Close and returns nil.
+//
+// The receive is non-blocking: no further Send can succeed once done is closed, so
+// an empty buffer means the transport is finished rather than merely idle.
+// Cancellation still wins — a canceled ctx during shutdown reports itself rather
+// than running more handlers.
+func (r receiver) drain(ctx context.Context, processor eventbus.Processor) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		select {
+		case m := <-r.ch:
+			if err := processor(ctx, m.meta, m.data); err != nil && r.onErr != nil {
+				r.onErr(m.meta, err)
+			}
+		default:
+			return nil
 		}
 	}
 }

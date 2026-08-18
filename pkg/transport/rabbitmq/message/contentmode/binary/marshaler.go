@@ -21,6 +21,16 @@ func (m Marshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, er
 		return amqp.Publishing{}, err
 	}
 
+	// The type is written to amqp.Publishing.Type, a shortstr. Wrapped in
+	// ErrUnsendable for the same reason as the extension rejections: over an outbox
+	// the row is already durable by the time anything gets here, and an unclassified
+	// error stops the lane on it forever. See event.MaxShortStrLen.
+	if event.ShortStrTooLong(md.Type) {
+		return amqp.Publishing{}, fmt.Errorf(
+			"%w: event type is %d bytes, over the %d-byte AMQP limit; shorten the event type",
+			event.ErrUnsendable, len(md.Type), event.MaxShortStrLen)
+	}
+
 	return amqp.Publishing{
 		Type:        md.Type,
 		ContentType: md.DataContentType,
@@ -69,7 +79,16 @@ func marshalMetadata(meta *event.Metadata) (amqp.Table, error) {
 	}
 
 	if !meta.Time.IsZero() {
-		headers[hdrTime] = meta.Time.Format(time.RFC3339)
+		// RFC3339Nano, not RFC3339: RFC3339 carries no fractional-seconds field, so
+		// it silently truncated every timestamp to a whole second. The publisher
+		// stamps microsecond precision by default and the outbox persists it at full
+		// fidelity, so the truncation made the durable record and the delivered event
+		// disagree — and a forwarder that re-publishes a received Metadata persisted
+		// the truncated value, making the loss permanent one hop downstream.
+		// CloudEvents timestamps are RFC3339 with optional fractional seconds, and
+		// time.Parse(time.RFC3339, …) on the consumer side accepts them, so this stays
+		// readable by any consumer that could read the truncated form.
+		headers[hdrTime] = meta.Time.Format(time.RFC3339Nano)
 	}
 
 	// Rejected, not merged — the same rule structured mode enforces, and it matters
@@ -101,6 +120,17 @@ func marshalMetadata(meta *event.Metadata) (amqp.Table, error) {
 		// transaction, leaving the lane stuck on that row every tick.
 		if err := event.ValidExtensionValue(v); err != nil {
 			return nil, fmt.Errorf("%w: extension %q: %w", event.ErrUnsendable, k, err)
+		}
+
+		// The name becomes an AMQP header-table key, written as a shortstr. Same
+		// reasoning as the value check above: amqp091-go refuses it at SEND time, so
+		// a row that predates the publish-time length check lands here, and only an
+		// ErrUnsendable-wrapped error lets the relay park it instead of stopping the
+		// lane on it forever.
+		if event.ShortStrTooLong(k) {
+			return nil, fmt.Errorf(
+				"%w: extension name is %d bytes, over the %d-byte AMQP limit; shorten it",
+				event.ErrUnsendable, len(k), event.MaxShortStrLen)
 		}
 
 		headers[k] = v

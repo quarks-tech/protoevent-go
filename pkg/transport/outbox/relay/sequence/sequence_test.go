@@ -167,6 +167,18 @@ type fakeStore struct {
 	// the Store contract.
 	poisonSeq int64
 
+	// Recorded by CommitOffsetFenced, so a test can assert the relay fenced on its
+	// OWN election identity rather than on something it invented.
+	// commitHook, when set, runs at the top of CommitOffset so a test can make the
+	// commit hang the way a wedged connection does. It receives the call's context and
+	// must honor it, as a real driver does — otherwise the fake, not the code under
+	// test, decides how long the call takes.
+	commitHook func(context.Context) error
+
+	fencedCalls     int
+	lastFenceLock   string
+	lastFenceHolder string
+
 	seqCalls    int // number of SequenceMessages invocations, for loop-count assertions
 	listCalls   int // number of ListMessages invocations, for did-drain-run assertions
 	initCalls   int // number of InitOffsetLatest invocations (priming churn assertions)
@@ -261,6 +273,15 @@ func (s *fakeStore) Offset(_ context.Context, name string) (int64, bool, error) 
 // UPDATE-only store and hide that.
 func (s *fakeStore) CommitOffset(ctx context.Context, name string, seq int64) error {
 	s.mu.Lock()
+	hook := s.commitHook
+	s.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx); err != nil {
+			return err
+		}
+	}
+
+	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.commitCalls++
 	_, s.commitHadDeadline = ctx.Deadline()
@@ -338,6 +359,14 @@ func (s *fakeStore) SweepMessages(_ context.Context, limit int) (int, error) {
 	return n, nil
 }
 
+// remainingSweepBacklog reports how much deletable work the fake still holds.
+func (s *fakeStore) remainingSweepBacklog() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.sweepBacklog
+}
+
 // snapshotSweep reads the sweep counters under mu.
 func (s *fakeStore) snapshotSweep() (calls, limit int) {
 	s.mu.Lock()
@@ -373,6 +402,29 @@ func (s *fakeStore) snapshotListCalls() int {
 	return s.listCalls
 }
 
+// CommitOffsetFenced models the SQL store's holder-checked upsert: the watermark moves
+// only while the lock is still held by holderID. A relay that has been superseded gets
+// persisted=false — the same answer the real store gives, and not an error.
+func (s *fakeStore) CommitOffsetFenced(
+	ctx context.Context, name, lockName, holderID string, seq int64,
+) (bool, error) {
+	s.mu.Lock()
+	s.fencedCalls++
+	s.lastFenceLock = lockName
+	s.lastFenceHolder = holderID
+	superseded := s.leader != "" && s.leader != holderID
+	s.mu.Unlock()
+
+	if superseded {
+		return false, nil
+	}
+	if err := s.CommitOffset(ctx, name, seq); err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 func (s *fakeStore) TryAcquireLeaderLock(_ context.Context, _, holderID string, _ time.Duration) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -391,6 +443,48 @@ func (s *fakeStore) ReleaseLeaderLock(_ context.Context, _, holderID string) err
 	}
 	return nil
 }
+
+// fenceRecord returns what the last fenced commit was evaluated against.
+func (s *fakeStore) fenceRecord() (lockName, holderID string, calls int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.lastFenceLock, s.lastFenceHolder, s.fencedCalls
+}
+
+// blockCommit installs a hook run at the start of every CommitOffset, so a test can
+// make the commit hang the way a wedged connection does.
+func (s *fakeStore) blockCommit(fn func(context.Context) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.commitHook = fn
+}
+
+// setLeader installs a lock holder, modeling a standby that has taken over.
+func (s *fakeStore) setLeader(holderID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.leader = holderID
+}
+
+// setOffset moves a group's watermark directly, modeling the successor's progress.
+func (s *fakeStore) setOffset(name string, seq int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.offsets[name] = seq
+}
+
+// offsetOf reads a group's watermark.
+func (s *fakeStore) offsetOf(name string) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seq, ok := s.offsets[name]
+
+	return seq, ok
+}
+
+// appendPending publishes one unsequenced row.
+func (s *fakeStore) appendPending() { s.append(msg()) }
 
 // leaderHolder returns the current lock holder ("" if free), guarded by mu.
 func (s *fakeStore) leaderHolder() string {
@@ -1366,7 +1460,10 @@ func TestRetentionDefaultsOnAndIsWaivable(t *testing.T) {
 	t.Run("default window on a store without Sweeper is not an error", func(t *testing.T) {
 		// A legitimate topology: the store prunes itself, or another relay owns the
 		// sweep. Only an EXPLICIT WithRetention makes the capability mandatory.
-		if _, err := sequence.NewRelay("c", storeWithoutSweeper{inner: newFakeStore()}, noopSender); err != nil {
+		// WithoutFencedCommit: these wrappers expose a deliberately narrow capability
+		// set, and the fence is not what is under test here.
+		if _, err := sequence.NewRelay("c", storeWithoutSweeper{inner: newFakeStore()}, noopSender,
+			sequence.WithoutFencedCommit()); err != nil {
 			t.Fatalf("NewRelay: %v", err)
 		}
 	})
@@ -1778,7 +1875,8 @@ func TestNewRelayRejectsRetentionWithoutRetentionStore(t *testing.T) {
 		t.Fatalf("err = %v, want the Sweeper capability error", err)
 	}
 	// Without WithRetention the same store is fine: retention is simply off.
-	if _, err := sequence.NewRelay("c", storeWithoutSweeper{inner: newFakeStore()}, noopSender); err != nil {
+	if _, err := sequence.NewRelay("c", storeWithoutSweeper{inner: newFakeStore()}, noopSender,
+		sequence.WithoutFencedCommit()); err != nil {
 		t.Fatalf("NewRelay without retention: %v", err)
 	}
 }
@@ -1822,12 +1920,13 @@ func (s storeWithoutSequencer) ReleaseLeaderLock(ctx context.Context, name, hold
 // ever gets a seq, drain sees nothing, no error is reported.
 func TestNewRelayRejectsMissingSequencerWithoutWaiver(t *testing.T) {
 	st := storeWithoutSequencer{inner: newFakeStore()}
-	_, err := sequence.NewRelay("c", st, noopSender)
+	_, err := sequence.NewRelay("c", st, noopSender, sequence.WithoutFencedCommit())
 	if err == nil || !strings.Contains(err.Error(), "WithoutSequencer") {
 		t.Fatalf("err = %v, want the Sequencer capability error naming the waiver", err)
 	}
 	// The explicit waiver accepts the same store.
-	if _, err := sequence.NewRelay("c", st, noopSender, sequence.WithoutSequencer()); err != nil {
+	if _, err := sequence.NewRelay("c", st, noopSender,
+		sequence.WithoutSequencer(), sequence.WithoutFencedCommit()); err != nil {
 		t.Fatalf("NewRelay with WithoutSequencer: %v", err)
 	}
 }
@@ -3018,5 +3117,481 @@ func TestStoppedLaneKeepsReportingLag(t *testing.T) {
 	}
 	if !last.more {
 		t.Fatal("OnDrained more = false on a stopped lane, want true: the log still has work")
+	}
+}
+
+// TestSupersededLeaderStopsInsteadOfRedeliveringTheLog covers the fenced commit
+// (S1): a relay that has been superseded mid-page must learn it at its own commit,
+// end the pass, and say so.
+//
+// Be precise about what this adds, because the surrounding machinery already covers
+// part of it. drain() renews the lease BETWEEN pages, so a superseded leader was
+// already stopped before re-sending a second page; and CommitOffset is monotone, so a
+// stale watermark could never pull the number backwards. Neither of those is what the
+// fence is for.
+//
+// The fence earns its place on two counts. First, DETECTION: supersession is now
+// reported at the commit boundary — one page earlier than the next renewal would
+// notice, and visible to an Observer at all. The stream runtime has always surfaced a
+// stale token save; the same event in this runtime was silent, which is why a
+// superseded relay could misbehave with nothing in the logs to say so.
+//
+// Second, and the reason it matters more since the store moved off the database clock:
+// a lease renewal can be FOOLED by a clock, and the fence cannot. TryAcquire decides
+// expiry by comparing a stored deadline against the caller's own clock, so an instance
+// running fast can conclude it still leads when the lock row says otherwise. The fence
+// compares holder IDENTITY in the store, with no clock in the decision, so it is the
+// one check that a skewed clock cannot talk its way past.
+func TestSupersededLeaderStopsInsteadOfRedeliveringTheLog(t *testing.T) {
+	st := newFakeStore()
+	for range 20 {
+		st.appendPending()
+	}
+	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+
+	const page = 5
+
+	var (
+		mu    sync.Mutex
+		sent  int
+		obsMu sync.Mutex
+		obsEr []error
+	)
+	// Supersession lands mid-page, exactly as a slow send would let it.
+	sender := senderFunc(func(context.Context, *event.Metadata, []byte) error {
+		mu.Lock()
+		sent++
+		n := sent
+		mu.Unlock()
+
+		if n == 3 {
+			st.setLeader("standby")
+			st.setOffset("g", 500) // the successor has drained well past us
+		}
+
+		return nil
+	})
+
+	r, err := sequence.NewRelay("g", st, sender,
+		sequence.WithPollInterval(time.Millisecond),
+		sequence.WithBatchSize(page),
+		// Replay from the start, so this relay genuinely drains and commits rather
+		// than priming at latest and finding nothing to do.
+		sequence.WithStartFromBeginning(),
+		sequence.WithObserver(relay.Observer{OnError: func(_ string, err error) {
+			obsMu.Lock()
+			obsEr = append(obsEr, err)
+			obsMu.Unlock()
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	// Losing an election is not a fault, so the pass must end cleanly.
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("a superseded pass must end cleanly, not error: %v", err)
+	}
+
+	mu.Lock()
+	total := sent
+	mu.Unlock()
+
+	if total > page {
+		t.Errorf("the superseded relay sent %d events (%d pages): it kept redelivering the log "+
+			"from its own stale position instead of stopping when its commit was rejected",
+			total, (total+page-1)/page)
+	}
+
+	if got, _ := st.offsetOf("g"); got != 500 {
+		t.Errorf("watermark = %d, want 500 (the successor's position, untouched)", got)
+	}
+
+	obsMu.Lock()
+	defer obsMu.Unlock()
+	var reported bool
+	for _, e := range obsEr {
+		if strings.Contains(e.Error(), "superseded") {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Errorf("supersession was not reported to the observer (errors: %v): the stream runtime "+
+			"surfaces a stale token save, and this event was previously invisible", obsEr)
+	}
+}
+
+// TestFencedCommitUsesTheRelaysOwnElectionIdentity pins that the fence is evaluated
+// against the identity this relay actually competes under. A fence checked against
+// anything else — a fresh UUID, the group name — would be a no-op that still returns
+// persisted=true, which looks identical to a working fence until the day it matters.
+func TestFencedCommitUsesTheRelaysOwnElectionIdentity(t *testing.T) {
+	st := newFakeStore()
+	st.appendPending()
+	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+
+	r, err := sequence.NewRelay("g", st, noopSender,
+		sequence.WithPollInterval(time.Millisecond),
+		sequence.WithLeaderLockName("shared-lock"),
+		// Replay from the start so a commit actually happens: a group primed at
+		// "latest" has nothing to drain and would never reach the fence.
+		sequence.WithStartFromBeginning(),
+	)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	lock, holder, calls := st.fenceRecord()
+	if calls == 0 {
+		t.Fatal("the relay never used the fenced commit")
+	}
+	if lock != "shared-lock" {
+		t.Errorf("fenced on lock %q, want the configured leader-lock name", lock)
+	}
+	// The holder must be the identity that actually holds the lock, i.e. the one the
+	// elector acquired with.
+	if holder == "" || holder != st.leaderHolder() {
+		t.Errorf("fenced on holder %q, but the lock is held by %q", holder, st.leaderHolder())
+	}
+}
+
+// TestNewRelayRejectsAStoreThatCannotFenceTheWatermark pins the capability
+// requirement and its two escapes. A store that cannot fence must not be accepted
+// silently: the consequence is a rewound group, which is invisible in the logs and
+// permanent in the consumers.
+func TestNewRelayRejectsAStoreThatCannotFenceTheWatermark(t *testing.T) {
+	st := storeWithoutFence{inner: newFakeStore()}
+
+	_, err := sequence.NewRelay("g", st, noopSender)
+	if err == nil || !strings.Contains(err.Error(), "FencedCommitter") {
+		t.Fatalf("err = %v, want the FencedCommitter capability error", err)
+	}
+	if !strings.Contains(err.Error(), "WithoutFencedCommit") {
+		t.Fatalf("err = %v, want it to name the waiver", err)
+	}
+
+	if _, err := sequence.NewRelay("g", st, noopSender, sequence.WithoutFencedCommit()); err != nil {
+		t.Fatalf("the explicit waiver was rejected: %v", err)
+	}
+	// Single-instance mode needs no fence: there is no rival to be superseded by.
+	if _, err := sequence.NewRelay("g", st, noopSender, sequence.WithoutLeaderElection()); err != nil {
+		t.Fatalf("single-instance mode was rejected: %v", err)
+	}
+}
+
+// storeWithoutFence exposes the full Store contract but deliberately not
+// FencedCommitter, modeling a third-party store written before the capability
+// existed.
+type storeWithoutFence struct{ inner *fakeStore }
+
+func (s storeWithoutFence) ListMessages(ctx context.Context, afterSeq int64, limit int) ([]*outbox.Message, error) {
+	return s.inner.ListMessages(ctx, afterSeq, limit)
+}
+
+func (s storeWithoutFence) Offset(ctx context.Context, name string) (int64, bool, error) {
+	return s.inner.Offset(ctx, name)
+}
+
+func (s storeWithoutFence) CommitOffset(ctx context.Context, name string, seq int64) error {
+	return s.inner.CommitOffset(ctx, name, seq)
+}
+
+func (s storeWithoutFence) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
+	return s.inner.InitOffsetLatest(ctx, name)
+}
+
+func (s storeWithoutFence) SequenceMessages(ctx context.Context, limit int) (int, error) {
+	return s.inner.SequenceMessages(ctx, limit)
+}
+
+func (s storeWithoutFence) TryAcquireLeaderLock(
+	ctx context.Context, name, holderID string, ttl time.Duration,
+) (bool, error) {
+	return s.inner.TryAcquireLeaderLock(ctx, name, holderID, ttl)
+}
+
+func (s storeWithoutFence) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
+	return s.inner.ReleaseLeaderLock(ctx, name, holderID)
+}
+
+// TestPoisonHandlerIsBoundedByOpTimeout pins that the park hook cannot stall the relay.
+//
+// A PoisonHandler is a REMOTE call by design — it publishes to a DLQ or writes to a
+// parking store — and it runs on the relay's only goroutine. Every other remote call on
+// that goroutine is bounded by construction: the store capabilities through boundedStore,
+// the leader elector's TryAcquire, the lane's send. This one was the sole exception, so
+// an unresponsive DLQ stopped delivery indefinitely with no signal at all — the observer
+// error, the log line and the stuck-lane escalation all sit downstream of the handler
+// returning.
+func TestPoisonHandlerIsBoundedByOpTimeout(t *testing.T) {
+	st := newFakeStore()
+	st.appendPending()
+	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+	st.poisonSeq = 1
+
+	const opTimeout = 300 * time.Millisecond
+
+	var (
+		mu       sync.Mutex
+		gotDDL   bool
+		hadDDL   bool
+		handlerC = make(chan struct{}, 1)
+	)
+	// The handler blocks far longer than the budget and reports what context it got.
+	poison := func(ctx context.Context, _ *outbox.Message, _ error) error {
+		_, ok := ctx.Deadline()
+		mu.Lock()
+		hadDDL = ok
+		mu.Unlock()
+		select {
+		case handlerC <- struct{}{}:
+		default:
+		}
+
+		<-ctx.Done()
+		mu.Lock()
+		gotDDL = true
+		mu.Unlock()
+
+		return ctx.Err()
+	}
+
+	r, err := sequence.NewRelay("g", st, noopSender,
+		sequence.WithPollInterval(time.Millisecond),
+		sequence.WithOpTimeout(opTimeout),
+		sequence.WithLeaseTTL(10*time.Second),
+		sequence.WithStartFromBeginning(),
+		sequence.WithPoisonHandler(poison),
+	)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- r.RunOnce(context.Background()) }()
+
+	select {
+	case <-handlerC:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the poison handler was never called")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunOnce never returned: a blocking PoisonHandler stalled the relay's only " +
+			"goroutine, and no observer, log or stuck-lane signal fires until it returns")
+	}
+
+	elapsed := time.Since(start)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !hadDDL {
+		t.Error("the PoisonHandler received a context with no deadline: an unresponsive parking " +
+			"store would block delivery forever")
+	}
+	if !gotDDL {
+		t.Error("the PoisonHandler's context was never canceled")
+	}
+	// Generous upper bound: the point is that it is bounded at all, not the exact value.
+	if elapsed > 3*time.Second {
+		t.Errorf("the pass took %v with a %v OpTimeout: the park is not bounded by it", elapsed, opTimeout)
+	}
+}
+
+// TestShutdownReturnsWithinAnAggregateBudget is the S14 regression test.
+//
+// Every step of the shutdown path was bounded individually and nothing bounded their
+// SUM. bound.Commit decided its budget at ENTRY, so a SIGTERM landing just after it
+// returned left the final offset commit detached and uninterruptible for the whole
+// OpTimeout — 30s by default — and the leader-lock release added its own budget on top.
+// The total reached ~40s against a Kubernetes terminationGracePeriodSeconds that
+// defaults to 30, so the pod was SIGKILLed mid-commit: it lost the very write the
+// detachment exists to protect and redelivered the page it had already sent.
+//
+// The existing shutdown tests assert per-call properties — that the commit context is
+// detached and bounded, that leadership is released — and cancel while the relay is
+// IDLE, with everything already delivered. None of them measures how long Run takes to
+// return once cancellation lands mid-commit, which is the only quantity a termination
+// grace period cares about.
+func TestShutdownReturnsWithinAnAggregateBudget(t *testing.T) {
+	st := newFakeStore()
+	for range 5 {
+		st.appendPending()
+	}
+	if _, err := st.SequenceMessages(context.Background(), 100); err != nil {
+		t.Fatalf("sequence: %v", err)
+	}
+
+	// A commit that hangs far longer than any budget: a wedged connection, or a store
+	// that has stopped answering. It must not be able to hold shutdown open.
+	const opTimeout = 25 * time.Second
+	committing := make(chan struct{}, 1)
+	st.blockCommit(func(ctx context.Context) error {
+		select {
+		case committing <- struct{}{}:
+		default:
+		}
+		// Honors the context, as a real driver does: whatever bound gives this call is
+		// what decides when it ends.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Minute):
+			return nil
+		}
+	})
+
+	r, err := sequence.NewRelay("g", st, noopSender,
+		sequence.WithPollInterval(time.Millisecond),
+		sequence.WithOpTimeout(opTimeout),
+		sequence.WithLeaseTTL(90*time.Second),
+		sequence.WithStartFromBeginning(),
+	)
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Run(ctx) }()
+
+	// Cancel only once a commit is actually in flight, so the test measures the
+	// mid-commit case rather than an idle relay.
+	select {
+	case <-committing:
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("no commit was ever attempted")
+	}
+
+	cancel()
+	start := time.Now()
+
+	select {
+	case <-done:
+	case <-time.After(75 * time.Second):
+		t.Fatalf("Run did not return within 75s of cancellation while a commit was in flight: "+
+			"the detached commit kept its full %v budget and the shutdown tail added its own on "+
+			"top, so the pod is SIGKILLed mid-commit and redelivers the page it already sent",
+			opTimeout)
+	}
+
+	elapsed := time.Since(start)
+	// The aggregate budget: the commit's post-cancellation grace plus the shutdown tail,
+	// which now share one bound.Shutdown each rather than one per step. Asserted with
+	// headroom for scheduling — the point is that it is well inside a 30s grace period
+	// and independent of OpTimeout, not the exact figure.
+	// One post-cancellation grace for the in-flight commit, plus the shared shutdown
+	// tail. Deliberately independent of OpTimeout, which is the property that broke:
+	// with headroom for scheduling, but far tighter than the ~40s that outran a default
+	// 30s terminationGracePeriodSeconds.
+	const budget = 12 * time.Second
+	if elapsed > budget {
+		t.Errorf("shutdown took %v, want under %v: with a %v OpTimeout this is the value a "+
+			"terminationGracePeriodSeconds has to cover", elapsed, budget, opTimeout)
+	}
+	t.Logf("Run returned %v after cancellation (OpTimeout %v)", elapsed, opTimeout)
+}
+
+// TestSweepStillFullDoesNotConsumeTheRetentionInterval is the S11 regression test.
+//
+// maybeSweep loops while pages come back full, bounded by maxPagesPerTick, and then
+// latched the interval — so the sweep's throughput ceiling was
+// maxPagesPerTick * RetentionSweepBatch per RetentionSweepInterval. On the defaults that
+// is 64 * 1000 per hour: 17.8 rows/s. Any outbox publishing faster than that grows
+// forever once rows start crossing the retention window, at (rate - 17.8) rows/s, and
+// the terminal state is a full disk months later and nowhere near the cause.
+//
+// The interval is a cadence for pruning an outbox that has CAUGHT UP; it was never meant
+// to ration throughput. The code already applies exactly this reasoning to a FAILED
+// sweep — "a sweep that deleted nothing must not buy a full RetentionSweepInterval of
+// silence" — and hitting the page cap while pages are still full is the same situation
+// reached by a different exit: there is known deletable work left, and waiting an hour
+// to resume it is what lets the table win.
+//
+// So the interval is now latched only when the sweep actually drains the backlog. While
+// it is behind, it continues every tick, bounded per tick by maxPagesPerTick as before.
+func TestSweepStillFullDoesNotConsumeTheRetentionInterval(t *testing.T) {
+	const (
+		batch = 100
+		// More than maxPagesPerTick pages of work, so the first pass cannot finish.
+		backlog = 100 * 100
+	)
+
+	st := newFakeStore()
+	st.sweepBacklog = backlog
+
+	var swept []int
+	obs := relay.Observer{OnSwept: func(_ string, n int) { swept = append(swept, n) }}
+
+	// An hour-long interval, as the defaults have: if the cap-hit exit latches it, the
+	// second pass below sweeps nothing.
+	r, err := sequence.NewRelay("c", st, noopSender,
+		sequence.WithRetention(time.Hour, batch), sequence.WithObserver(obs))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	firstTotal := 0
+	for _, n := range swept {
+		firstTotal += n
+	}
+	if firstTotal == backlog {
+		t.Fatalf("the first pass swept the whole %d-row backlog, so the page cap was never hit "+
+			"and this test proves nothing", backlog)
+	}
+
+	// A second pass, immediately: no wall-clock hour has passed.
+	swept = swept[:0]
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	secondTotal := 0
+	for _, n := range swept {
+		secondTotal += n
+	}
+
+	if secondTotal == 0 {
+		t.Fatalf("the second pass swept nothing while %d deletable rows remained: hitting the page "+
+			"cap consumed the whole retention interval, capping the sweep at "+
+			"maxPagesPerTick*batch per interval (17.8 rows/s on the defaults) — below any real "+
+			"publish rate, so the table grows without bound",
+			backlog-firstTotal)
+	}
+
+	// And once it catches up, the interval IS respected: no unbounded sweeping of an
+	// outbox that has nothing left to prune.
+	for range 20 {
+		if err := r.RunOnce(t.Context()); err != nil {
+			t.Fatalf("catch-up pass: %v", err)
+		}
+	}
+	if st.remainingSweepBacklog() != 0 {
+		t.Fatalf("%d rows still deletable after catching up", st.remainingSweepBacklog())
+	}
+
+	swept = swept[:0]
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("idle pass: %v", err)
+	}
+	if len(swept) != 0 {
+		t.Errorf("an idle relay swept again inside the retention interval (%v): the interval is no "+
+			"longer bounding a caught-up sweep", swept)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/bound"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/leader"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
 )
@@ -37,6 +38,10 @@ type Reporter struct {
 	Name     string
 	Observer relay.Observer
 	Logger   *slog.Logger
+
+	// ParkTimeout bounds the PoisonHandler call. Zero leaves it unbounded, which is
+	// only safe for a handler that cannot block — see MessageFailure.
+	ParkTimeout time.Duration
 
 	// wasLeader is the last leadership state reported, so Leadership can fire on
 	// transitions only.
@@ -88,8 +93,8 @@ func (r *Reporter) Leadership(isLeader bool) {
 // TTL expiry, and a store outage also surfaces on the successor's TryAcquire —
 // so it is logged at Warn here rather than returned to a shutdown path that
 // could do nothing else with it.
-func (r *Reporter) ReleaseLeadership(e *leader.Elector) {
-	if err := e.Release(); err != nil {
+func (r *Reporter) ReleaseLeadership(ctx context.Context, e *leader.Elector) {
+	if err := e.Release(ctx); err != nil {
 		r.Logger.Warn(r.Runtime+" relay: release leader lock", "relay", r.Name, "err", err)
 	}
 	r.Leadership(false)
@@ -108,6 +113,19 @@ func (r *Reporter) ReleaseLeadership(e *leader.Elector) {
 func (r *Reporter) MessageFailure(ctx context.Context, h relay.PoisonHandler, msg *outbox.Message, err error) error {
 	var parkErr error
 	if h != nil {
+		// Bounded, because a PoisonHandler is a REMOTE call by design — it publishes to
+		// a DLQ or writes to a parking store — and it runs on the relay's only
+		// goroutine. Every other remote call on that goroutine is bounded by
+		// construction (the store capabilities, the stream's Next, the leader
+		// elector's TryAcquire, the lane's send); this one was the sole exception, so
+		// an unresponsive DLQ stalled delivery indefinitely with NO signal at all: the
+		// observer, the log line and the stuck-lane escalation below all sit
+		// DOWNSTREAM of this call returning.
+		if r.ParkTimeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = bound.Call(ctx, r.ParkTimeout)
+			defer cancel()
+		}
 		parkErr = h(ctx, msg, err)
 	}
 	r.Error(err)

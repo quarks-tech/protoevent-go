@@ -180,3 +180,44 @@ func TestValidateMetadataEnforcesTheSendableShape(t *testing.T) {
 		})
 	}
 }
+
+// TestValidateMetadataRejectsOverlongTypeAndExtensionNames pins the AMQP shortstr
+// bound at publish time.
+//
+// The type becomes amqp.Publishing.Type and an extension name becomes an AMQP
+// header-table key; both are shortstrs, so amqp091-go refuses anything over 255
+// bytes at SEND time. Over an outbox that is long after the row committed with the
+// caller's business transaction, and the resulting error is neither a DecodeError
+// nor ErrUnsendable-wrapped, so no classifier claims it and the relay lane stops on
+// that row every tick forever — blocking every event behind it. This is the same
+// reasoning that already rejects a dot-less type and a nested extension value here.
+func TestValidateMetadataRejectsOverlongTypeAndExtensionNames(t *testing.T) {
+	t.Run("type", func(t *testing.T) {
+		md := validMetadata()
+		md.Type = "books.v1." + strings.Repeat("T", 256)
+
+		if err := outbox.ValidateMetadata(md); err == nil {
+			t.Fatal("ValidateMetadata accepted a type over the AMQP shortstr limit")
+		}
+	})
+
+	t.Run("extension name", func(t *testing.T) {
+		md := validMetadata()
+		md.Extensions = map[string]any{strings.Repeat("k", 256): "v"}
+
+		if err := outbox.ValidateMetadata(md); err == nil {
+			t.Fatal("ValidateMetadata accepted an extension name over the AMQP shortstr limit")
+		}
+	})
+
+	t.Run("at the limit both are accepted", func(t *testing.T) {
+		md := validMetadata()
+		// 255 bytes exactly, dot included, so SplitType still succeeds.
+		md.Type = "b." + strings.Repeat("T", 253)
+		md.Extensions = map[string]any{strings.Repeat("k", 255): "v"}
+
+		if err := outbox.ValidateMetadata(md); err != nil {
+			t.Fatalf("ValidateMetadata rejected metadata at the limit: %v", err)
+		}
+	})
+}

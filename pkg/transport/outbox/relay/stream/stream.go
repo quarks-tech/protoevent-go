@@ -378,7 +378,7 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		return nil, err
 	}
 
-	reporter := options.Reporter("stream", name)
+	reporter := options.Reporter("stream", name, options.OpTimeout)
 
 	// Asserted on the raw store, before boundedStore wraps it: the wrapper
 	// implements Store and nothing else, so the capability would be invisible

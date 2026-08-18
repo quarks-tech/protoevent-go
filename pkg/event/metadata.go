@@ -275,6 +275,32 @@ func ReservedExtensionName(name string) bool {
 	return core
 }
 
+// MaxShortStrLen is the longest value AMQP 0-9-1 can carry in a shortstr field:
+// the length prefix is a single byte.
+//
+// It bounds two things a publisher controls. An event's TYPE is written to
+// amqp.Publishing.Type, and every AMQP header-table KEY — which is what an
+// extension name becomes in binary content mode — is written the same way. The
+// amqp091-go field encoder refuses anything longer, at SEND time.
+//
+// The bound matters most over an outbox, where publish-time validation and the send
+// are separated by a durable row. Nothing about a 256-byte type is detectable when
+// the row commits, and the eventual send failure is neither a DecodeError nor
+// wrapped in ErrUnsendable unless something checks for it — so no classifier claims
+// it and the relay lane stops on that row every tick forever, blocking every event
+// behind it, recoverable only by editing offsets in a live database. Rejecting it up
+// front costs the caller's transaction one error instead.
+const MaxShortStrLen = 255
+
+// ShortStrTooLong reports whether s exceeds what an AMQP shortstr can carry.
+//
+// The measurement is BYTES, not runes: the wire format's one-byte length prefix
+// counts encoded bytes, so a 200-rune string of multi-byte characters can exceed the
+// limit while len([]rune(s)) suggests it fits.
+func ShortStrTooLong(s string) bool {
+	return len(s) > MaxShortStrLen
+}
+
 // ValidExtensionValue reports whether v is an extension value every transport here
 // can actually serialize, returning a descriptive error when it is not.
 //

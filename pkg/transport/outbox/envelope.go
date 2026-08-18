@@ -108,9 +108,23 @@ func ValidateMetadata(md *event.Metadata) error {
 	if _, _, err := event.SplitType(md.Type); err != nil {
 		return fmt.Errorf("outbox: message metadata type: %w", err)
 	}
+	// The type becomes amqp.Publishing.Type, a shortstr — see event.MaxShortStrLen
+	// for why a length this validation misses wedges a lane rather than failing a
+	// publish.
+	if event.ShortStrTooLong(md.Type) {
+		return fmt.Errorf(
+			"outbox: message metadata type is %d bytes, over the %d-byte AMQP limit; shorten the event type",
+			len(md.Type), event.MaxShortStrLen)
+	}
 	for k, v := range md.Extensions {
 		if event.ReservedExtensionName(k) {
 			return fmt.Errorf("outbox: extension %q collides with a core CloudEvents attribute; rename it", k)
+		}
+		// An extension name becomes an AMQP header-table key, also a shortstr.
+		if event.ShortStrTooLong(k) {
+			return fmt.Errorf(
+				"outbox: extension name is %d bytes, over the %d-byte AMQP limit; shorten it",
+				len(k), event.MaxShortStrLen)
 		}
 		if err := validExtension(v); err != nil {
 			return fmt.Errorf("outbox: extension %q: %w", k, err)

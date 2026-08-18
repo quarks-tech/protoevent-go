@@ -24,8 +24,14 @@ var ErrLaneStopped = errors.New("stream: lane stopped; will reopen and redeliver
 // stream condition occurs (returns ErrInvalidated / ErrHistoryLost).
 // Releases leadership on exit so a planned shutdown fails over quickly.
 func (r *Relay) Run(ctx context.Context) error {
-	defer r.closeStream()
-	defer r.reporter.ReleaseLeadership(r.leader)
+	// One budget for the whole shutdown tail. These run in sequence (LIFO: release,
+	// then close), so a Shutdown budget each made the tail 2*Shutdown on top of the
+	// final commit — which is how the total reached ~40s against a 30s termination
+	// grace period. See bound.ShutdownScope.
+	shutdown, endShutdown := bound.ShutdownScope()
+	defer endShutdown()
+	defer r.closeStream(shutdown)
+	defer r.reporter.ReleaseLeadership(shutdown, r.leader)
 
 	r.ensureIndexes(ctx)
 
@@ -57,12 +63,12 @@ func (r *Relay) Run(ctx context.Context) error {
 			// error identity — the mongo v2 driver's own operation timeouts
 			// also surface as context.DeadlineExceeded, and those must still
 			// be observed as real errors while ctx is alive (default branch).
-			r.closeStream()
+			r.closeStream(context.Background())
 			r.sleep(ctx)
 		default:
 			// transient (leadership, reopen, send/save): report, drop the stream, retry
 			r.reporter.PassFailed(err)
-			r.closeStream()
+			r.closeStream(context.Background())
 			r.sleep(ctx)
 		}
 	}
@@ -104,7 +110,7 @@ func (r *Relay) RunOnce(ctx context.Context) error {
 	}
 	r.reporter.Leadership(isLeader)
 	if !isLeader {
-		r.closeStream()
+		r.closeStream(context.Background())
 		r.sleep(ctx) // avoid busy-spinning TryAcquireLeaderLock while not leader
 		return nil
 	}
@@ -367,7 +373,7 @@ func (r *Relay) drainWindow(ctx context.Context) error {
 		// already dead there), so the reopen resumes just after it, at the
 		// failed event; a non-advanced one saved nothing (reopen resumes from
 		// the prior token).
-		r.closeStream()
+		r.closeStream(context.Background())
 		return ErrLaneStopped
 	}
 	return nil
@@ -539,11 +545,22 @@ func (r *Relay) committedTokenAge() time.Duration {
 // cursor/session timeout reaps it. It is consumed here — logged at Warn —
 // rather than returned: every caller would do exactly this and nothing else,
 // so returning it would only relocate the same log line to five call sites.
-func (r *Relay) closeStream() {
+func (r *Relay) closeStream(ctx context.Context) {
 	if r.stream == nil {
 		return
 	}
-	ctx, cancel := bound.Fresh()
+	// Always bounded, and never longer than the caller's scope. A reopen on the happy
+	// path passes context.Background() and so gets its own budget; the shutdown
+	// sequence passes its shared scope and this keeps whichever deadline is sooner. An
+	// already-dead context would make killCursors unsendable, which leaks the
+	// server-side cursor until the server reaps it, so that case is given a fresh
+	// budget instead.
+	var cancel context.CancelFunc
+	if ctx.Err() != nil {
+		ctx, cancel = bound.Fresh()
+	} else {
+		ctx, cancel = context.WithTimeout(ctx, bound.Shutdown)
+	}
 	defer cancel()
 	if err := r.stream.Close(ctx); err != nil {
 		r.options.Logger.Warn("stream relay: close stream", "relay", r.name, "err", err)

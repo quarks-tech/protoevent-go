@@ -43,6 +43,19 @@ func NewElector(ls relay.LeaderStore, lockName, holderID string, ttl time.Durati
 	return &Elector{ls: ls, lockName: lockName, holderID: holderID, ttl: ttl}
 }
 
+// LockName and HolderID expose the identity this elector competes under, so a runtime
+// can FENCE a write on it: "apply this only if that lock is still held by me".
+//
+// Holding the lease and still being the leader are different claims. The lease can
+// expire — or be stolen by an instance whose clock runs fast — between the check and
+// the write, so a caller that guards a write with "am I the leader?" has guarded
+// nothing. Passing this identity into the write itself lets the store decide, at the
+// moment it applies, whether the claim is still good.
+func (e *Elector) LockName() string { return e.lockName }
+
+// HolderID returns the unique identity of this elector instance.
+func (e *Elector) HolderID() string { return e.holderID }
+
 // TryAcquire acquires or renews the lock. Returns true if this elector holds
 // it after the call.
 //
@@ -82,11 +95,23 @@ func (e *Elector) TryAcquire(ctx context.Context) (bool, error) {
 // TTL expiry regardless, and a store outage also surfaces on the successor's
 // TryAcquire every tick. Callers on a shutdown path should log it and move on
 // (the relay runtimes do), not fail shutdown over it.
-func (e *Elector) Release() error {
+// ctx should be the caller's shutdown scope (bound.ShutdownScope), so the release
+// shares one deadline with the rest of the shutdown sequence instead of adding its own.
+// An already-expired ctx still attempts the release on a fresh budget, since a release
+// that never reaches the server leaves a successor waiting out the full lease.
+func (e *Elector) Release(ctx context.Context) error { //nolint:contextcheck // a dead or absent ctx deliberately falls back to a fresh budget; see above
 	if !e.isLeader.Swap(false) || e.ls == nil {
 		return nil
 	}
-	ctx, cancel := bound.Fresh()
+	var cancel context.CancelFunc
+	if ctx.Err() != nil {
+		ctx, cancel = bound.Fresh()
+	} else {
+		// WithTimeout, not the scope as-is: this keeps whichever deadline is sooner, so
+		// the release shares the shutdown scope's budget when there is one and is still
+		// bounded when the caller handed over an unbounded context.
+		ctx, cancel = context.WithTimeout(ctx, bound.Shutdown)
+	}
 	defer cancel()
 
 	return e.ls.ReleaseLeaderLock(ctx, e.lockName, e.holderID)

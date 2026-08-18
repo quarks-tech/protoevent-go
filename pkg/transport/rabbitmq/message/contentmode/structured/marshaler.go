@@ -16,12 +16,42 @@ import (
 type Marshaler struct{}
 
 func (m Marshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, error) {
+	// The payload is spliced into the envelope as raw JSON, so it must BE JSON.
+	// json.RawMessage is copied through verbatim, and an invalid one is not an
+	// error the encoder reports: proto bytes emit `"data":\b\x01` and a
+	// zero-length non-nil payload emits the literal `"data":`, both invalid
+	// documents that marshal with a nil error. The publish then succeeds, the broker accepts the frame,
+	// and every consumer fails at json.Unmarshal — so the event is dead-lettered
+	// while the relay commits its offset past it. Three real inputs reach here:
+	// an event with no fields set, a payload whose DataContentType claims JSON
+	// while Data holds proto bytes, and the TiDB store's normalization of a nil
+	// payload to []byte{}.
+	//
+	// Wrapped in event.ErrUnsendable, as the extension rejections below are: the
+	// payload cannot become JSON by retrying, and an outbox row persisted before
+	// this check existed reaches this exact point — where an unclassified error
+	// stops the relay lane on that row every tick forever.
+	if len(data) > 0 && !json.Valid(data) {
+		return amqp.Publishing{}, fmt.Errorf(
+			"%w: structured mode splices the payload into the envelope as raw JSON, but this payload is not valid JSON (%d bytes); publish it in binary content mode, or encode the payload as JSON",
+			event.ErrUnsendable, len(data))
+	}
+
+	// An absent payload is null, not the empty string: json.RawMessage("") would
+	// emit the literal `"data":` and RawMessage(nil) already emits null, so an
+	// event published with a nil payload and the same event after a round trip
+	// through a store that normalizes nil to []byte{} must encode identically.
+	payload := json.RawMessage(data)
+	if len(data) == 0 {
+		payload = json.RawMessage("null")
+	}
+
 	dto := map[string]any{
 		"specversion": md.SpecVersion,
 		"id":          md.ID,
 		"type":        md.Type,
 		"source":      md.Source,
-		"data":        json.RawMessage(data),
+		"data":        payload,
 	}
 
 	if md.DataContentType != "" {
@@ -37,7 +67,8 @@ func (m Marshaler) Marshal(md *event.Metadata, data []byte) (amqp.Publishing, er
 	}
 
 	if !md.Time.IsZero() {
-		dto["time"] = md.Time.Format(time.RFC3339)
+		// RFC3339Nano — see the binary marshaler: RFC3339 truncates to whole seconds.
+		dto["time"] = md.Time.Format(time.RFC3339Nano)
 	}
 
 	// Extensions share one flat namespace with the core attributes in structured

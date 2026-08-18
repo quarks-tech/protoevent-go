@@ -3,6 +3,7 @@ package gochan_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -198,5 +199,85 @@ func TestReceiveSurvivesProcessorError(t *testing.T) {
 	}
 	if len(failed) != total {
 		t.Fatalf("error handler saw %d failures, want %d", len(failed), total)
+	}
+}
+
+// TestSendRacingCloseDoesNotPanic pins that a planned shutdown cannot crash a
+// publisher.
+//
+// Close used to be a bare close() of the shared message channel, so a Send parked
+// on a full buffer — the state a slow handler puts every publisher into, and
+// exactly what a shutdown interrupts — panicked with "send on closed channel" on a
+// goroutine this package does not own. The doc comment waived it as acceptable for
+// an in-memory transport while offering callers no barrier with which to satisfy
+// the "only after every Send has returned" precondition it required.
+func TestSendRacingCloseDoesNotPanic(t *testing.T) {
+	sr := gochan.New()
+
+	md := &event.Metadata{ID: "id-1", Type: "books.v1.BookCreated", Source: "/svc"}
+
+	// Fill the buffer so the next Send has nowhere to go.
+	for i := range 20 {
+		if err := sr.Send(context.Background(), md, []byte("d")); err != nil {
+			t.Fatalf("prefill %d: %v", i, err)
+		}
+	}
+
+	blocked := make(chan error, 1)
+	go func() {
+		defer func() {
+			if p := recover(); p != nil {
+				blocked <- fmt.Errorf("Send panicked: %v", p)
+			}
+		}()
+		blocked <- sr.Send(context.Background(), md, []byte("blocked"))
+	}()
+
+	// Give the goroutine time to park in the send.
+	time.Sleep(50 * time.Millisecond)
+
+	sr.Close(context.Background())
+
+	select {
+	case err := <-blocked:
+		if !errors.Is(err, gochan.ErrClosed) {
+			t.Fatalf("blocked Send returned %v, want gochan.ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked Send never returned after Close")
+	}
+
+	// A Send after Close reports it rather than panicking, and Close is idempotent.
+	if err := sr.Send(context.Background(), md, []byte("after")); !errors.Is(err, gochan.ErrClosed) {
+		t.Fatalf("Send after Close = %v, want gochan.ErrClosed", err)
+	}
+	sr.Close(context.Background())
+}
+
+// TestCloseDeliversWhatWasAlreadyBuffered pins the other half of Close's contract:
+// ending the subscription must not discard events the transport already accepted.
+func TestCloseDeliversWhatWasAlreadyBuffered(t *testing.T) {
+	sr := gochan.New()
+
+	md := &event.Metadata{ID: "id-1", Type: "books.v1.BookCreated", Source: "/svc"}
+	for i := range 5 {
+		if err := sr.Send(context.Background(), md, []byte{byte(i)}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+
+	sr.Close(context.Background())
+
+	var got int
+	err := sr.Receive(context.Background(), func(_ context.Context, _ *event.Metadata, _ []byte) error {
+		got++
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Receive = %v, want nil", err)
+	}
+	if got != 5 {
+		t.Fatalf("delivered %d events, want 5", got)
 	}
 }

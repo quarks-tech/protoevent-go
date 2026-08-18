@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/xid"
@@ -25,6 +26,11 @@ type receiverOptions struct {
 	setupTopology  bool
 	enableDLX      bool
 	requeueOnError bool
+
+	// requeueBackoffBase and requeueBackoffMax bound how fast a transient failure may
+	// be retried. See WithRequeueBackoff.
+	requeueBackoffBase time.Duration
+	requeueBackoffMax  time.Duration
 }
 
 func defaultReceiverOptions() receiverOptions {
@@ -47,11 +53,16 @@ func defaultReceiverOptions() receiverOptions {
 		// requeueing it would spin forever. That distinction is the caller's to make,
 		// by returning eventbus.NewUnprocessableEventError.
 		//
-		// The cost of this default is that a handler failing on a message the broker
-		// keeps redelivering retries in a tight loop. Bound it with WithDLX (a
-		// dead-letter exchange plus x-message-ttl gives delayed retry) or the
-		// parkinglot receiver, and see WithoutRequeue to opt back out.
-		requeueOnError: true,
+		// Requeueing is paced by WithRequeueBackoff rather than being immediate. An
+		// unthrottled loop is not merely wasteful on a quorum queue: those carry an
+		// x-delivery-limit (RabbitMQ 4.x applies one by default), and retrying at broker
+		// speed spends the whole budget in milliseconds — measured at 21 attempts in
+		// 13.9ms — after which the broker DISCARDS the message. A downstream blip
+		// shorter than a network round trip destroyed the event, which is the exact case
+		// this default exists to survive. See WithoutRequeue to opt out entirely.
+		requeueOnError:     true,
+		requeueBackoffBase: defaultRequeueBackoffBase,
+		requeueBackoffMax:  defaultRequeueBackoffMax,
 	}
 }
 
@@ -291,12 +302,124 @@ func (r *Receiver) Receive(shutdownCtx context.Context, processor eventbus.Proce
 	}
 
 	return consume.Run(shutdownCtx, r.client, spec, processor,
-		func(_ context.Context, _ *connpool.Conn, delivery *amqp.Delivery, dErr error) error {
-			return doAcknowledge(delivery, dErr, r.options.requeueOnError)
+		func(ctx context.Context, _ *connpool.Conn, delivery *amqp.Delivery, dErr error) error {
+			return doAcknowledge(ctx, delivery, dErr, r.options)
 		})
 }
 
-func doAcknowledge(m *amqp.Delivery, err error, requeueOnError bool) error {
+// Default pacing for requeued transient failures. The base doubles per redelivery up
+// to the cap, so a budget of 20 deliveries spans minutes instead of milliseconds: a
+// blip clears on an early attempt, while a genuinely stuck message still reaches its
+// limit (and a dead-letter exchange, if one is attached) in bounded time.
+const (
+	defaultRequeueBackoffBase = 200 * time.Millisecond
+	defaultRequeueBackoffMax  = 15 * time.Second
+)
+
+// deliveryCountHeader is set by quorum queues on each redelivery, and is what lets the
+// backoff grow with the number of failed attempts rather than being flat.
+const deliveryCountHeader = "x-delivery-count"
+
+// WithRequeueBackoff paces requeued transient failures: the delay before a delivery is
+// returned to the broker starts at base and doubles per redelivery, capped at max.
+//
+// It exists because the retry budget is finite and the broker sets the pace. A quorum
+// queue's x-delivery-limit is consumed by REDELIVERIES, so an unpaced requeue loop
+// exhausts it at broker speed and the message is discarded — measured at 21 attempts in
+// 13.9ms, so any downstream fault lasting longer than a few milliseconds was fatal to
+// the event. Pacing turns that budget into a window long enough for the fault to clear.
+//
+// The delay is served by holding the delivery unacked, which occupies one prefetch slot
+// for its duration. Several simultaneously-failing messages can therefore idle a
+// consumer whose prefetch is small; raise the prefetch, or use the parkinglot receiver,
+// if that matters more than in-order retry of the same message.
+//
+// A zero or negative base disables pacing and restores the immediate-requeue behavior.
+func WithRequeueBackoff(base, max time.Duration) ReceiverOption {
+	return func(o *receiverOptions) {
+		o.requeueBackoffBase = base
+		o.requeueBackoffMax = max
+	}
+}
+
+// deliveryCount reports how many times this delivery has already been delivered, from
+// the quorum-queue header. Absent (classic queues, or the first delivery) is 0, which
+// yields the base delay — still enough to stop a tight loop from burning CPU.
+//
+// The header arrives as one of several integer widths depending on the broker and on
+// anything between it and this consumer, so every AMQP integer type is accepted; the
+// same normalization the parking lot applies to x-death.
+func deliveryCount(m *amqp.Delivery) int {
+	// Clamped: the delay is capped long before this many redeliveries, so a huge or
+	// hostile value only needs to be turned into "plenty" rather than converted
+	// faithfully — which also keeps the widening conversions below in range.
+	const clamp = 64
+
+	var n int64
+	switch v := m.Headers[deliveryCountHeader].(type) {
+	case int:
+		n = int64(v)
+	case int8:
+		n = int64(v)
+	case int16:
+		n = int64(v)
+	case int32:
+		n = int64(v)
+	case int64:
+		n = v
+	case uint8:
+		n = int64(v)
+	case uint16:
+		n = int64(v)
+	case uint32:
+		n = int64(v)
+	case uint64:
+		if v > clamp {
+			return clamp
+		}
+		n = int64(v)
+	default:
+		return 0
+	}
+
+	if n < 0 {
+		return 0
+	}
+	if n > clamp {
+		return clamp
+	}
+
+	return int(n)
+}
+
+// requeueDelay is the pause before returning a transiently-failed delivery, doubling
+// with the redelivery count and capped at max.
+func requeueDelay(m *amqp.Delivery, base, max time.Duration) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+
+	n := deliveryCount(m)
+	if n < 0 {
+		n = 0
+	}
+	// Shift, but never past the cap: 1<<n overflows well before a realistic
+	// delivery limit is reached.
+	delay := base
+	for range n {
+		if delay >= max {
+			return max
+		}
+		delay *= 2
+	}
+	if max > 0 && delay > max {
+		return max
+	}
+
+	return delay
+}
+
+func doAcknowledge(ctx context.Context, m *amqp.Delivery, err error, o receiverOptions) error {
 	switch {
 	case err == nil:
 		if aErr := m.Ack(false); aErr != nil {
@@ -307,7 +430,20 @@ func doAcknowledge(m *amqp.Delivery, err error, requeueOnError bool) error {
 			return fmt.Errorf("reject delivery: %w", rErr)
 		}
 	default:
-		if rErr := m.Reject(requeueOnError); rErr != nil {
+		// Pace the requeue. ctx is the SHUTDOWN context (see consume.Ack), so a
+		// cancellation here means the process is draining: return the delivery at once
+		// rather than holding it for a delay nobody is waiting for.
+		if o.requeueOnError {
+			if d := requeueDelay(m, o.requeueBackoffBase, o.requeueBackoffMax); d > 0 {
+				timer := time.NewTimer(d)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+				}
+			}
+		}
+		if rErr := m.Reject(o.requeueOnError); rErr != nil {
 			return fmt.Errorf("reject delivery: %w", rErr)
 		}
 	}

@@ -255,7 +255,11 @@ func TestRoundTripPreservesDataSchemaAndTime(t *testing.T) {
 	md.ID = "id-1"
 	md.Source = "/svc"
 	md.DataSchema = u
-	md.Time = time.Now().UTC().Truncate(time.Second)
+	// NOT truncated to a second. The truncation this replaced made the assertion
+	// below unable to fail: both marshalers formatted with time.RFC3339, which
+	// carries no fractional-seconds field, so every timestamp lost its sub-second
+	// component on the wire while the test pre-truncated the input to match.
+	md.Time = time.Date(2026, 8, 18, 12, 0, 0, 123456789, time.UTC)
 
 	pub, err := Marshaler{}.Marshal(md, []byte("x"))
 	if err != nil {
@@ -273,6 +277,10 @@ func TestRoundTripPreservesDataSchemaAndTime(t *testing.T) {
 	}
 	if !got.Time.Equal(md.Time) {
 		t.Fatalf("Time = %v, want %v", got.Time, md.Time)
+	}
+	if got.Time.Nanosecond() != md.Time.Nanosecond() {
+		t.Fatalf("Time nanoseconds = %d, want %d (sub-second precision lost on the wire)",
+			got.Time.Nanosecond(), md.Time.Nanosecond())
 	}
 }
 
@@ -457,4 +465,43 @@ func TestUnmarshalDropsBrokerDeathBookkeeping(t *testing.T) {
 		t.Errorf("extension \"tenant\" = %#v, want \"acme\": the filter must not eat a caller's "+
 			"own extensions", md.Extensions["tenant"])
 	}
+}
+
+// TestMarshalOverlongShortStrIsUnsendable pins that the AMQP shortstr limit is
+// reported as ErrUnsendable rather than as an opaque encoder failure.
+//
+// Publish-time validation now rejects these lengths, but an outbox row persisted
+// BEFORE that check existed still reaches this marshaler. Only an
+// ErrUnsendable-wrapped error lets a relay park such a row; anything else stops the
+// lane on it every tick forever. Same contract as the reserved-name and
+// nested-value rejections here.
+func TestMarshalOverlongShortStrIsUnsendable(t *testing.T) {
+	t.Run("type", func(t *testing.T) {
+		md := event.NewMetadata("books.v1." + strings.Repeat("T", 256))
+		md.ID = "id-1"
+		md.Source = "/svc"
+
+		_, err := Marshaler{}.Marshal(md, []byte("x"))
+		if err == nil {
+			t.Fatal("Marshal accepted a type over the AMQP shortstr limit")
+		}
+		if !errors.Is(err, event.ErrUnsendable) {
+			t.Fatalf("error does not wrap event.ErrUnsendable, so a relay cannot park the row: %v", err)
+		}
+	})
+
+	t.Run("extension name", func(t *testing.T) {
+		md := event.NewMetadata("books.v1.BookCreated")
+		md.ID = "id-1"
+		md.Source = "/svc"
+		md.Extensions = map[string]any{strings.Repeat("k", 256): "v"}
+
+		_, err := Marshaler{}.Marshal(md, []byte("x"))
+		if err == nil {
+			t.Fatal("Marshal accepted an extension name over the AMQP shortstr limit")
+		}
+		if !errors.Is(err, event.ErrUnsendable) {
+			t.Fatalf("error does not wrap event.ErrUnsendable, so a relay cannot park the row: %v", err)
+		}
+	})
 }

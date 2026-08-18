@@ -239,12 +239,15 @@ func (l *Lease) Elector(runtime string, store any) (*leader.Elector, error) {
 }
 
 // Reporter builds the signal sink for one relay.
-func (h *Hooks) Reporter(runtime, name string) *notify.Reporter {
+// parkTimeout bounds the PoisonHandler; pass the runtime's OpTimeout, which is the
+// budget every other remote call on the relay goroutine already uses.
+func (h *Hooks) Reporter(runtime, name string, parkTimeout time.Duration) *notify.Reporter {
 	return &notify.Reporter{
-		Runtime:  runtime,
-		Name:     name,
-		Observer: h.Observer,
-		Logger:   h.Logger,
+		Runtime:     runtime,
+		Name:        name,
+		Observer:    h.Observer,
+		Logger:      h.Logger,
+		ParkTimeout: parkTimeout,
 	}
 }
 

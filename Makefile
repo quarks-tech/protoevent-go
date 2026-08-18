@@ -8,11 +8,20 @@ MODULES := . pkg/transport/outbox pkg/transport/outbox/mongodb pkg/transport/out
 # an external consumer sees, and nothing consumes this.
 TEST_MODULES := $(MODULES) test/e2e
 
-.PHONY: test lint check-modules
+.PHONY: test test-race lint check-modules
 
 # Tests and lint run under go.work, so cross-module changes resolve locally.
 test:
 	@set -e; for m in $(TEST_MODULES); do echo "== $$m"; (cd $$m && go test ./...); done
+
+# test-race is the concurrency gate. Several tests drive genuinely concurrent
+# production code — the sequencer under contending goroutines, the publish-confirm
+# map, the gochan buffer — and plain `make test` never asks the detector to look, so
+# a data race in that code is invisible to the suite that was written to catch it.
+# The explicit -timeout replaces Go's undeclared 10-minute default, which the
+# container-backed tests can approach on a cold image pull.
+test-race:
+	@set -e; for m in $(TEST_MODULES); do echo "== $$m (-race)"; (cd $$m && go test -race -timeout 15m ./...); done
 
 lint:
 	@set -e; for m in $(TEST_MODULES); do echo "== $$m"; (cd $$m && golangci-lint run); done

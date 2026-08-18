@@ -20,6 +20,16 @@ import (
 // simply never invoked — and future signals are additive rather than
 // breaking. The zero value discards everything. Both runtimes accept the
 // same type; OnSequenced simply never fires for the stream runtime.
+//
+// Callbacks MUST NOT BLOCK. They run on the relay's single pass goroutine, which is
+// also the goroutine that reads the store, sends to the broker and renews the leader
+// lease — so a callback that waits on a lock, a network write or a full channel stops
+// delivery for as long as it waits. Nothing bounds them: unlike the store capabilities,
+// the send and the PoisonHandler, which each carry an OpTimeout budget, an observer
+// callback is assumed cheap because its whole purpose is to hand a number to a metrics
+// registry. A blocked one is also invisible, because the signals that would report a
+// stalled relay are these same callbacks. Record the value and return; do the work
+// elsewhere. (gochan.WithErrorHandler states the same requirement for the same reason.)
 type Observer struct {
 	// OnDrained reports a drain/forward pass: count successfully sent
 	// (messages parked via a PoisonHandler are reported through OnError and
@@ -131,11 +141,30 @@ type LeaderStore interface {
 	// TryAcquireLeaderLock acquires or renews the lock. Returns true if holderID
 	// holds it after the call. The lock expires after ttl if not renewed.
 	//
-	// Expiry MUST be evaluated against a single authoritative clock — the
-	// store's own (DB server) clock, never the caller's wall clock: with
-	// client-side time.Now() a standby with a fast clock steals a live lease
-	// (dual leader) under clock skew between relay instances. Both reference
-	// implementations do this (TiDB NOW(6), MongoDB $$NOW).
+	// Expiry MUST be evaluated against ONE clock, shared by every instance of the
+	// group, and the deadline MUST be stored in a form that cannot be read in a
+	// different frame of reference than it was written in. Two instances that
+	// disagree about the current time by more than ttl can both consider themselves
+	// leader.
+	//
+	// A server-side clock is the easy way to satisfy this — one clock serves every
+	// instance — and MongoDB does it with $$NOW, which is safe because a BSON date is
+	// an unambiguous UTC instant.
+	//
+	// TiDB does NOT: it sends the deadline and the comparison from the relay process
+	// as bound parameters. NOW(6) looked like a single authoritative clock and was
+	// not one — it renders in the SESSION's time_zone and lands in a zone-less
+	// DATETIME(6) column, so a session eight hours ahead read every live lease as
+	// long expired and stole it outright, while a session behind never took over a
+	// lease that had genuinely expired. Trading that for the relay's own clock costs
+	// the single-clock property and buys away an error that needed no clock skew at
+	// all, only a differing time_zone.
+	//
+	// The consequence is that leadership alone is NOT sufficient to protect the log:
+	// a relay whose clock runs fast can acquire a lease another instance still holds.
+	// Ordering therefore has to be defended where the damage would happen — the
+	// offset commit must be fenced by holder, not merely monotone — rather than
+	// resting on the lease being unstealable.
 	TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error)
 	// ReleaseLeaderLock releases the lock if held by holderID, so a standby
 	// takes over immediately on graceful shutdown instead of waiting out the

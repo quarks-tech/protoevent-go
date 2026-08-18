@@ -98,14 +98,52 @@ type Sequencer interface {
 	SequenceMessages(ctx context.Context, limit int) (int, error)
 }
 
-// Clock is an optional store capability supplying the store's own current time.
+// FencedCommitter is an optional store capability: a CommitOffset that applies only
+// while the caller still holds the leader lock.
 //
-// It exists for one reason: lag. Message.CreateTime is stamped by the STORE
-// (the DB's NOW at insert), so measuring its age against the relay host's
-// time.Now() folds any NTP skew between the relay pod and the database into the
-// reported lag — on a pod whose clock trails the DB, a genuinely stale backlog
-// reports a negative age, which a Prometheus gauge plots as ~0 and no alert ever
-// fires on. With this capability both operands come from the store's clock.
+// Leadership does not protect the watermark on its own. A relay checks the lease
+// between pages, then sends a page and commits — and nothing stops the lease from
+// expiring, or being taken by an instance whose clock runs fast, inside that window.
+// A single store call is bounded by OpTimeout, but a whole page of slow sends is not,
+// so a stalled leader can wake up long after a standby has drained past it and commit
+// its stale watermark over the top. Because plain CommitOffset is an unconditional
+// monotone upsert, that write lands: consumers then see the log replayed from an older
+// position, and while event-id dedup absorbs the duplicates it cannot restore ORDER,
+// so any last-write-wins consumer regresses to a stale state permanently.
+//
+// Fencing moves the decision into the write. The store applies the new watermark only
+// if lockName is still held by holderID, and reports back whether it did — so a
+// superseded leader cannot rewind anything and, unlike before, finds out.
+//
+// The check is on holder IDENTITY, not on the lease's expiry time, which keeps it free
+// of any clock. A lease that merely expired with no successor still belongs to its
+// last holder, and that holder committing is safe: nobody else is draining. What must
+// be rejected is a commit from an instance that has been REPLACED, and a changed
+// holder_id says exactly that.
+type FencedCommitter interface {
+	// CommitOffsetFenced advances name's watermark to seq if lockName is still held
+	// by holderID, and reports whether the write was applied.
+	//
+	// persisted=false is not an error: it is the successful detection of a lost
+	// election, and the relay treats it as leadership lost. An error means the
+	// question could not be answered, which is NOT a license to assume either way.
+	//
+	// Monotone and insert-if-absent, exactly as CommitOffset — the fence is an extra
+	// condition, not a replacement for those guarantees.
+	CommitOffsetFenced(ctx context.Context, name, lockName, holderID string, seq int64) (persisted bool, err error)
+}
+
+// Clock is an optional store capability supplying the clock the store stamps with.
+//
+// It exists for one reason: lag. Message.CreateTime is stamped by the STORE, so
+// measuring its age against an unrelated clock folds the skew between them into the
+// reported lag — against a clock that trails the stamping one, a genuinely stale
+// backlog reports a negative age, which a Prometheus gauge plots as ~0 and no alert
+// ever fires on. With this capability both operands come from the same clock.
+//
+// What matters is that the two operands SHARE a clock, not which clock it is. A store
+// that stamps with the database's clock answers from the database; one that stamps
+// from its own process answers from there.
 //
 // A store that cannot cheaply answer it simply doesn't implement it: the relay
 // then falls back to the host clock (see Relay.oldestAge). The relay calls
@@ -154,6 +192,8 @@ type options struct {
 	PollInterval      time.Duration
 
 	SequencerDisabled bool // disables this relay's sequencer pass (see WithoutSequencer)
+
+	FencedCommitWaived bool // accepts an unfenced watermark (see WithoutFencedCommit)
 
 	// StartFromBeginning makes a NEW consumer group replay the retained log
 	// from the start instead of the default "latest" (future events only —
@@ -254,6 +294,21 @@ func WithoutLeaderElection() Option {
 // dedup on Metadata.ID regardless).
 func WithoutSequencer() Option { return func(o *options) { o.SequencerDisabled = true } }
 
+// WithoutFencedCommit accepts a store that cannot fence the watermark on leadership.
+//
+// Required to run a multi-instance relay over a Store that does not implement
+// FencedCommitter, because the alternative — accepting it silently — is the failure
+// this waiver exists to make visible: two leaders whose unconditional monotone commits
+// interleave, replaying the log from an older position and breaking total order for
+// good. Event-id dedup hides the duplicates and cannot restore the order.
+//
+// The waiver is safe when nothing can produce a second leader: a genuinely
+// single-instance deployment (where WithoutLeaderElection() says so and no fence is
+// needed), or a store whose watermark is guarded some other way. It is not safe
+// merely because the hazard seems unlikely — a page of slow sends outliving the lease
+// is ordinary broker backpressure, not an exotic event.
+func WithoutFencedCommit() Option { return func(o *options) { o.FencedCommitWaived = true } }
+
 // WithLogger sets the error logger. A nil logger is ignored.
 func WithLogger(l *slog.Logger) Option {
 	return func(o *options) {
@@ -320,10 +375,15 @@ func WithUnsendableClassifier(f relay.UnsendableClassifier) Option {
 // the instances asking the store to prune.
 func WithoutRetention() Option { return func(o *options) { o.RetentionDisabled = true } }
 
-// WithRetention retunes this relay's sweep CADENCE: at most one sweep per
-// sweepInterval, deleting up to sweepBatch fully-consumed rows per sweep.
-// sweepInterval is wall-clock time, decoupled from PollInterval — retuning the
-// tick does not silently change sweep cadence.
+// WithRetention retunes this relay's sweep CADENCE: deleting up to sweepBatch
+// fully-consumed rows per page, and — once the sweep has caught up — waiting at least
+// sweepInterval before pruning again. sweepInterval is wall-clock time, decoupled from
+// PollInterval, so retuning the tick does not silently change the idle cadence.
+//
+// sweepInterval does NOT cap throughput: while deletable rows remain the sweep continues
+// on every tick, bounded per tick rather than per interval. It used to be a cap, which
+// limited pruning to roughly 18 rows/s on the defaults — below any real publish rate, so
+// the log grew without bound and the symptom arrived months later as a full disk.
 //
 // How much history the sweep keeps is the store's retention window, not this
 // relay's (see Sweeper). Calling this makes the Sweeper capability mandatory — an
@@ -354,9 +414,10 @@ type Relay struct {
 	reporter *notify.Reporter
 	lane     *lane.Lane[int64]
 
-	sequencer Sequencer // nil if store lacks the capability or WithoutSequencer
-	retention Sweeper   // nil if store lacks the capability or retention not configured
-	clock     Clock     // nil if store lacks the capability (lag falls back to the host clock)
+	sequencer Sequencer       // nil if store lacks the capability or WithoutSequencer
+	fenced    FencedCommitter // nil only under WithoutFencedCommit / single-instance
+	retention Sweeper         // nil if store lacks the capability or retention not configured
+	clock     Clock           // nil if store lacks the capability (lag falls back to the host clock)
 
 	lastSweep time.Time // for retention cadence (see maybeSweep)
 
@@ -394,6 +455,17 @@ type Relay struct {
 // transport (e.g. a RabbitMQ sender). When several consumer groups share one
 // store, run the sequencer in exactly one relay and configure the others with
 // WithoutSequencer() — see its doc.
+//
+// name must be unique per DESTINATION, not merely per process, and nothing enforces
+// that. The offset row and the leader lock are both keyed on it, so two deployments
+// that reuse a name — a copied wiring snippet, a service split in two — contend as
+// though they were replicas of one relay: exactly one leads at a time, drains, and
+// advances the SHARED watermark past events the other instance never saw. Each
+// destination then receives an arbitrary slice of the log (in the worst case, nothing
+// at all), both report healthy OnDrained, and the retention sweep deletes the rows as
+// fully consumed. Two replicas of ONE deployment sharing a name is the intended case
+// and is exactly what this looks like from inside, which is why it cannot be detected
+// here.
 //
 // Sizing note (mirrors the stream runtime's TokenBatchSize rule): a drain
 // page is up to BatchSize synchronous Sender.Send calls, and the lease is
@@ -447,7 +519,7 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		return nil, err
 	}
 
-	reporter := options.Reporter("sequence", name)
+	reporter := options.Reporter("sequence", name, options.OpTimeout)
 	r := &Relay{
 		name: name,
 		// Every store capability is decorated with the OpTimeout operation
@@ -505,6 +577,20 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 				"(pass WithoutRetention() to make this explicit, and ensure something else prunes the log)",
 				"relay", name)
 		}
+	}
+	// The fence is required wherever a SECOND leader is possible, which is
+	// wherever there is an election. Without it a superseded leader's monotone
+	// commit lands unconditionally and rewinds the group — see FencedCommitter.
+	// Single-instance mode needs no fence: there is no rival to be superseded by.
+	if !options.FencedCommitWaived && !options.LeaderElectionDisabled {
+		fc, ok := store.(FencedCommitter)
+		if !ok {
+			return nil, errors.New("sequence: store does not implement sequence.FencedCommitter, so a " +
+				"superseded leader could rewind this group's watermark and replay the log out of order; " +
+				"pass WithoutFencedCommit() to accept that, or WithoutLeaderElection() if this is a " +
+				"single-instance deployment")
+		}
+		r.fenced = boundedFencedCommitter{inner: fc, ttl: options.OpTimeout}
 	}
 	// Optional, and legitimately absent: without it lag is measured against the
 	// relay host's clock instead of the store's (see Clock).

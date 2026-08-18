@@ -1,6 +1,8 @@
 package publish
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -59,7 +61,7 @@ func TestEnableConfirmsDoesNotSerializeDistinctChannels(t *testing.T) {
 	wedged := &blockingChannel{entered: make(chan struct{}), release: make(chan struct{})}
 	healthy := &fastChannel{}
 
-	go func() { _ = c.Enable(wedged) }()
+	go func() { _ = c.Enable(context.Background(), wedged) }()
 
 	// Only proceed once the wedged handshake is actually in flight, so the test
 	// cannot pass by winning a race.
@@ -70,7 +72,7 @@ func TestEnableConfirmsDoesNotSerializeDistinctChannels(t *testing.T) {
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- c.Enable(healthy) }()
+	go func() { done <- c.Enable(context.Background(), healthy) }()
 
 	select {
 	case err := <-done:
@@ -97,7 +99,7 @@ func TestEnableConfirmsRunsTheHandshakeOncePerChannel(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 20 {
 		wg.Go(func() {
-			if err := c.Enable(ch); err != nil {
+			if err := c.Enable(context.Background(), ch); err != nil {
 				t.Errorf("enableConfirms: %v", err)
 			}
 		})
@@ -171,3 +173,104 @@ func (b *blockingChannel) NotifyReturn(c chan amqp.Return) chan amqp.Return { re
 
 // NotifyReturn satisfies Channel.
 func (f *fastChannel) NotifyReturn(c chan amqp.Return) chan amqp.Return { return c }
+
+// TestEnableConfirmsGivesUpWithTheContext is the regression test for the hang that had
+// no signal.
+//
+// Channel.Confirm is a synchronous, context-less AMQP RPC, and amqp091 writes frames
+// with no deadline: on a channel whose peer has stopped reading — a resource alarm, a
+// dropped conntrack entry, a broker mid-failover — it never returns. That call ran on
+// the CALLER's goroutine, which for an outbox relay is its only goroutine. A Send
+// bounded by SendTimeout could not interrupt it, because a deadline only helps a callee
+// that reads it.
+//
+// The result was the quietest possible failure: no OnDrained, no OnError, no log line
+// and no stuck-lane escalation, because every one of those fires only after the send
+// returns. Meanwhile the leader lease expired and a standby started draining the same
+// log, and Run never returned on SIGTERM.
+//
+// The existing suite already had the blockingChannel fixture and asserted only that a
+// wedged channel did not stall OTHER channels. Nobody asserted what happened to the
+// goroutine stuck in the wedged handshake itself.
+func TestEnableConfirmsGivesUpWithTheContext(t *testing.T) {
+	c := NewConfirms()
+	wedged := &blockingChannel{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(wedged.release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- c.Enable(ctx, wedged) }()
+
+	select {
+	case <-wedged.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blocking handshake was never entered")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Enable returned %v, want a context deadline error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Enable never returned on a wedged channel: the caller's goroutine is stuck in a " +
+			"context-less AMQP RPC, and for a relay that is its only goroutine — delivery stops " +
+			"with no error, no log and no escalation, and SIGTERM cannot end it")
+	}
+}
+
+// TestEnableConfirmsDoesNotClaimConfirmsAfterGivingUp pins the half that makes the
+// abandonment safe.
+//
+// Reporting a context error and ALSO leaving the channel marked as enabled would be
+// worse than hanging: the next publish would proceed believing confirms were negotiated,
+// so an unconfirmed publish would be reported as delivered and an outbox relay would
+// commit its offset past an event the broker never acknowledged.
+func TestEnableConfirmsDoesNotClaimConfirmsAfterGivingUp(t *testing.T) {
+	c := NewConfirms()
+	wedged := &blockingChannel{entered: make(chan struct{}), release: make(chan struct{})}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	if err := c.Enable(ctx, wedged); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Enable = %v, want a context deadline error", err)
+	}
+
+	// A second attempt with a live context must NOT report success while the handshake
+	// is still outstanding.
+	second := make(chan error, 1)
+	go func() {
+		sctx, scancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer scancel()
+		second <- c.Enable(sctx, wedged)
+	}()
+
+	select {
+	case err := <-second:
+		if err == nil {
+			t.Fatal("Enable reported success while the confirm handshake was still outstanding: a " +
+				"publish would then be treated as confirmed when confirm mode was never negotiated")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second Enable never returned")
+	}
+
+	// Once the handshake completes, the channel is genuinely usable and the orphaned
+	// RPC's result is not thrown away.
+	close(wedged.release)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := c.Enable(context.Background(), wedged)
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Enable never succeeded after the handshake completed: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

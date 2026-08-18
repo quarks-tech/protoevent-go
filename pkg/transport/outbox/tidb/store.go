@@ -9,6 +9,7 @@ package tidb
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
@@ -45,12 +46,13 @@ const defaultRetentionWindow = 7 * 24 * time.Hour
 // NewRelayStore.
 type config struct {
 	prefix    string
-	retention time.Duration // sweep cutoff age; see WithRetentionWindow
+	retention time.Duration    // sweep cutoff age; see WithRetentionWindow
+	now       func() time.Time // clock for every stamped/compared time; see WithClock
 }
 
 // newConfig applies opts over the defaults.
 func newConfig(opts []Option) config {
-	c := config{retention: defaultRetentionWindow}
+	c := config{retention: defaultRetentionWindow, now: time.Now}
 	for _, opt := range opts {
 		opt(&c)
 	}
@@ -102,6 +104,30 @@ func WithRetentionWindow(d time.Duration) Option {
 	return func(c *config) { c.retention = d }
 }
 
+// WithClock replaces the clock the store stamps and compares times with
+// (default time.Now).
+//
+// Every timestamp this store writes or evaluates — create_time, offset
+// update_time, the leader lease deadline, the retention cutoff — is taken from
+// this clock in Go and sent as a bound parameter. It is exposed mainly so tests
+// can drive lease expiry and retention deterministically instead of sleeping.
+//
+// One clock per relay group. Two instances of one group whose clocks disagree by
+// more than the lease TTL can both consider themselves leader, which is why the
+// offset commit must be fenced rather than merely monotone.
+//
+// Rollout note: times are written in UTC. Rows written by a version that used NOW(6)
+// carry create_time in whatever time_zone the writing session used, so on a
+// deployment whose sessions were not UTC, retention treats those older rows as offset
+// by that zone until they age out of the window.
+func WithClock(now func() time.Time) Option {
+	if now == nil {
+		panic(errors.New("outbox: clock must not be nil"))
+	}
+
+	return func(c *config) { c.now = now }
+}
+
 // Runner is the subset of *sql.DB / *sql.Tx the store needs. Publish uses a
 // tx-scoped Runner (atomic with business writes); the relay uses *sql.DB.
 type Runner interface {
@@ -118,6 +144,8 @@ type Store struct {
 	// insertQuery is rendered once at construction (the table name is an
 	// identifier and cannot be a bound parameter; WithTablePrefix validates it).
 	insertQuery string
+	// now stamps create_time. See WithClock.
+	now func() time.Time
 }
 
 // NewStore builds a publish-side store over r, which MUST be a
@@ -140,20 +168,20 @@ func NewStore(r Runner, opts ...Option) *Store {
 	// time from the metadata JSON, and retention (SweepMessages) is
 	// create_time-anchored, not occur_time-anchored.
 	//
-	// create_time = NOW(6), the DATABASE clock — deliberately NOT the
-	// client-stamped Message.CreateTime: create_time is the retention anchor,
-	// and a publisher host with a skewed clock would otherwise pin rows
-	// forever (clock ahead) or expose them to an early sweep (clock behind).
-	// SweepMessages' cutoff is NOW(6)-relative too, so retention lives
-	// entirely in one clock domain.
+	// create_time comes from the store's clock (WithClock, default time.Now) as a
+	// bound parameter — deliberately NOT the client-stamped Message.CreateTime,
+	// which is a per-caller value: create_time is the retention anchor, and a
+	// publisher passing a skewed timestamp would otherwise pin rows forever (ahead)
+	// or expose them to an early sweep (behind). SweepMessages' cutoff comes from
+	// the same clock, so retention stays in one clock domain.
 	//
 	// NULLIF(@@tidb_current_ts, 0): on an autocommit connection the variable
 	// reads 0, and a 0 tx_start_ts would silently sort the row before every
 	// transactional row in a sequencer batch. NULLIF turns that 0 into NULL so
 	// the NOT NULL column rejects the row loudly instead.
-	return &Store{r: r, insertQuery: fmt.Sprintf(`
+	return &Store{r: r, now: c.now, insertQuery: fmt.Sprintf(`
 INSERT INTO %s (seq, tx_start_ts, event_id, metadata, data, create_time, occur_time)
-VALUES (NULL, NULLIF(@@tidb_current_ts, 0), ?, ?, ?, NOW(6), ?)`, c.prefix+baseMessagesTable)}
+VALUES (NULL, NULLIF(@@tidb_current_ts, 0), ?, ?, ?, ?, ?)`, c.prefix+baseMessagesTable)}
 }
 
 var _ outbox.Store = (*Store)(nil)
@@ -176,15 +204,25 @@ type RelayStore struct {
 	// to the store rather than passed per SweepMessages call because the
 	// sweep's effect is store-wide — see WithRetentionWindow.
 	retention time.Duration
+	// now stamps offset update_time and the lease deadline, and computes the
+	// retention cutoff. See WithClock.
+	now func() time.Time
 }
 
 // relayQueries holds every relay-side statement, rendered once at
 // construction: the table names are identifiers and cannot be bound
 // parameters, and WithTablePrefix validates the only variable fragment.
 type relayQueries struct {
+	// messagesTable and sequencersTable are the resolved (prefixed) names, kept so an
+	// error can name the actual table an operator has to repair rather than the
+	// unprefixed one from the migration.
+	messagesTable   string
+	sequencersTable string
+
 	list          string
 	offset        string
 	commitOffset  string
+	commitFenced  string
 	initOffset    string
 	deleteOffset  string
 	probePending  string
@@ -195,7 +233,6 @@ type relayQueries struct {
 	readLockHold  string
 	releaseLock   string
 	sweep         string
-	storeNow      string
 }
 
 // Leader-lock outcomes, as reported by acquireLock's LastInsertId.
@@ -231,6 +268,8 @@ func buildRelayQueries(c config) relayQueries {
 	sequencers := c.prefix + baseSequencersTable
 	locks := c.prefix + baseLocksTable
 	return relayQueries{
+		messagesTable:   messages,
+		sequencersTable: sequencers,
 		list: fmt.Sprintf(`
 SELECT seq, event_id, metadata, data, create_time
 FROM %s
@@ -240,13 +279,30 @@ LIMIT ?`, messages),
 		offset: fmt.Sprintf(`SELECT last_seq FROM %s WHERE name = ?`, offsets),
 		commitOffset: fmt.Sprintf(`
 INSERT INTO %s (name, last_seq, update_time)
-VALUES (?, ?, NOW(6))
+VALUES (?, ?, ?)
 ON DUPLICATE KEY UPDATE
     last_seq    = GREATEST(last_seq, VALUES(last_seq)),
     update_time = VALUES(update_time)`, offsets),
+		// The fenced commit is the same upsert with its VALUES replaced by a SELECT
+		// over the lock row, so the write is applied only while that lock is still
+		// held by this holder. A superseded leader selects no rows and therefore
+		// updates nothing — the unconditional GREATEST upsert above would instead
+		// have rewound the group and replayed the log out of order.
+		//
+		// The condition is holder IDENTITY only, with no expire_time comparison: a
+		// lease that merely lapsed without a successor still belongs to its last
+		// holder, and that holder committing is safe because nobody else is draining.
+		// Comparing deadlines here would put a clock back into the one write that
+		// must not depend on one.
+		commitFenced: fmt.Sprintf(`
+INSERT INTO %s (name, last_seq, update_time)
+SELECT ?, ?, ? FROM %s WHERE name = ? AND holder_id = ?
+ON DUPLICATE KEY UPDATE
+    last_seq    = GREATEST(last_seq, VALUES(last_seq)),
+    update_time = VALUES(update_time)`, offsets, locks),
 		initOffset: fmt.Sprintf(`
 INSERT INTO %s (name, last_seq, update_time)
-SELECT ?, COALESCE(MAX(seq), 0), NOW(6) FROM %s`, offsets, messages),
+SELECT ?, COALESCE(MAX(seq), 0), ? FROM %s`, offsets, messages),
 		deleteOffset: fmt.Sprintf(`DELETE FROM %s WHERE name = ?`, offsets),
 		probePending: fmt.Sprintf(`SELECT 1 FROM %s WHERE seq IS NULL LIMIT 1`, messages),
 		lockSequencer: fmt.Sprintf(
@@ -309,27 +365,29 @@ SET o.seq = ? + b.rn - 1`, messages, messages),
 		// expiry branch reads the incumbent's deadline as intended.
 		acquireLock: fmt.Sprintf(`
 INSERT INTO %s (name, holder_id, expire_time)
-VALUES (?, ?, NOW(6) + INTERVAL ? MICROSECOND)
+VALUES (?, ?, ?)
 ON DUPLICATE KEY UPDATE
-    holder_id   = IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), VALUES(holder_id), holder_id),
-    expire_time = IF(LAST_INSERT_ID(IF(expire_time < NOW(6) OR holder_id = VALUES(holder_id), %d, %d)) = %d,
+    holder_id   = IF(expire_time < ? OR holder_id = VALUES(holder_id), VALUES(holder_id), holder_id),
+    expire_time = IF(LAST_INSERT_ID(IF(expire_time < ? OR holder_id = VALUES(holder_id), %d, %d)) = %d,
                      VALUES(expire_time), expire_time)`, locks, lockTaken, lockLost, lockTaken),
 		// Only issued on the lockUnreported path — a fresh insert, or an
 		// environment that does not propagate LAST_INSERT_ID at all — never on the
 		// steady-state renewal. See TryAcquireLeaderLock.
 		readLockHold: fmt.Sprintf(`SELECT holder_id FROM %s WHERE name = ?`, locks),
 		releaseLock:  fmt.Sprintf(`DELETE FROM %s WHERE name = ? AND holder_id = ?`, locks),
-		// The cutoff is evaluated against the DATABASE clock (NOW(6)), per the
-		// Sweeper contract: a skewed relay host must not sweep early or
-		// pin rows forever. The bound parameter is the store's own retention
-		// window (WithRetentionWindow), not a per-call one.
+		// The cutoff arrives as a bound parameter computed from the store's clock
+		// (WithClock) — the same clock that stamps create_time, so the two sides of
+		// this comparison are commensurable. It used to be NOW(6) - INTERVAL, which
+		// renders in the SESSION's time_zone against a zone-less DATETIME(6): a
+		// sweeper 8 hours ahead of the publishing session deleted rows that were
+		// seconds old under a one-hour window. The retention window itself is the
+		// store's own (WithRetentionWindow), not a per-call one.
 		sweep: fmt.Sprintf(`
 DELETE FROM %s
 WHERE seq IS NOT NULL
   AND seq <= (SELECT MIN(last_seq) FROM %s)
-  AND create_time < NOW(6) - INTERVAL ? MICROSECOND
+  AND create_time < ?
 LIMIT ?`, messages, offsets),
-		storeNow: `SELECT NOW(6)`,
 	}
 }
 
@@ -347,7 +405,7 @@ LIMIT ?`, messages, offsets),
 // recommended (see NewStore).
 func NewRelayStore(db *sql.DB, opts ...Option) *RelayStore {
 	c := newConfig(opts)
-	return &RelayStore{db: db, q: buildRelayQueries(c), retention: c.retention}
+	return &RelayStore{db: db, q: buildRelayQueries(c), retention: c.retention, now: c.now}
 }
 
 // Compile-time capability pins for *RelayStore: the sequence runtime discovers
@@ -411,17 +469,40 @@ func (s *Store) CreateOutboxMessage(ctx context.Context, m *outbox.Message) erro
 	if data == nil {
 		data = []byte{}
 	}
-	// Message.CreateTime is deliberately IGNORED here: the row's create_time
-	// is stamped by the database clock (see NewStore) because it anchors
-	// retention and must not trust publisher clocks. ListMessages returns the
-	// DB-stamped value.
+	// Message.CreateTime is deliberately IGNORED here: create_time is stamped by
+	// the store's own clock (WithClock, default time.Now) because it anchors
+	// retention, and one clock per deployment is what keeps the sweep's cutoff
+	// commensurable with the values it compares. ListMessages returns the stamped
+	// value.
+	//
+	// Sent as a bound parameter in UTC rather than evaluated as NOW(6). NOW(6)
+	// renders in the SESSION's time_zone and lands in a zone-less DATETIME(6), so
+	// two sessions in different zones wrote and compared incommensurable values:
+	// a sweeper 8 hours ahead deleted rows seconds old under a 1h retention window.
 	_, err = s.r.ExecContext(ctx, s.insertQuery,
-		id[:], meta, data, md.Time.UTC(),
+		id[:], meta, data, s.now().UTC(), md.Time.UTC(),
 	)
 	if err != nil {
 		if isNullColumn(err, "tx_start_ts") {
 			return fmt.Errorf("outbox: CreateOutboxMessage must run inside a transaction (tx_start_ts is only available on transactional connections): %w", err)
 		}
+		// A collision on uk_outbox_event means this event ID is already in the outbox.
+		// Reported as ErrAlreadyPublished so a RETRIED business transaction can commit
+		// instead of failing forever: retries are routine on TiDB (write conflict,
+		// deadlock, or a commit whose outcome was ambiguous because the connection
+		// dropped after the primary key was written), and the retry re-publishes the
+		// same ID. Left as a bare 1062 it aborted the caller's transaction on every
+		// attempt, for an event that was already durable.
+		//
+		// Scoped to uk_outbox_event by name: a 1062 on uk_outbox_seq is a completely
+		// different fault — a rewound sequencer counter — and must not be laundered
+		// into "already published".
+		if isDuplicateKeyOn(err, "uk_outbox_event") {
+			return fmt.Errorf("%w: event %s is already in the outbox, so this publish changed "+
+				"nothing; a retried business transaction may commit: %w",
+				outbox.ErrAlreadyPublished, m.ID, err)
+		}
+
 		return fmt.Errorf("outbox: insert: %w", err)
 	}
 	return nil
@@ -545,23 +626,67 @@ func (rs *RelayStore) Offset(ctx context.Context, name string) (int64, bool, err
 // committing seq 0, so that the sweep's MIN(last_seq) cutoff accounts for it
 // before it has delivered anything.
 func (rs *RelayStore) CommitOffset(ctx context.Context, name string, seq int64) error {
-	_, err := rs.db.ExecContext(ctx, rs.q.commitOffset, name, seq)
+	_, err := rs.db.ExecContext(ctx, rs.q.commitOffset, name, seq, rs.now().UTC())
 	if err != nil {
 		return fmt.Errorf("outbox: commit offset: %w", err)
 	}
 	return nil
 }
 
-// StoreNow returns the database's current time (sequence.Clock), so the relay
-// reports lag against the same clock that stamped create_time instead of the
-// relay host's — see sequence.Clock for why that matters. NOW(6) matches the
-// column's microsecond precision.
-func (rs *RelayStore) StoreNow(ctx context.Context) (time.Time, error) {
-	var now time.Time
-	if err := rs.db.QueryRowContext(ctx, rs.q.storeNow).Scan(&now); err != nil {
-		return time.Time{}, fmt.Errorf("outbox: store now: %w", err)
+// CommitOffsetFenced advances name's watermark only while lockName is still held by
+// holderID (sequence.FencedCommitter), and reports whether the write was applied.
+//
+// This is the write that decides whether leadership is merely advisory. Plain
+// CommitOffset is an unconditional monotone upsert, so a leader that stalled through a
+// page of slow sends — ordinary broker backpressure, not an exotic failure — could
+// wake after a standby had drained past it and commit its stale watermark over the
+// top. Consumers then see the log replayed from an older position; event-id dedup
+// absorbs the duplicate deliveries but cannot restore ORDER.
+//
+// persisted=false is a successful answer, not a failure: it means this instance was
+// superseded. The relay treats it as leadership lost.
+func (rs *RelayStore) CommitOffsetFenced(
+	ctx context.Context, name, lockName, holderID string, seq int64,
+) (bool, error) {
+	res, err := rs.db.ExecContext(ctx, rs.q.commitFenced, name, seq, rs.now().UTC(), lockName, holderID)
+	if err != nil {
+		return false, fmt.Errorf("outbox: commit offset (fenced): %w", err)
 	}
-	return now, nil
+
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("outbox: commit offset (fenced) rows affected: %w", err)
+	}
+	if n > 0 {
+		return true, nil
+	}
+
+	// Zero affected rows is ambiguous, and reading it as "fenced out" would be a bug:
+	// the upsert also reports 0 when it matched the lock row but changed nothing —
+	// last_seq already at or above seq AND an identical update_time, which the seq-0
+	// group registration and any injected clock can both produce. MySQL's
+	// changed-vs-matched semantics additionally depend on the connection's
+	// clientFoundRows flag. Ask who holds the lock instead; this is the same
+	// disambiguating read TryAcquireLeaderLock uses for its unreported outcome.
+	held, err := rs.holdsLeaderLock(ctx, lockName, holderID)
+	if err != nil {
+		return false, err
+	}
+
+	return held, nil
+}
+
+// StoreNow returns the clock this store stamps with (sequence.Clock), so the relay
+// reports lag against the same clock that produced create_time rather than an
+// unrelated one — which is the property sequence.Clock actually needs.
+//
+// It no longer round-trips SELECT NOW(6). That read returned a time in the session's
+// time_zone while create_time is a zone-less DATETIME(6), so on any connection whose
+// zone was not the one that stamped the rows, the "age" it produced was wrong by the
+// offset between them. Reading the same clock the store writes with cannot disagree
+// with itself, and costs no round trip. ctx is unused for that reason.
+func (rs *RelayStore) StoreNow(_ context.Context) (time.Time, error) {
+	return rs.now().UTC(), nil
 }
 
 // InitOffsetLatest creates the named consumer group's offset row at the
@@ -582,7 +707,7 @@ func (rs *RelayStore) StoreNow(ctx context.Context) (time.Time, error) {
 // leaders init concurrently; the read-back below returns the surviving row
 // either way.
 func (rs *RelayStore) InitOffsetLatest(ctx context.Context, name string) (int64, error) {
-	_, err := rs.db.ExecContext(ctx, rs.q.initOffset, name)
+	_, err := rs.db.ExecContext(ctx, rs.q.initOffset, name, rs.now().UTC())
 	if err != nil && !isDuplicateKey(err) {
 		return 0, fmt.Errorf("outbox: init offset latest: %w", err)
 	}
@@ -617,6 +742,15 @@ func missingParseTimeHint(err error) string {
 }
 
 // isDuplicateKey reports whether err is MySQL/TiDB ER_DUP_ENTRY (1062).
+// isDuplicateKeyOn reports a 1062 on one NAMED unique index. The key name matters:
+// uk_outbox_event means "this event is already published" while uk_outbox_seq means the
+// sequencer counter was rewound, and the two demand opposite responses.
+func isDuplicateKeyOn(err error, index string) bool {
+	me, ok := errors.AsType[*mysql.MySQLError](err)
+
+	return ok && me.Number == 1062 && strings.Contains(me.Message, index)
+}
+
 func isDuplicateKey(err error) bool {
 	me, ok := errors.AsType[*mysql.MySQLError](err)
 	return ok && me.Number == 1062
@@ -661,18 +795,90 @@ func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, err
 		return 0, fmt.Errorf("outbox: probe pending: %w", err)
 	}
 
-	tx, err := rs.db.BeginTx(ctx, &sql.TxOptions{})
+	// One dedicated connection, and an explicit BEGIN PESSIMISTIC rather than
+	// database/sql's BeginTx.
+	//
+	// This pass is a read-modify-write across three round trips, and its whole safety
+	// argument is that the counter row stays locked FOR UPDATE for the duration, so
+	// concurrent sequencers serialize. That is true only in PESSIMISTIC mode. Under
+	// tidb_txn_mode='optimistic' — the global on many clusters migrated from MySQL, or
+	// a per-session value from a shared DSN or a proxy — SELECT ... FOR UPDATE takes no
+	// lock at read time and the conflict lands at COMMIT as error 9007. Since every
+	// relay runs a sequencer by default, contended passes then fail every tick and the
+	// log is never sequenced: no delivery at all, behind a retryable-looking error.
+	// With transaction auto-retry on it is worse, because TiDB replays the statements
+	// with the SAME bound parameters — next was computed here in Go, not re-read — so
+	// the replay re-assigns a used range and uk_outbox_seq rejects it as 1062.
+	//
+	// BEGIN PESSIMISTIC sets the mode for THIS transaction and overrides the session
+	// and global settings, so the guarantee no longer depends on how the cluster is
+	// configured. It has to be issued as a statement, which is why the transaction is
+	// driven by hand; the connection is pinned so BEGIN, the statements and COMMIT all
+	// land on the same session.
+	conn, err := rs.db.Conn(ctx)
 	if err != nil {
+		return 0, fmt.Errorf("outbox: get sequencing conn: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN PESSIMISTIC"); err != nil {
 		return 0, fmt.Errorf("outbox: begin sequence tx: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }() // no-op after Commit
 
+	assigned, err := rs.sequenceLocked(ctx, conn, limit)
+	if err != nil {
+		// Roll back before the connection goes back to the pool. The rollback runs on
+		// a context that cannot already be canceled: the transaction is invisible to
+		// database/sql, so a connection released with it still open would hand the
+		// next borrower an open transaction and its locks.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+		defer cancel()
+		if _, rbErr := conn.ExecContext(rctx, "ROLLBACK"); rbErr != nil {
+			// Poison the connection rather than return it holding a transaction.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+
+		return 0, err
+	}
+
+	return int(assigned), nil
+}
+
+// rollbackTimeout bounds the cleanup ROLLBACK on the sequencing connection.
+const rollbackTimeout = 5 * time.Second
+
+// sequenceLocked runs the body of one sequencing pass on a connection that has already
+// opened a pessimistic transaction, and commits it. Every error path leaves the
+// transaction open for the caller to roll back.
+func (rs *RelayStore) sequenceLocked(ctx context.Context, conn *sql.Conn, limit int) (int64, error) {
 	var next int64
-	if err := tx.QueryRowContext(ctx, rs.q.lockSequencer).Scan(&next); err != nil {
+	if err := conn.QueryRowContext(ctx, rs.q.lockSequencer).Scan(&next); err != nil {
+		// The counter row is seeded once, unconditionally, by the migration, so its
+		// absence is not a transient condition and no amount of retrying fixes it. It
+		// goes missing through ordinary operations: an operator "clearing the outbox"
+		// with three DELETEs, a TRUNCATE, a restore that omitted the small table, or a
+		// golang-migrate run left dirty midway (TiDB auto-commits each DDL, so a
+		// connection drop after the CREATE TABLEs leaves the tables present and the
+		// INSERT never run).
+		//
+		// Named explicitly because the consequence is severe and the default message is
+		// not: every pass fails, nothing is ever assigned a seq, and the relay delivers
+		// NOTHING for the lifetime of the deployment while reporting "sql: no rows in
+		// result set" — which names database/sql rather than the row that is missing or
+		// what to do about it.
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, fmt.Errorf("outbox: the sequencer counter row is missing: %s has no row with "+
+				"name='default', so no message can ever be assigned a seq and this relay will "+
+				"deliver nothing. Re-run the migrations, or re-seed it with "+
+				"INSERT INTO %s (name, next_seq) SELECT 'default', COALESCE(MAX(seq), 0) + 1 FROM %s "+
+				"(seeding at 1 while sequenced rows exist collides with uk_outbox_seq): %w",
+				rs.q.sequencersTable, rs.q.sequencersTable, rs.q.messagesTable, err)
+		}
+
 		return 0, fmt.Errorf("outbox: lock sequencer: %w", err)
 	}
 
-	res, err := tx.ExecContext(ctx, rs.q.assignSeq, limit, next)
+	res, err := conn.ExecContext(ctx, rs.q.assignSeq, limit, next)
 	if err != nil {
 		return 0, fmt.Errorf("outbox: assign seq: %w", err)
 	}
@@ -682,15 +888,16 @@ func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, err
 	}
 
 	if assigned > 0 {
-		if _, err := tx.ExecContext(ctx, rs.q.bumpSequencer, next+assigned); err != nil {
+		if _, err := conn.ExecContext(ctx, rs.q.bumpSequencer, next+assigned); err != nil {
 			return 0, fmt.Errorf("outbox: bump sequencer: %w", err)
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return 0, fmt.Errorf("outbox: commit sequence tx: %w", err)
 	}
-	return int(assigned), nil
+
+	return assigned, nil
 }
 
 // TryAcquireLeaderLock acquires or renews the lock; the incoming holder wins if
@@ -713,7 +920,20 @@ func (rs *RelayStore) SequenceMessages(ctx context.Context, limit int) (int, err
 // concurrent ReleaseLeaderLock reads as "not ours" and costs at most one tick of
 // leadership, never a second leader.
 func (rs *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
-	res, err := rs.db.ExecContext(ctx, rs.q.acquireLock, name, holderID, ttl.Microseconds())
+	// The deadline and the expiry comparison both come from this store's clock, sent
+	// as bound parameters. They used to be NOW(6), which renders in the SESSION's
+	// time_zone: against a zone-less DATETIME(6) column that let a session 8 hours
+	// ahead steal a live lease outright, and left a standby unable to take over a
+	// lease that had genuinely expired.
+	//
+	// The clock is now the RELAY's, not the database's, so instances of one group
+	// must agree on time to within the lease TTL. That is a weaker guarantee than a
+	// single server clock, and it is why the offset commit has to be fenced by holder
+	// rather than merely monotone — a stolen lease must not be able to move the
+	// watermark.
+	now := rs.now().UTC()
+	res, err := rs.db.ExecContext(ctx, rs.q.acquireLock,
+		name, holderID, now.Add(ttl), now, now)
 	if err != nil {
 		return false, fmt.Errorf("outbox: acquire lock: %w", err)
 	}
@@ -770,7 +990,7 @@ func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID stri
 // across all consumers and inserted (create_time) longer ago than this store's
 // retention window (WithRetentionWindow, default 7 days) — per the DATABASE
 // clock on both sides: create_time is DB-stamped at insert (see
-// CreateOutboxMessage) and the cutoff is NOW(6)-relative, so no publisher or
+// CreateOutboxMessage) and the cutoff comes from that same clock, so no publisher or
 // relay host clock can sweep early or pin rows forever.
 // Retention is anchored to insert time, not event time, so a backdated
 // WithEventTime event is not swept early. If no offsets exist yet,
@@ -791,7 +1011,10 @@ func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID stri
 // MIN(last_seq) at its last committed position, halting the sweep permanently.
 // Decommission a retired consumer group with DeleteOffset to unpin retention.
 func (rs *RelayStore) SweepMessages(ctx context.Context, limit int) (int, error) {
-	res, err := rs.db.ExecContext(ctx, rs.q.sweep, rs.retention.Microseconds(), limit)
+	// The cutoff is computed here rather than as NOW(6) - INTERVAL, so it is
+	// commensurable with the create_time values CreateOutboxMessage stamps from the
+	// same clock.
+	res, err := rs.db.ExecContext(ctx, rs.q.sweep, rs.now().UTC().Add(-rs.retention), limit)
 	if err != nil {
 		return 0, fmt.Errorf("outbox: sweep: %w", err)
 	}

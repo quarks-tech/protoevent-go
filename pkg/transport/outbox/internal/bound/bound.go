@@ -21,6 +21,7 @@ package bound
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -45,15 +46,66 @@ func Call(ctx context.Context, ttl time.Duration) (context.Context, context.Canc
 // TokenBatchSize-1 events for the stream runtime. Values (trace/log) are
 // preserved via WithoutCancel; the timeout alone limits the call.
 //
-// The budget drops to Shutdown once ctx is dead, because at that point the
-// lease TTL is not the constraint — the process is leaving.
+// The budget is ttl while the process is alive and drops to Shutdown once ctx is
+// canceled, INCLUDING when the cancel arrives mid-call. Deciding that only at entry
+// was the bug: a SIGTERM landing a microsecond after this returned left the write
+// detached and uninterruptible for the whole ttl — 30s by default — and with the
+// stream close and the lock release still to come, shutdown reached ~40s against a
+// Kubernetes terminationGracePeriodSeconds that defaults to 30. The pod was then
+// SIGKILLed mid-commit, losing the very write this detachment exists to protect and
+// redelivering the page it had already sent.
+//
+// Detachment is preserved either way: the point is that the write is not aborted the
+// instant cancellation arrives, not that it may run forever afterwards.
 func Commit(ctx context.Context, ttl time.Duration) (context.Context, context.CancelFunc) {
-	timeout := ttl
 	if ctx.Err() != nil {
-		timeout = Shutdown
+		return context.WithTimeout(context.WithoutCancel(ctx), Shutdown)
 	}
 
-	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	out, cancel := context.WithTimeout(context.WithoutCancel(ctx), ttl)
+
+	// Watchdog: shorten the detached budget to Shutdown when the parent cancels. It
+	// exits as soon as the caller releases the context or the deadline passes, so it
+	// cannot outlive the call it bounds.
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-stop:
+			return
+		case <-out.Done():
+			return
+		}
+
+		grace := time.NewTimer(Shutdown)
+		defer grace.Stop()
+		select {
+		case <-grace.C:
+			cancel()
+		case <-stop:
+		case <-out.Done():
+		}
+	}()
+
+	var once sync.Once
+
+	return out, func() {
+		once.Do(func() { close(stop) })
+		cancel()
+	}
+}
+
+// ShutdownScope is the single budget shared by every step of a planned shutdown that
+// runs after the run context is dead — the leader-lock release and the change-stream
+// close.
+//
+// One scope rather than a Fresh() per step, because the steps are SEQUENTIAL: two
+// independent Shutdown budgets are a 2*Shutdown tail, and each new shutdown step added
+// later would silently extend it again. Sharing one deadline makes the tail bounded by
+// Shutdown no matter how many steps it grows to, which is what lets the total shutdown
+// cost be stated at all.
+func ShutdownScope() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), Shutdown)
 }
 
 // Salvaged bounds a best-effort read that may legitimately be issued after the
@@ -74,10 +126,12 @@ func Salvaged(ctx context.Context, ttl time.Duration) (context.Context, context.
 	return context.WithTimeout(ctx, ttl)
 }
 
-// Fresh bounds shutdown-path I/O that has no usable parent context at all — a
-// deferred leader-lock release, a change-stream close — where the caller's
-// context is typically already canceled and the call would otherwise never
-// reach the server.
+// Fresh bounds a single piece of shutdown-path I/O that has no usable parent context
+// at all, for a caller that is not part of a shutdown sequence with its own scope.
+//
+// Prefer ShutdownScope where several such calls run one after another: N independent
+// Fresh calls cost N*Shutdown, which is how the shutdown tail grew past the pod's
+// termination grace period.
 func Fresh() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), Shutdown)
 }

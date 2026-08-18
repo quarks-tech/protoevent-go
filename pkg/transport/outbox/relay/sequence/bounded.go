@@ -56,6 +56,23 @@ func (s boundedStore) CommitOffset(ctx context.Context, name string, seq int64) 
 	return s.inner.CommitOffset(ctx, name, seq)
 }
 
+// boundedFencedCommitter applies the same detachment as CommitOffset above: a fenced
+// commit records sends that already happened, so losing it to a canceled run context
+// would redeliver the page on restart.
+type boundedFencedCommitter struct {
+	inner FencedCommitter
+	ttl   time.Duration
+}
+
+func (s boundedFencedCommitter) CommitOffsetFenced(
+	ctx context.Context, name, lockName, holderID string, seq int64,
+) (bool, error) {
+	ctx, cancel := bound.Commit(ctx, s.ttl)
+	defer cancel()
+
+	return s.inner.CommitOffsetFenced(ctx, name, lockName, holderID, seq)
+}
+
 // boundedSequencer, boundedRetention and boundedClock apply the same policy to
 // the optional store capabilities. They are separate types rather than fields on
 // one decorator because the relay holds each capability in its own interface

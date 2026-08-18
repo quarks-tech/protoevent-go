@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
+
 	"github.com/quarks-tech/amqpx"
 	"github.com/quarks-tech/amqpx/connpool"
 
@@ -582,4 +584,376 @@ func TestPublishStarvedByAConsumerOnTheSameClient(t *testing.T) {
 
 	stopSub2()
 	<-done2
+}
+
+// dedicatedBroker boots a broker used by ONE test, for tests that put the broker
+// into a state the shared instance must not be left in — a stopped app, a resource
+// alarm, a lowered max_message_size.
+func dedicatedBroker(t *testing.T) *rabbitmqtest.Instance {
+	t.Helper()
+
+	inst, cleanup, err := rabbitmqtest.Start(context.Background())
+	if err != nil {
+		if errors.Is(err, rabbitmqtest.ErrDockerUnavailable) {
+			if os.Getenv("CI") != "" {
+				t.Fatalf("rabbitmq integration tests require Docker in CI: %v", err)
+			}
+			t.Skipf("no Docker: %v", err)
+		}
+		t.Fatalf("start dedicated broker: %v", err)
+	}
+	t.Cleanup(cleanup)
+
+	return inst
+}
+
+// TestSubscriptionDoesNotSurviveABrokerRestart documents what a rolling broker
+// upgrade does to a subscriber.
+//
+// The connection dies, amqpx classifies the dropped delivery channel as retryable
+// and re-subscribes — but the retry budget is MaxRetries=3 between 8ms and 512ms,
+// well under two seconds in total. A broker that is away for longer exhausts it,
+// Receive returns, Subscribe returns, and nothing in this library re-subscribes. The
+// process then stays alive and healthy, serving traffic and consuming nothing, until
+// somebody restarts it.
+//
+// This test pins that as the CURRENT contract rather than asserting the recovery the
+// library does not implement: the failure is silent today, and a test that names it
+// is what makes a future auto-resubscribe (or a documented supervision requirement)
+// a deliberate change instead of a surprise. The assertion to care about is that
+// Subscribe RETURNS — a caller can supervise a returned error, but cannot supervise
+// a goroutine that sits there consuming nothing.
+func TestSubscriptionDoesNotSurviveABrokerRestart(t *testing.T) {
+	inst := dedicatedBroker(t)
+
+	client := amqpx.NewClient(&amqpx.Config{Address: inst.Address})
+	t.Cleanup(func() { _ = client.Close() })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 180*time.Second)
+	defer cancel()
+
+	const (
+		service  = "restart.v1"
+		consumer = "restart-consumer"
+	)
+
+	sd := &eventbus.ServiceDesc{ServiceName: service, Events: []eventbus.EventDesc{{Name: testEventName}}}
+
+	sender := rabbitmq.NewSender(client)
+	if err := sender.Setup(ctx, sd); err != nil {
+		t.Fatalf("sender setup: %v", err)
+	}
+
+	delivered := make(chan struct{}, 8)
+	sub := eventbus.NewSubscriber(consumer)
+	sub.RegisterHandler(sd, testEventName,
+		func(context.Context, *event.Metadata, func(any) error, eventbus.SubscriberInterceptor) error {
+			delivered <- struct{}{}
+
+			return nil
+		})
+
+	receiver := rabbitmq.NewReceiver(client, rabbitmq.WithTopologySetup())
+
+	subCtx, stopSub := context.WithCancel(ctx)
+	defer stopSub()
+	done := make(chan error, 1)
+	go func() { done <- sub.Subscribe(subCtx, receiver) }()
+
+	inst.WaitForQueue(t, consumer)
+
+	// Barrier: prove the subscription works before breaking the broker.
+	if err := sender.Send(ctx, testEvent(service), []byte("before")); err != nil {
+		t.Fatalf("send before restart: %v", err)
+	}
+	select {
+	case <-delivered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the pre-restart event was never delivered, so the restart is not what this test measures")
+	}
+
+	// A restart long enough to outlast the ~1.6s retry budget.
+	inst.StopApp(t)
+	time.Sleep(5 * time.Second)
+	inst.StartApp(t)
+
+	select {
+	case err := <-done:
+		// The current, documented-by-this-test behavior.
+		if err == nil {
+			t.Fatal("Subscribe returned nil after a broker restart: a subscription that ended " +
+				"must report why, or a caller cannot supervise it")
+		}
+		t.Logf("Subscribe returned after the broker restart, as expected today: %v", err)
+	case <-time.After(60 * time.Second):
+		// If we get here the library recovered on its own. That is BETTER than the
+		// documented behavior, so prove the recovery is real rather than just
+		// asserting the subscription is still running.
+		if err := sender.Send(ctx, testEvent(service), []byte("after")); err != nil {
+			t.Fatalf("send after restart: %v", err)
+		}
+		select {
+		case <-delivered:
+			t.Log("the subscription recovered by itself and delivered a post-restart event; " +
+				"update this test's contract to require that")
+		case <-time.After(30 * time.Second):
+			t.Fatal("Subscribe neither returned nor delivered a post-restart event: the " +
+				"subscription is wedged, consuming nothing and reporting nothing")
+		}
+	}
+
+	stopSub()
+}
+
+// TestRequeueLoopIsBoundedByTheQuorumDeliveryLimit is the broker-backed proof that
+// the default requeue policy behaves differently on the queue type most RabbitMQ 4.x
+// estates actually run.
+//
+// TestTransientHandlerErrorDoesNotDestroyTheEvent proves a transient error does not
+// destroy the event — on a CLASSIC queue, via a single redelivery. Quorum queues
+// carry an x-delivery-limit (RabbitMQ 4.x applies one by default), and the receiver's
+// requeueOnError default requeues on every transient failure, so the redelivery
+// budget is finite: past the limit the broker dead-letters the message, or DROPS it
+// when no dead-letter exchange is attached.
+//
+// The topology here is declared by the TEST, not by WithTopologySetup, which is the
+// realistic case — a quorum queue provisioned by Terraform, an operator, or a policy.
+// It also means this test is the one place the repo exercises a receiver consuming a
+// queue it did not create.
+func TestRequeueLoopIsBoundedByTheQuorumDeliveryLimit(t *testing.T) {
+	inst := requireBroker(t)
+	client := newTestClient(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 120*time.Second)
+	defer cancel()
+
+	const (
+		service       = "quorum.v1"
+		consumer      = "quorum-consumer"
+		dlx           = "quorum-consumer.dlx"
+		dlq           = "quorum-consumer.dead"
+		deliveryLimit = 5
+	)
+
+	sd := &eventbus.ServiceDesc{ServiceName: service, Events: []eventbus.EventDesc{{Name: testEventName}}}
+
+	sender := rabbitmq.NewSender(client)
+	if err := sender.Setup(ctx, sd); err != nil {
+		t.Fatalf("sender setup: %v", err)
+	}
+
+	// Externally-managed topology: a quorum queue with a finite delivery budget and
+	// somewhere for the broker to put the message once it is spent.
+	inst.DeclareExchange(t, dlx, "fanout")
+	inst.DeclareQueue(t, dlq, nil)
+	inst.BindQueue(t, dlq, "", dlx)
+	inst.DeclareQueue(t, consumer, amqp.Table{
+		"x-queue-type":           "quorum",
+		"x-delivery-limit":       int32(deliveryLimit),
+		"x-dead-letter-exchange": dlx,
+		"x-dead-letter-strategy": "at-least-once",
+		"x-overflow":             "reject-publish",
+	})
+	inst.BindQueue(t, consumer, testEventName, service)
+
+	var (
+		mu       sync.Mutex
+		attempts int
+	)
+	spent := make(chan struct{})
+
+	sub := eventbus.NewSubscriber(consumer)
+	sub.RegisterHandler(sd, testEventName,
+		func(context.Context, *event.Metadata, func(any) error, eventbus.SubscriberInterceptor) error {
+			mu.Lock()
+			attempts++
+			n := attempts
+			mu.Unlock()
+
+			if n > deliveryLimit {
+				select {
+				case <-spent:
+				default:
+					close(spent)
+				}
+			}
+
+			// Transient, as in the classic-queue test: retrying could succeed.
+			return errors.New("downstream timeout")
+		})
+
+	// No WithTopologySetup: the queue above is not ours to declare.
+	receiver := rabbitmq.NewReceiver(client)
+
+	subCtx, stopSub := context.WithCancel(ctx)
+	defer stopSub()
+	done := make(chan error, 1)
+	go func() { done <- sub.Subscribe(subCtx, receiver) }()
+
+	if err := sender.Send(ctx, testEvent(service), []byte("payload")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	// Wait for the budget to be spent, or for the loop to settle.
+	select {
+	case <-spent:
+	case <-time.After(45 * time.Second):
+	}
+
+	// Let the broker finish dead-lettering before counting.
+	time.Sleep(3 * time.Second)
+	stopSub()
+	<-done
+
+	mu.Lock()
+	got := attempts
+	mu.Unlock()
+
+	incoming, _ := inst.QueueDepth(t, consumer)
+	dead, dlqExists := inst.QueueDepth(t, dlq)
+
+	t.Logf("handler attempts=%d incoming depth=%d dead-letter depth=%d", got, incoming, dead)
+
+	if got <= 1 {
+		t.Fatalf("handler ran %d time(s): the message was not requeued at all", got)
+	}
+	if got > deliveryLimit+1 {
+		t.Fatalf("handler ran %d times, more than the x-delivery-limit of %d allows: the broker's "+
+			"redelivery budget is not bounding the requeue loop", got, deliveryLimit)
+	}
+	if !dlqExists {
+		t.Fatal("the dead-letter queue disappeared")
+	}
+	// The event must be SOMEWHERE. incoming+dead == 0 is the silent-loss outcome a
+	// quorum queue without a dead-letter exchange produces, and the reason pairing
+	// the requeue default with a DLX is not optional.
+	if incoming+dead == 0 {
+		t.Fatalf("the event is in neither queue after %d delivery attempts: the delivery limit "+
+			"destroyed it", got)
+	}
+	if dead != 1 {
+		t.Errorf("dead-letter depth = %d, want 1: the exhausted message should be dead-lettered", dead)
+	}
+
+	// Read what the BROKER wrote, rather than a hand-built fixture: x-death is the
+	// header the parking-lot receiver's retry-cap logic reads.
+	if d, ok := inst.Get(t, dlq); ok {
+		t.Logf("dead-lettered delivery: redelivered=%v x-death=%#v", d.Redelivered, d.Headers["x-death"])
+	}
+}
+
+// TestTransientFailureOnAQuorumQueueSurvivesTheDeliveryLimit is the regression test for
+// the requeue loop destroying events on the queue type production actually runs.
+//
+// The default receiver requeues on a transient handler error, and the broker redelivers
+// IMMEDIATELY — there is no backoff anywhere in the path. On a classic queue that is
+// merely wasteful. On a quorum queue, which carries an x-delivery-limit (RabbitMQ 4.x
+// applies one by default), the loop spends the entire redelivery budget at broker speed:
+// measured at 21 attempts in 13.9ms, after which the broker DISCARDS the message.
+//
+// So an event is destroyed by a downstream blip shorter than a network round trip — a
+// connection reset, a 503, a context deadline — which is the most ordinary failure a
+// consumer has, and exactly the case the requeue default was introduced to survive.
+//
+// The assertion is deliberately about TIME, not about attempt count. Retrying is correct;
+// retrying a finite budget faster than the fault can clear is what loses the event. A
+// transient fault that clears in a second or two must find the message still there.
+func TestTransientFailureOnAQuorumQueueSurvivesTheDeliveryLimit(t *testing.T) {
+	inst := requireBroker(t)
+	client := newTestClient(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 180*time.Second)
+	defer cancel()
+
+	const (
+		service       = "qsurvive.v1"
+		consumer      = "qsurvive-consumer"
+		deliveryLimit = 20
+		// How long the simulated downstream outage lasts. Well inside any sane retry
+		// budget, and 100x the 13.9ms the unthrottled loop took to exhaust it.
+		outage = 1500 * time.Millisecond
+	)
+
+	sd := &eventbus.ServiceDesc{ServiceName: service, Events: []eventbus.EventDesc{{Name: testEventName}}}
+
+	sender := rabbitmq.NewSender(client)
+	if err := sender.Setup(ctx, sd); err != nil {
+		t.Fatalf("sender setup: %v", err)
+	}
+
+	// A quorum queue with the RabbitMQ 4.x default delivery limit and NO dead-letter
+	// exchange: the plain setup, where an exhausted budget means the message is gone.
+	inst.DeclareQueue(t, consumer, amqp.Table{
+		"x-queue-type":     "quorum",
+		"x-delivery-limit": int32(deliveryLimit),
+	})
+	inst.BindQueue(t, consumer, testEventName, service)
+
+	var (
+		mu        sync.Mutex
+		attempts  int
+		succeeded bool
+	)
+	recovered := make(chan struct{})
+	start := time.Now()
+
+	sub := eventbus.NewSubscriber(consumer)
+	sub.RegisterHandler(sd, testEventName,
+		func(context.Context, *event.Metadata, func(any) error, eventbus.SubscriberInterceptor) error {
+			mu.Lock()
+			attempts++
+			mu.Unlock()
+
+			// The downstream is down, then recovers.
+			if time.Since(start) < outage {
+				return errors.New("downstream blip")
+			}
+
+			mu.Lock()
+			succeeded = true
+			mu.Unlock()
+			select {
+			case <-recovered:
+			default:
+				close(recovered)
+			}
+
+			return nil
+		})
+
+	receiver := rabbitmq.NewReceiver(client)
+
+	subCtx, stopSub := context.WithCancel(ctx)
+	defer stopSub()
+	done := make(chan error, 1)
+	go func() { done <- sub.Subscribe(subCtx, receiver) }()
+
+	if err := sender.Send(ctx, testEvent(service), []byte("payload")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	select {
+	case <-recovered:
+	case <-time.After(90 * time.Second):
+	}
+
+	stopSub()
+	<-done
+
+	mu.Lock()
+	n, ok := attempts, succeeded
+	mu.Unlock()
+	depth, _ := inst.QueueDepth(t, consumer)
+
+	t.Logf("attempts=%d handled_after_recovery=%v queue_depth=%d", n, ok, depth)
+
+	if !ok {
+		t.Fatalf("the event was never handled after the downstream recovered: %d delivery attempts "+
+			"burned the quorum queue's %d-delivery budget before the %v outage cleared, and the "+
+			"broker discarded it (queue depth %d). A transient failure must not destroy the event.",
+			n, deliveryLimit, outage, depth)
+	}
+	if depth != 0 {
+		t.Errorf("queue depth = %d after a successful handle, want 0", depth)
+	}
 }

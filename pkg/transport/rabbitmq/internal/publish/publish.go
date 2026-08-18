@@ -25,6 +25,8 @@
 package publish
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -56,10 +58,15 @@ type Confirms struct {
 }
 
 type channelState struct {
-	// once serializes the confirm.select handshake per channel without holding the
-	// map lock across it, so a wedged channel blocks only publishes that need it.
-	once sync.Once
-	err  error
+	// mu guards the handshake bookkeeping below. It is never held across the AMQP RPC
+	// itself — see Enable.
+	mu sync.Mutex
+	// inFlight is non-nil while a confirm.select handshake is running, and is closed
+	// when it finishes. Waiters select on it so that at most one RPC is issued per
+	// channel while none of them is forced to wait for it indefinitely.
+	inFlight chan struct{}
+	enabled  bool
+	err      error
 
 	// returns is created on first use, and only under mandatory publishing.
 	returnsOnce sync.Once
@@ -97,22 +104,90 @@ func (c *Confirms) stateFor(ch Channel) *channelState {
 	return st
 }
 
-// Enable puts ch into publisher-confirm mode, at most once per channel.
+// Enable puts ch into publisher-confirm mode, at most once per channel, and gives up
+// when ctx does.
 //
-// The handshake runs OUTSIDE the map lock, which is the whole point of the sync.Once
-// indirection: ch.Confirm is an unbounded context-less RPC, and holding a shared
-// mutex across it stalls every concurrent publish — including ones on healthy
-// channels — at exactly the moment a network incident is creating new channels.
-func (c *Confirms) Enable(ch Channel) error {
+// The handshake runs OUTSIDE the map lock: ch.Confirm is an unbounded context-less RPC,
+// and holding a shared mutex across it stalls every concurrent publish — including ones
+// on healthy channels — at exactly the moment a network incident is creating new
+// channels.
+//
+// It also runs off the CALLER's goroutine, which is the part a sync.Once could not
+// provide. amqp091 writes frames with no deadline and no context, so on a channel whose
+// peer has stopped reading, Confirm never returns. That call sat on the relay's single
+// goroutine: a Send bounded by SendTimeout could not be interrupted, because a deadline
+// only helps a callee that reads it. Delivery then stopped with no OnDrained, no
+// OnError, no log and no stuck-lane escalation — every one of those signals fires only
+// after the send returns — while the leader lease expired and a standby began draining
+// the same log. Run never returned on SIGTERM either.
+//
+// A caller whose ctx expires gets a context error and does NOT get a channel it might
+// wrongly believe is in confirm mode. The orphaned RPC keeps running: if it eventually
+// succeeds the channel is genuinely in confirm mode and the next publish uses it, and
+// if it never returns the goroutine stays parked until amqpx force-closes the
+// connection, which is what unblocks a write on a dead socket. That is one leaked
+// goroutine per wedged channel, bounded by the pool size and preferable to a wedged
+// relay.
+func (c *Confirms) Enable(ctx context.Context, ch Channel) error {
 	st := c.stateFor(ch)
 
-	st.once.Do(func() {
-		if err := ch.Confirm(false); err != nil {
-			st.err = fmt.Errorf("enable publisher confirms: %w", err)
-		}
-	})
+	st.mu.Lock()
+	switch {
+	case st.enabled:
+		st.mu.Unlock()
 
-	return st.err
+		return nil
+	case st.err != nil:
+		// A handshake the BROKER refused is sticky: retrying it on the same channel
+		// cannot succeed. An abandoned attempt records no error, so it does not land
+		// here.
+		err := st.err
+		st.mu.Unlock()
+
+		return err
+	}
+
+	wait := st.inFlight
+	if wait == nil {
+		wait = make(chan struct{})
+		st.inFlight = wait
+		st.mu.Unlock()
+
+		go func() {
+			err := ch.Confirm(false)
+
+			st.mu.Lock()
+			if err != nil {
+				st.err = fmt.Errorf("enable publisher confirms: %w", err)
+			} else {
+				st.enabled = true
+			}
+			st.inFlight = nil
+			st.mu.Unlock()
+			close(wait)
+		}()
+	} else {
+		st.mu.Unlock()
+	}
+
+	select {
+	case <-wait:
+	case <-ctx.Done():
+		return fmt.Errorf("enable publisher confirms: %w", ctx.Err())
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.err != nil {
+		return st.err
+	}
+	if !st.enabled {
+		// The attempt finished without recording either outcome, which can only mean a
+		// concurrent reset of the bookkeeping. Report it rather than claim confirms.
+		return errors.New("enable publisher confirms: handshake state was reset for this channel")
+	}
+
+	return nil
 }
 
 // Returns registers (once per channel) and returns ch's basic.return watch, for
@@ -203,5 +278,7 @@ func (w *Watch) Took() (amqp.Return, bool) {
 // owned here.
 func (c *Confirms) AssumeEnabled(ch Channel) {
 	st := c.stateFor(ch)
-	st.once.Do(func() {})
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.enabled = true
 }

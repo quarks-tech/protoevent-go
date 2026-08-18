@@ -1,8 +1,12 @@
 package structured
 
 import (
+	stdjson "encoding/json"
+	"errors"
 	"testing"
+	"time"
 
+	json "github.com/json-iterator/go"
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
@@ -230,5 +234,112 @@ func TestUnmarshalInterpretsEscapesInOptionalAttributes(t *testing.T) {
 	}
 	if md.Subject != `a"b` {
 		t.Fatalf("Subject = %q, want %q (escapes must be interpreted, not left raw)", md.Subject, `a"b`)
+	}
+}
+
+// TestMarshalRejectsPayloadThatIsNotJSON pins that structured mode never emits an
+// invalid envelope.
+//
+// The payload is spliced in as json.RawMessage, which the encoder copies through
+// verbatim, so before this check a non-JSON payload produced an invalid document
+// with a NIL error: proto bytes emitted `"data":\b\x01` and a zero-length non-nil
+// payload emitted the literal `"data":`. The publish succeeded, the broker
+// accepted the frame, and every consumer failed at json.Unmarshal — so the event
+// was dead-lettered while the relay committed its offset past it.
+//
+// The rejection wraps event.ErrUnsendable so a relay holding such a persisted row
+// can park it instead of stopping the lane on it forever.
+func TestMarshalRejectsPayloadThatIsNotJSON(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"proto bytes", []byte("\x08\x01")},
+		{"truncated object", []byte("{")},
+		{"bare word", []byte("garbage")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			md := event.NewMetadata("books.v1.BookCreated")
+			md.ID = "id-1"
+			md.Source = "/svc"
+
+			_, err := Marshaler{}.Marshal(md, tc.data)
+			if err == nil {
+				t.Fatal("Marshal returned nil error for a non-JSON payload")
+			}
+			if !errors.Is(err, event.ErrUnsendable) {
+				t.Fatalf("error does not wrap event.ErrUnsendable, so a relay cannot park the row: %v", err)
+			}
+		})
+	}
+}
+
+// TestMarshalEncodesAbsentPayloadAsNull pins that an event with no payload
+// round-trips as a VALID envelope, whether the payload arrives as nil or as the
+// []byte{} a store normalizes nil to. These two must encode identically: the same
+// event published directly and published through an outbox must not differ.
+func TestMarshalEncodesAbsentPayloadAsNull(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data []byte
+	}{
+		{"nil", nil},
+		{"empty non-nil", []byte{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			md := event.NewMetadata("books.v1.BookDeleted")
+			md.ID = "id-1"
+			md.Source = "/svc"
+
+			pub, err := Marshaler{}.Marshal(md, tc.data)
+			if err != nil {
+				t.Fatalf("Marshal: %v", err)
+			}
+			if !json.Valid(pub.Body) {
+				t.Fatalf("emitted an invalid JSON envelope: %q", pub.Body)
+			}
+
+			// Decoded with encoding/json, not the json-iterator alias this file
+			// imports: jsoniter decodes a JSON null into an EMPTY RawMessage, so it
+			// cannot distinguish "data":null from a missing key.
+			var dto map[string]stdjson.RawMessage
+			if err := stdjson.Unmarshal(pub.Body, &dto); err != nil {
+				t.Fatalf("unmarshal envelope: %v", err)
+			}
+			if got := string(dto["data"]); got != "null" {
+				t.Fatalf(`data = %s, want null`, got)
+			}
+		})
+	}
+}
+
+// TestRoundTripPreservesSubSecondTime pins that structured mode carries the
+// fractional seconds the publisher stamped. Both marshalers formatted with
+// time.RFC3339, which has no fractional-seconds field, so every timestamp was
+// silently truncated to a whole second — while the outbox persisted the full
+// value, making the durable record and the delivered event disagree.
+func TestRoundTripPreservesSubSecondTime(t *testing.T) {
+	md := event.NewMetadata("books.v1.BookCreated")
+	md.ID = "id-1"
+	md.Source = "/svc"
+	md.Time = time.Date(2026, 8, 18, 12, 0, 0, 123456789, time.UTC)
+
+	pub, err := Marshaler{}.Marshal(md, []byte("{}"))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	got, _, err := Marshaler{}.Unmarshal(&amqp.Delivery{
+		ContentType: pub.ContentType, Body: pub.Body,
+	})
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if !got.Time.Equal(md.Time) {
+		t.Fatalf("Time = %v, want %v", got.Time, md.Time)
+	}
+	if got.Time.Nanosecond() != md.Time.Nanosecond() {
+		t.Fatalf("Time nanoseconds = %d, want %d (sub-second precision lost on the wire)",
+			got.Time.Nanosecond(), md.Time.Nanosecond())
 	}
 }

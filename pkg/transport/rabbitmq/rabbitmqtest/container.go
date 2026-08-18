@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -44,8 +45,17 @@ type Instance struct {
 	// (a test that inspects the broker without going through this module).
 	URL string
 
-	// raw is the lazily dialed connection behind the queue helpers below.
-	once   sync.Once
+	// container is the running broker, kept so a test can reach the broker as an
+	// OPERATOR rather than as a client: rabbitmqctl for the states that have no AMQP
+	// representation — a memory or disk alarm, a stopped app, a changed
+	// max_message_size. Start used to discard this handle, which made every such
+	// failure mode structurally untestable: a broker restart, a blocked connection,
+	// and a quorum queue's delivery limit all need it.
+	container testcontainers.Container
+
+	// raw is the lazily dialed connection behind the queue helpers below. Guarded by
+	// mu rather than a sync.Once because it is re-dialed after a broker restart.
+	mu     sync.Mutex
 	raw    *amqp.Connection
 	rawErr error
 }
@@ -97,7 +107,7 @@ func Start(ctx context.Context) (*Instance, func(), error) {
 	}
 
 	endpoint := fmt.Sprintf("guest:guest@%s:%s/", host, mapped.Port())
-	inst := &Instance{Address: endpoint, URL: "amqp://" + endpoint}
+	inst := &Instance{Address: endpoint, URL: "amqp://" + endpoint, container: c}
 	terminate := cleanup
 	cleanup = nil // disarm the deferred unwind: ownership passes to the caller
 
@@ -135,13 +145,21 @@ func probeDocker(ctx context.Context) error {
 // NOT amqpx's pooled one, so a 404 cannot retire a channel the code under test is
 // about to use.
 
-// conn returns the shared raw connection, dialing it once.
+// conn returns the shared raw connection, dialing it on first use and RE-dialing
+// after the broker has dropped it.
+//
+// The re-dial is what makes StopApp/StartApp usable: stopping the app kills every
+// connection, so a cached one is permanently closed and every later helper call
+// would fail on a broker that is in fact healthy again.
 func (i *Instance) conn(t *testing.T) *amqp.Connection {
 	t.Helper()
 
-	i.once.Do(func() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if i.raw == nil || i.raw.IsClosed() {
 		i.raw, i.rawErr = amqp.Dial(i.URL)
-	})
+	}
 	if i.rawErr != nil {
 		t.Fatalf("dial broker: %v", i.rawErr)
 	}
@@ -217,4 +235,183 @@ func (i *Instance) DeleteQueue(t *testing.T, queue string) {
 	}); err != nil {
 		t.Fatalf("delete queue %q: %v", queue, err)
 	}
+}
+
+// Operator helpers: states the broker can be in that have no AMQP client-side
+// representation.
+//
+// A client can declare, publish and consume; it cannot put the broker into a
+// resource alarm, stop its app, or change max_message_size. Those are the
+// preconditions for a whole class of production failures — a connection blocked by a
+// disk alarm, a subscription that never recovers from a rolling broker restart, an
+// oversize publish rejected by policy — so a test that cannot reach them cannot
+// cover them.
+
+// Container exposes the running broker for a test that needs an operation these
+// helpers do not wrap.
+func (i *Instance) Container() testcontainers.Container {
+	return i.container
+}
+
+// Exec runs cmd inside the broker container and returns its exit code and combined
+// output. It fails the test only when the command could not be run at all; a NON-ZERO
+// exit is returned for the caller to assert on, since "rabbitmqctl refused this" is
+// often the thing under test.
+func (i *Instance) Exec(t *testing.T, cmd ...string) (int, string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	code, reader, err := i.container.Exec(ctx, cmd)
+	if err != nil {
+		t.Fatalf("exec %v: %v", cmd, err)
+	}
+
+	out, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read output of %v: %v", cmd, err)
+	}
+
+	return code, string(out)
+}
+
+// Rabbitmqctl runs `rabbitmqctl <args...>` and fails the test on a non-zero exit,
+// for the cases where the command succeeding is a precondition rather than the
+// assertion.
+func (i *Instance) Rabbitmqctl(t *testing.T, args ...string) string {
+	t.Helper()
+
+	code, out := i.Exec(t, append([]string{"rabbitmqctl"}, args...)...)
+	if code != 0 {
+		t.Fatalf("rabbitmqctl %v exited %d: %s", args, code, out)
+	}
+
+	return out
+}
+
+// StopApp stops the RabbitMQ application while leaving the container running, and
+// StartApp brings it back. Together they model a broker restart: every connection
+// and channel is dropped, and the endpoint is unchanged when it returns.
+//
+// This is deliberately NOT a container stop/start. Docker republishes an ephemeral
+// host port on restart, so the container-level cycle would move the address every
+// caller already captured — the app-level cycle drops connections just as hard while
+// keeping Address and URL valid.
+func (i *Instance) StopApp(t *testing.T) {
+	t.Helper()
+	i.Rabbitmqctl(t, "stop_app")
+}
+
+// StartApp restarts the application stopped by StopApp and waits for it to accept
+// connections again, so a test does not have to poll for readiness itself.
+func (i *Instance) StartApp(t *testing.T) {
+	t.Helper()
+
+	i.Rabbitmqctl(t, "start_app")
+	i.Rabbitmqctl(t, "await_startup")
+
+	// await_startup returns once the node is up; prove the AMQP listener actually
+	// completes a handshake before handing control back, which is the same reason
+	// Start waits on the log line rather than on the port.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		c, err := amqp.Dial(i.URL)
+		if err == nil {
+			_ = c.Close()
+
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("broker did not accept connections after start_app: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// SetMemoryWatermark sets vm_memory_high_watermark. Passing 0 raises the memory
+// alarm immediately, which blocks every publishing connection — the state that makes
+// a context-less publish hang. Restore it with a normal value (0.6 is the default).
+func (i *Instance) SetMemoryWatermark(t *testing.T, fraction string) {
+	t.Helper()
+	i.Rabbitmqctl(t, "set_vm_memory_high_watermark", fraction)
+}
+
+// SetDiskFreeLimit sets disk_free_limit. A limit larger than the disk (e.g. "100GB")
+// raises the disk alarm, blocking publishers.
+func (i *Instance) SetDiskFreeLimit(t *testing.T, limit string) {
+	t.Helper()
+	i.Rabbitmqctl(t, "set_disk_free_limit", limit)
+}
+
+// SetMaxMessageSize changes the broker's max_message_size at runtime, so a test can
+// provoke a permanently-rejected publish without building a multi-megabyte payload.
+func (i *Instance) SetMaxMessageSize(t *testing.T, bytes int) {
+	t.Helper()
+	i.Rabbitmqctl(t, "eval", fmt.Sprintf("application:set_env(rabbit, max_message_size, %d).", bytes))
+}
+
+// DeclareQueue declares a durable queue with args, for the topology a test needs the
+// BROKER to own rather than the code under test — a quorum queue, an
+// x-delivery-limit, a dead-letter exchange, a message TTL. Declaring these here is
+// what makes "the receiver did not create this topology" a testable condition.
+func (i *Instance) DeclareQueue(t *testing.T, queue string, args amqp.Table) {
+	t.Helper()
+
+	if err := i.withChannel(t, func(ch *amqp.Channel) error {
+		_, err := ch.QueueDeclare(queue, true, false, false, false, args)
+
+		return err
+	}); err != nil {
+		t.Fatalf("declare queue %q with args %v: %v", queue, args, err)
+	}
+}
+
+// DeclareExchange declares a durable exchange of kind, for the same reason as
+// DeclareQueue.
+func (i *Instance) DeclareExchange(t *testing.T, exchange, kind string) {
+	t.Helper()
+
+	if err := i.withChannel(t, func(ch *amqp.Channel) error {
+		return ch.ExchangeDeclare(exchange, kind, true, false, false, false, nil)
+	}); err != nil {
+		t.Fatalf("declare exchange %q: %v", exchange, err)
+	}
+}
+
+// BindQueue binds queue to exchange under key.
+func (i *Instance) BindQueue(t *testing.T, queue, key, exchange string) {
+	t.Helper()
+
+	if err := i.withChannel(t, func(ch *amqp.Channel) error {
+		return ch.QueueBind(queue, key, exchange, false, nil)
+	}); err != nil {
+		t.Fatalf("bind queue %q to %q with key %q: %v", queue, exchange, key, err)
+	}
+}
+
+// Get fetches one message from queue without acking it, and reports whether there was
+// one. It is how a test reads what the BROKER wrote — most importantly the real
+// x-death header shape behind a retry lap, which is otherwise asserted only against
+// hand-built fixtures.
+//
+// The delivery is left unacked and the channel is closed immediately after, so the
+// message returns to the queue: inspecting a queue must not consume it.
+func (i *Instance) Get(t *testing.T, queue string) (amqp.Delivery, bool) {
+	t.Helper()
+
+	var (
+		d  amqp.Delivery
+		ok bool
+	)
+	if err := i.withChannel(t, func(ch *amqp.Channel) error {
+		var err error
+		d, ok, err = ch.Get(queue, false)
+
+		return err
+	}); err != nil {
+		t.Fatalf("get from queue %q: %v", queue, err)
+	}
+
+	return d, ok
 }

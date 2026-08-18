@@ -206,7 +206,7 @@ func (s *Sender) Send(ctx context.Context, meta *event.Metadata, data []byte) er
 		// set is EMPTY — so by default an event no queue received is reported as
 		// delivered, and a relay commits its position past it. See
 		// WithMandatoryPublish for when that trade is the wrong one.
-		if err := s.confirms.Enable(ch); err != nil {
+		if err := s.confirms.Enable(ctx, ch); err != nil {
 			return err
 		}
 

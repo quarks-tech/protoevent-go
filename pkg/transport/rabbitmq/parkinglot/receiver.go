@@ -349,7 +349,7 @@ func (r *Receiver) putIntoParkingLot(ctx context.Context, conn *connpool.Conn, d
 	// most one after the confirm. Parks are poison-only and rare, so serializing them
 	// per channel costs nothing.
 	ch := conn.Channel()
-	if err := r.confirms.Enable(ch); err != nil {
+	if err := r.confirms.Enable(ctx, ch); err != nil {
 		return fmt.Errorf("put into parking lot: %w", err)
 	}
 

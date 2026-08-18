@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/bound"
 	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/internal/lane"
 )
 
@@ -41,6 +42,34 @@ var errLostLeadership = errors.New("sequence: leadership lost mid-pass")
 // simply is not the leader, which is silence in front of a real outage.
 var errLeaseRenewFailed = errors.New("sequence: leader lease renewal failed")
 
+// commitOffset advances the watermark, through the fence when the store has one.
+//
+// A rejected fenced write is reported as errLostLeadership, which is what it means: a
+// changed holder_id says another instance has taken the lock, so this pass must stop
+// and skip the sweep exactly as a failed renewal does. It is also SIGNALED rather
+// than swallowed — the stream runtime surfaces a stale token save to the observer, and
+// the same event here was previously invisible, which is why a superseded leader could
+// rewind a group with nothing in the logs to say so.
+func (r *Relay) commitOffset(ctx context.Context, seq int64) error {
+	if r.fenced == nil {
+		return r.store.CommitOffset(ctx, r.name, seq)
+	}
+
+	persisted, err := r.fenced.CommitOffsetFenced(ctx, r.name, r.leader.LockName(), r.leader.HolderID(), seq)
+	if err != nil {
+		return err
+	}
+	if !persisted {
+		r.reporter.Error(fmt.Errorf("%w: the watermark commit at seq %d was rejected because the "+
+			"leader lock %q is now held by another instance; this relay was superseded mid-pass and its "+
+			"offset was NOT applied", errLostLeadership, seq, r.leader.LockName()))
+
+		return errLostLeadership
+	}
+
+	return nil
+}
+
 // renewLease re-acquires the leader lease between pages. See the two sentinels
 // above for how its three outcomes are reported.
 func (r *Relay) renewLease(ctx context.Context) error {
@@ -60,7 +89,10 @@ func (r *Relay) renewLease(ctx context.Context) error {
 func (r *Relay) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.options.PollInterval)
 	defer ticker.Stop()
-	defer r.reporter.ReleaseLeadership(r.leader)
+	// One budget for the shutdown tail; see bound.ShutdownScope.
+	shutdown, endShutdown := bound.ShutdownScope()
+	defer endShutdown()
+	defer r.reporter.ReleaseLeadership(shutdown, r.leader)
 
 	// Do one pass immediately instead of waiting a full PollInterval for the
 	// first tick, so a freshly started relay starts delivering right away.
@@ -82,14 +114,23 @@ func (r *Relay) Run(ctx context.Context) error {
 			// surfaces the richer cancel reason under WithCancelCause/errgroup.
 			return context.Cause(ctx)
 		case <-ticker.C:
+			// Cancellation is re-checked BEFORE starting a pass, because a ready
+			// ticker and a done context are both ready cases and select picks
+			// pseudo-randomly — so this arm keeps being chosen after cancellation.
+			// Each pass entered that way starts a fresh store call, and the final
+			// commit's shutdown grace is paid again for every one of them: measured at
+			// three passes and 15s of shutdown where one pass and 5s were intended.
+			// (The receive loop in transport/gochan documents the same hazard.)
+			if ctx.Err() != nil {
+				return context.Cause(ctx)
+			}
 			if err := r.RunOnce(ctx); err != nil {
 				if ctx.Err() != nil {
-					// Planned shutdown (ctx is genuinely done): ctx.Done() will
-					// fire and exit the loop; don't report a spurious error
-					// metric/log for it. Gated on run-context liveness, not
-					// error identity — an op-level context.DeadlineExceeded
-					// while ctx is still alive is a real, recurring timeout and
-					// must be reported below.
+					// Planned shutdown (ctx is genuinely done): don't report a
+					// spurious error metric/log for it. Gated on run-context
+					// liveness, not error identity — an op-level
+					// context.DeadlineExceeded while ctx is still alive is a real,
+					// recurring timeout and must be reported below.
 					continue
 				}
 				r.reporter.PassFailed(err)
@@ -310,7 +351,7 @@ func (r *Relay) primeOffset(ctx context.Context) (int64, error) {
 		// history this group was configured to replay. Committing 0 is the
 		// registration primitive — CommitOffset is an insert-if-absent monotone
 		// upsert, so it creates the row at 0 and is a no-op against any existing row.
-		return offset, r.store.CommitOffset(ctx, r.name, 0)
+		return offset, r.commitOffset(ctx, 0)
 	}
 
 	// A brand-new group starts at "latest" (parity with the stream runtime's
@@ -392,7 +433,7 @@ func (r *Relay) drainPage(ctx context.Context, offset int64) (int64, pageOutcome
 	}
 
 	if maxSeq > offset {
-		if err := r.store.CommitOffset(ctx, r.name, maxSeq); err != nil {
+		if err := r.commitOffset(ctx, maxSeq); err != nil {
 			return offset, pageDone, err
 		}
 		// A single leader owns the watermark, so the value just committed IS the
@@ -488,15 +529,21 @@ func (r *Relay) oldestAge(ctx context.Context, createTime time.Time) time.Durati
 	return age
 }
 
-// maybeSweep runs the retention sweep at most once per RetentionSweepInterval
-// of wall-clock time — decoupled from PollInterval, so retuning the tick does
-// not silently change sweep cadence. The first leader tick sweeps immediately
-// (lastSweep zero); each pass is bounded by RetentionSweepBatch and the pass
-// loop by maxPagesPerTick, mirroring drain: a single bounded batch per
-// interval would otherwise fall behind SILENTLY whenever deletable rows
-// accumulate faster than batch/interval, growing the table toward a
-// disk-full incident with no signal. Every pass reports its count via
-// OnSwept — repeated full batches are the falling-behind alarm.
+// maybeSweep runs the retention sweep, at most once per RetentionSweepInterval of
+// wall-clock time ONCE IT HAS CAUGHT UP — decoupled from PollInterval, so retuning the
+// tick does not silently change the idle cadence. The first leader tick sweeps
+// immediately (lastSweep zero); each pass is bounded by RetentionSweepBatch and the pass
+// loop by maxPagesPerTick, mirroring drain.
+//
+// While there is deletable work LEFT the interval is not consumed, so the sweep resumes
+// on the next tick. That distinction is the difference between a bounded and an unbounded
+// table: latching the interval on any completed page capped the sweep at
+// maxPagesPerTick * RetentionSweepBatch per interval — 17.8 rows/s on the defaults —
+// below any real publish rate, so a store publishing faster grew at the difference
+// forever and surfaced as a disk-full incident months later, nowhere near the cause.
+//
+// Every pass reports its count via OnSwept — repeated full batches mean the sweep is
+// behind and now working every tick to catch up.
 func (r *Relay) maybeSweep(ctx context.Context) error {
 	if r.retention == nil {
 		return nil
@@ -520,9 +567,6 @@ func (r *Relay) maybeSweep(ctx context.Context) error {
 			// reported through PassFailed just like them.
 			return err
 		}
-		// Latched on the first page that actually completed, so the interval is
-		// measured from work done rather than from work attempted.
-		r.lastSweep = time.Now()
 		// Reported even for n == 0. A zero sweep is not always the healthy
 		// idle case: the cutoff is MIN(last_seq) across ALL groups, so one lagging
 		// or replaying group (a WithStartFromBeginning group registers at 0) pins it
@@ -532,6 +576,19 @@ func (r *Relay) maybeSweep(ctx context.Context) error {
 		// exits immediately on a short page, so an idle interval reports once.
 		r.reporter.Swept(n)
 		if n < r.options.RetentionSweepBatch {
+			// Latched only HERE, on catching up: the interval is a cadence for pruning
+			// an outbox with nothing left to delete, not a ration of throughput. It
+			// used to be latched on the first completed page, so exiting the loop at
+			// maxPagesPerTick with pages still full bought a full interval of silence
+			// and capped the sweep at maxPagesPerTick*RetentionSweepBatch per interval
+			// — 17.8 rows/s on the defaults, below any real publish rate, so the table
+			// grew at (rate - 17.8) rows/s until the disk filled months later.
+			//
+			// This is the same reasoning the error path above already applies, reached
+			// by a different exit: while there is known deletable work left, the sweep
+			// resumes next tick, bounded per tick by maxPagesPerTick exactly as before.
+			r.lastSweep = time.Now()
+
 			return nil // drained the deletable backlog
 		}
 		if err := ctx.Err(); err != nil {
@@ -539,7 +596,10 @@ func (r *Relay) maybeSweep(ctx context.Context) error {
 		}
 	}
 
-	return nil // cap hit: the next interval continues; OnSwept has been signaling full batches
+	// Cap hit with pages still full: deliberately NOT latching lastSweep, so the next
+	// tick continues instead of waiting out the interval. OnSwept has been signaling
+	// full batches throughout, which is the falling-behind alarm.
+	return nil
 }
 
 // stuckLabel renders a seq for the operator. Built only on escalation (see

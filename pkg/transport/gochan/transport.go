@@ -6,6 +6,7 @@ package gochan
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 	"github.com/quarks-tech/protoevent-go/pkg/eventbus"
@@ -19,6 +20,10 @@ const (
 var (
 	ErrNilContext  = errors.New("nil Context")
 	ErrNilMetadata = errors.New("nil Metadata")
+
+	// ErrClosed is returned by Send after Close. It replaces the "send on closed
+	// channel" panic a Send racing Close used to raise.
+	ErrClosed = errors.New("gochan: transport closed")
 )
 
 // SendReceiver is both ends of the in-memory transport over one shared
@@ -27,6 +32,11 @@ var (
 type SendReceiver struct {
 	sender   sender
 	receiver receiver
+
+	// done is closed by Close and is the shutdown signal for both ends. The shared
+	// message channel is never closed, so no Send can panic on it.
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 type message struct {
@@ -52,10 +62,12 @@ func WithErrorHandler(h func(md *event.Metadata, err error)) Option {
 // New builds a SendReceiver over a fresh channel (buffer depth 20).
 func New(opts ...Option) *SendReceiver {
 	ch := make(chan message, defaultChanDepth)
+	done := make(chan struct{})
 
 	sr := &SendReceiver{
-		sender:   ch,
-		receiver: receiver{ch: ch},
+		sender:   sender{ch: ch, done: done},
+		receiver: receiver{ch: ch, done: done},
+		done:     done,
 	}
 
 	for _, opt := range opts {
@@ -82,10 +94,15 @@ func (sr *SendReceiver) Receive(ctx context.Context, processor eventbus.Processo
 	return sr.receiver.Receive(ctx, processor)
 }
 
-// Close closes the underlying channel, ending Receive after the buffer
-// drains. Close exactly once, and only after every Send has returned: a
-// second Close — or a Send racing Close — panics (bare channel semantics,
-// acceptable for this in-memory test transport).
+// Close signals shutdown, ending Receive once the buffer drains. It is safe to
+// call concurrently with Send and safe to call more than once.
+//
+// Close used to close the shared message channel, which made a second Close — or a
+// Send racing Close — a panic, waived as "acceptable for this in-memory test
+// transport". It is not: gochan is the documented single-process wiring and the
+// transport used in the end-to-end tests, a publisher blocked on a full buffer is
+// exactly what a shutdown interrupts, and the API offered a caller no barrier with
+// which to prove every Send had returned. A Send after Close now returns ErrClosed.
 func (sr *SendReceiver) Close(_ context.Context) {
-	close(sr.sender)
+	sr.closeOnce.Do(func() { close(sr.done) })
 }
