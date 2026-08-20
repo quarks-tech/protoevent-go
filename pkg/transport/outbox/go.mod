@@ -12,7 +12,7 @@ require (
 	// publishing order in ./tidb/go.mod for that reason. Tag the root module
 	// first, then bump this pin, then tag this module; verify with
 	// `make check-modules`.
-	github.com/quarks-tech/protoevent-go v0.4.2
+	github.com/quarks-tech/protoevent-go v0.5.0
 )
 
 require google.golang.org/protobuf v1.36.11

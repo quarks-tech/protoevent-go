@@ -10,7 +10,7 @@ require (
 	// v0.4.2 tag does not contain, so it builds only inside the repo's go.work.
 	// Tag the root module first, then bump this pin — see the publishing order in
 	// pkg/transport/outbox/tidb/go.mod, and verify with `make check-modules`.
-	github.com/quarks-tech/protoevent-go v0.4.2
+	github.com/quarks-tech/protoevent-go v0.5.0
 	github.com/rabbitmq/amqp091-go v1.13.0
 	github.com/rs/xid v1.6.0
 )
