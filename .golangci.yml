@@ -1,28 +1,126 @@
 version: "2"
 run:
   concurrency: 2
-  go: '1.25'
+  go: '1.26'
   timeout: 1m
 
+# Curated set (v2 spelling — the previous config used v1 keys that
+# golangci-lint v2 silently ignored, so only the 5 standard linters actually
+# ran). Rolled out curated rather than `default: all`: enabling everything
+# repo-wide in the same change would drown the signal. Extend deliberately.
 linters:
-  enable-all: true
-  disable:
-    - depguard
+  default: standard
+  enable:
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - durationcheck
+    - errname
+    - errorlint
+    - exptostd
+    - fatcontext
+    - gocritic
+    - gosec
+    - intrange
+    - mirror
+    # Policing "use the language feature that now exists" cannot be done by
+    # review: a reviewer pattern-matches against a training corpus, and brand-new
+    # stdlib API has none — errors.AsType survived two full review rounds on this
+    # branch before a human spotted it. An analyzer has no such bias, so the rule
+    # is enforced here instead of remembered.
+    #
+    # Note that golangci bundles its own x/tools snapshot, which lags the
+    # standalone analyzer (the WaitGroup.Go modernizer, for one, is newer than
+    # what ships here). Running
+    #   go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest ./...
+    # per module catches the rest; worth doing on each toolchain bump.
+    #
+    # usestdlibvars is deliberately NOT enabled alongside it: it makes staticcheck
+    # emit an SA5011 false positive on a t.Fatalf-guarded pointer in
+    # mongodb/watch_internal_test.go, and one bogus finding costs more than the
+    # rule is worth here.
+    - modernize
+    - misspell
+    - musttag
+    - nilnesserr
+    - noctx
+    - nolintlint
+    - perfsprint
+    - prealloc
+    - protogetter
+    - recvcheck
+    - rowserrcheck
+    - sloglint
+    - sqlclosecheck
+    - testpackage
+    - thelper
+    - unconvert
+    - unparam
+    - usetesting
     - wrapcheck
-    - mnd
-    - varnamelen
+  settings:
+    errcheck:
+      check-type-assertions: true
+    misspell:
+      locale: US
+    musttag:
+      functions:
+        # mongo-driver v2 import path; musttag's built-ins only cover v1
+        - name: go.mongodb.org/mongo-driver/v2/bson.Marshal
+          tag: bson
+          arg-pos: 0
+        - name: go.mongodb.org/mongo-driver/v2/bson.Unmarshal
+          tag: bson
+          arg-pos: 1
+    usetesting:
+      # Disabled repo-wide (not per-file) because context.Background is
+      # legitimate in three recurring classes here: container/TestMain
+      # bootstrap (runs before/after any test), testing/synctest bubbles
+      # (t.Context would escape the bubble), and the store integration
+      # suites' established convention. Per-path exclusions would have to
+      # enumerate most test files anyway.
+      context-background: false
+      context-todo: true
+  exclusions:
+    rules:
+      # Transports are the pass-through/driver-plumbing layer: the outbox
+      # store contracts return descriptive `outbox:`-prefixed errors by
+      # convention, the relay runtimes preserve error identity across
+      # delegators (Run returns the unwrapped cancellation cause on planned
+      # shutdown), and wrapping at every hop would double-prefix everything.
+      # wrapcheck stays strict for eventbus/encoding/event, where wrapping
+      # discipline earns its keep.
+      - path: pkg/transport/
+        linters:
+          - wrapcheck
+      # Shutdown-path helpers (closeStream, the bounded final offset/token
+      # writes) run where the caller's ctx is already dead and use fresh
+      # bounded contexts BY DESIGN (documented on each); contextcheck cannot
+      # express that. (The leader elector's Release lives in internal/leader
+      # and takes no ctx parameter, so contextcheck has nothing to flag there.)
+      - path: pkg/transport/outbox/relay/
+        linters:
+          - contextcheck
+      # Testcontainer cleanup runs after the test ctx is dead; fresh bounded
+      # contexts there are the same deliberate pattern.
+      - path: (tidbtest|mongodbtest)/
+        linters:
+          - contextcheck
+      # Test helpers return raw errors straight into t.Fatal — wrapping them
+      # adds ceremony, not context.
+      - path: _test\.go
+        linters:
+          - wrapcheck
 
-linters-settings:
-  gci:
-    sections:
-      - standard
-      - default
-      - prefix(github.com/quarks-tech)
-      - prefix(github.com/quarks-tech/protoevent-go)
-      - blank
-  misspell:
-    locale: US
-  goimports:
-    local-prefixes: github.com/quarks-tech/protoevent-go
-  lll:
-    line-length: 180
+formatters:
+  enable:
+    - gci
+    - gofmt
+  settings:
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/quarks-tech)
+        - prefix(github.com/quarks-tech/protoevent-go)
+        - blank

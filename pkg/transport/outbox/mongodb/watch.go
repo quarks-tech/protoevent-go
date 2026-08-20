@@ -1,0 +1,311 @@
+package mongodb
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay"
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox/relay/stream"
+)
+
+// Compile-time capability pins: the runtime discovers LeaderStore by type
+// assertion, so signature drift would otherwise downgrade silently to
+// always-leader. Both contracts belong to *RelayStore — the publish *Store
+// deliberately implements neither.
+var (
+	_ stream.Store        = (*RelayStore)(nil)
+	_ relay.LeaderStore   = (*RelayStore)(nil)
+	_ stream.IndexEnsurer = (*RelayStore)(nil)
+)
+
+// resumeTokenTimestampMarker is the KeyString type marker that opens a resume
+// token's _data payload, immediately followed by the big-endian clusterTime.
+const resumeTokenTimestampMarker = 0x82
+
+// changeStreamHistoryLostCode is the MongoDB server error code for
+// ChangeStreamHistoryLost: the resume token has fallen off the oplog window.
+const changeStreamHistoryLostCode = 286
+
+// nonResumableChangeStreamErrorLabel is the error label the server attaches to
+// a non-resumable change-stream error (in addition to, or instead of, the bare
+// code on some server versions).
+const nonResumableChangeStreamErrorLabel = "NonResumableChangeStreamError"
+
+// changeEvent is the decoded change-stream document (insert or invalidate).
+type changeEvent struct {
+	ID            bson.Raw       `bson:"_id"`           // resume token for THIS event
+	OperationType string         `bson:"operationType"` // insert | invalidate | ...
+	CommitTime    bson.Timestamp `bson:"clusterTime"`
+	FullDocument  outboxDoc      `bson:"fullDocument"` // present on insert
+}
+
+// Watch opens an insert-filtered change stream resumed from token (or "now").
+// maxAwait becomes the change stream's server-side maxAwaitTime — the relay
+// passes its DrainWindow, keeping a single latency knob. A non-positive
+// maxAwait leaves the driver/server default in place (the relay validates
+// DrainWindow > 0, so this is unreachable through the stream relay).
+func (rs *RelayStore) Watch(ctx context.Context, token string, maxAwait time.Duration) (stream.Stream, error) {
+	// invalidate MUST pass the filter too: a $match on "insert" alone silently
+	// drops the collection-dropped/renamed invalidate event, leaving the
+	// stream reporting empty windows forever instead of surfacing the fatal
+	// ErrInvalidated via Next below (verified live: see
+	// TestWatchSurfacesInvalidateOnDrop).
+	pipeline := mongo.Pipeline{
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "operationType", Value: bson.D{{Key: "$in", Value: bson.A{"insert", "invalidate"}}}},
+		}}},
+	}
+	opts := options.ChangeStream()
+	if maxAwait > 0 {
+		opts = opts.SetMaxAwaitTime(maxAwait)
+	}
+	if token != "" {
+		opts = opts.SetResumeAfter(bson.Raw(token))
+	}
+	// else: no resumeAfter → the stream starts at "now" (v1 StartNow).
+
+	cs, err := rs.coll(rs.collMessages).Watch(ctx, pipeline, opts)
+	if err != nil {
+		// The server validates resumeAfter against the oplog AT AGGREGATE TIME,
+		// so the two most likely paths off the resume-token cliff — a relay
+		// restarted after downtime longer than the oplog window, and a broker
+		// outage whose stop-the-lane cycle reopens the stream every window —
+		// surface ChangeStreamHistoryLost HERE, not in Next. Without this
+		// classification the fatal is wrapped as a generic open error, Run's
+		// errors.Is misses, and the break-glass design silently degrades into
+		// an infinite transient-retry loop.
+		if isHistoryLost(err) {
+			return nil, fmt.Errorf("%w: %w", stream.ErrHistoryLost, err)
+		}
+		return nil, fmt.Errorf("outbox: open change stream: %w", err)
+	}
+	return &mongoStream{cs: cs}, nil
+}
+
+// mongoStream adapts a *mongo.ChangeStream to stream.Stream.
+type mongoStream struct {
+	cs *mongo.ChangeStream
+}
+
+// Next drains one event if buffered; on an empty batch it blocks up to
+// maxAwaitTime and returns (nil,false,nil). A stream error → (nil,false,err),
+// classified to stream.ErrHistoryLost when the resume token fell off the
+// oplog, stream.ErrInvalidated on an invalidate event (collection
+// drop/rename), and *stream.DecodeError when THIS event's payload fails to
+// decode — the DecodeError carries the event's resume position so the relay
+// can park it and resume past it, instead of reopening onto the same poison
+// event forever.
+func (m *mongoStream) Next(ctx context.Context) (*stream.Event, bool, error) {
+	// TryNext returns false when the current batch is drained WITHOUT closing
+	// the stream (respecting maxAwaitTime) — exactly the window semantics we want.
+	if !m.cs.TryNext(ctx) {
+		err := m.cs.Err()
+		if err == nil {
+			// Err() == nil is NOT enough to call this an empty window: the driver
+			// reports a stream the SERVER closed the same way. Its loopNext clears
+			// cs.err and returns on `cs.ID() == 0` (change_stream.go), so a closed
+			// cursor yields (false, nil) forever — and reading that as "caught up"
+			// leaves the relay idling on a dead stream while drainWindow keeps
+			// reporting healthy empty windows and Run never reopens, because
+			// r.stream is still non-nil. The only symptom is committedTokenAge
+			// climbing. Both checks are required; the driver's own docs say so.
+			//
+			// Surfaced as an ordinary transient error, not a fatal: Run's default
+			// branch closes the stream and reopens from the persisted token, which
+			// is exactly the recovery. Only when that token has fallen off the
+			// oplog does the reopen escalate to ErrHistoryLost, from Watch.
+			if m.cs.ID() == 0 {
+				return nil, false, errors.New("outbox: change stream closed by the server; reopening from the persisted token")
+			}
+
+			return nil, false, nil // empty window
+		}
+		if isHistoryLost(err) {
+			// Wrap rather than replace: this is the break-glass runbook
+			// case, and the server error carries the diagnostics (message,
+			// code, labels) the operator needs. errors.Is still matches
+			// the sentinel.
+			return nil, false, fmt.Errorf("%w: %w", stream.ErrHistoryLost, err)
+		}
+		return nil, false, fmt.Errorf("outbox: change stream next: %w", err)
+	}
+	var ce changeEvent
+	if err := m.cs.Decode(&ce); err != nil {
+		// The envelope itself failed to decode; recover the resume position
+		// from the raw change document so the caller can still skip past it.
+		return nil, false, decodeErrorFromRaw(m.cs.Current, err)
+	}
+	if ce.OperationType == "invalidate" {
+		return nil, false, stream.ErrInvalidated
+	}
+	msg, err := decodeMessage(ce.FullDocument)
+	if err != nil {
+		return nil, false, &stream.DecodeError{
+			ID:          ce.FullDocument.ID,
+			ResumeToken: string(ce.ID),
+			CommitTime:  time.Unix(int64(ce.CommitTime.T), 0).UTC(),
+			Err:         err,
+		}
+	}
+	return &stream.Event{
+		Message:     msg,
+		ResumeToken: string(ce.ID),
+		CommitTime:  time.Unix(int64(ce.CommitTime.T), 0).UTC(),
+	}, true, nil
+}
+
+// Checkpoint returns the postBatchResumeToken after an empty window. The driver
+// surfaces the batch-level token via ResumeToken(); the anchor clusterTime is
+// decoded from the token itself (clusterTimeFromToken), so it lives in the
+// SAME clock domain as event clusterTimes — the server's. Stamping client
+// time.Now() here instead would poison SaveToken's monotone guard under clock
+// skew: a host clock N ahead of the server persists an idle-window anchor N
+// in the future, and every real event-token save for the next N is silently
+// classified stale (nothing persists while committedTokenAge reports fresh).
+//
+// Fallback for a token whose payload defies the known layout: client "now"
+// truncated to whole seconds (bson.Timestamp granularity — millisecond
+// precision would compare NEWER than a same-second event and misclassify the
+// very next event-token save as stale). The third return reports which of the two
+// it is, because the relay may persist either but may only CALIBRATE its clock
+// offset from a server-derived one — calibrating from the local substitute would
+// mark the offset trustworthy while it is really the raw host clock.
+func (m *mongoStream) Checkpoint() (string, time.Time, bool) {
+	tok := m.cs.ResumeToken()
+	if tok == nil {
+		return "", time.Time{}, false
+	}
+	if ct, ok := clusterTimeFromToken(tok); ok {
+		return string(tok), ct, true
+	}
+	return string(tok), time.Now().UTC().Truncate(time.Second), false
+}
+
+// clusterTimeFromToken extracts the clusterTime embedded in a resume token.
+// A resume token is a {"_data": "<hex>"} document whose payload is a
+// KeyString: byte 0 is the Timestamp type marker (0x82) and bytes 1-8 are the
+// big-endian bson.Timestamp (4 bytes seconds, 4 bytes increment). This layout
+// is stable across server versions ≥4.2 (it is what makes tokens comparable
+// server-side), but decoding stays best-effort: ok=false on any surprise, and
+// the caller falls back rather than fails.
+func clusterTimeFromToken(tok bson.Raw) (time.Time, bool) {
+	v, err := tok.LookupErr("_data")
+	if err != nil {
+		return time.Time{}, false
+	}
+	s, ok := v.StringValueOK()
+	if !ok {
+		return time.Time{}, false
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) < 5 || b[0] != resumeTokenTimestampMarker {
+		return time.Time{}, false
+	}
+	secs := binary.BigEndian.Uint32(b[1:5])
+	return time.Unix(int64(secs), 0).UTC(), true
+}
+
+// tokenKeyFromString extracts a resume token's KeyString payload as a
+// case-normalized hex string, the store's fine-grained ordering key. KeyString
+// bytes are memcmp-ordered by design (that is what makes tokens comparable
+// server-side), and fixed-width hex preserves byte order, so lexicographic
+// comparison of two keys reproduces the server's token order — including the
+// increment half of the timestamp and the document position that the
+// second-granularity clusterTime anchor truncates away. Best-effort like
+// clusterTimeFromToken: ok=false on any surprise (non-token strings, foreign
+// formats), and SaveToken falls back to the coarse clusterTime guard.
+func tokenKeyFromString(token string) (string, bool) {
+	v, err := bson.Raw(token).LookupErr("_data")
+	if err != nil {
+		return "", false
+	}
+	s, ok := v.StringValueOK()
+	if !ok || s == "" {
+		return "", false
+	}
+	// Validate it is hex before lowercasing: only then is ToLower
+	// order-preserving (all digits map within [0-9a-f]). Validated IN PLACE
+	// rather than via hex.DecodeString: the decoded bytes are never used —
+	// only the hex string is stored and compared — so decoding would allocate
+	// and discard a ~50-byte buffer on every token save (one per drain window
+	// per leader). Same accept/reject set as hex.DecodeString: even length,
+	// every byte a hex digit.
+	if len(s)%2 != 0 {
+		return "", false
+	}
+	for i := range len(s) {
+		switch c := s[i]; {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return "", false
+		}
+	}
+	return strings.ToLower(s), true
+}
+
+func (m *mongoStream) Close(ctx context.Context) error {
+	if err := m.cs.Close(ctx); err != nil {
+		return fmt.Errorf("outbox: close change stream: %w", err)
+	}
+	return nil
+}
+
+// decodeErrorFromRaw builds a *stream.DecodeError from the raw change
+// document when the changeEvent envelope itself fails to decode. Each field
+// is best-effort: the resume token (_id), clusterTime, and the outbox row id
+// (fullDocument._id) are extracted independently, so whatever survives the
+// corruption still positions the caller.
+func decodeErrorFromRaw(raw bson.Raw, err error) *stream.DecodeError {
+	de := &stream.DecodeError{Err: err}
+	if v, lerr := raw.LookupErr("_id"); lerr == nil {
+		if doc, ok := v.DocumentOK(); ok {
+			de.ResumeToken = string(doc)
+		}
+	}
+	if v, lerr := raw.LookupErr("clusterTime"); lerr == nil {
+		if t, _, ok := v.TimestampOK(); ok {
+			de.CommitTime = time.Unix(int64(t), 0).UTC()
+		}
+	}
+	if v, lerr := raw.LookupErr("fullDocument", "_id"); lerr == nil {
+		if s, ok := v.StringValueOK(); ok {
+			de.ID = s
+		}
+	}
+	return de
+}
+
+// isHistoryLost reports whether err is the server's ChangeStreamHistoryLost
+// error (code 286), signaled either by the bare code or by the
+// NonResumableChangeStreamError label the server attaches to it.
+//
+// The label check is deliberately broader than code 286. The server also attaches
+// that label to other non-resumable stream failures (an invalidated stream, a
+// dropped collection), so this over-reports: such a failure is answered with
+// ErrHistoryLost, sending the operator to the break-glass DeleteToken + manual
+// re-read runbook when a different response was the right one.
+//
+// That is the chosen side of the trade. The alternative — keying on the code alone
+// — under-reports on any server version that surfaces the condition via the label
+// without the bare code, and an unrecognized history-lost error is not a survivable
+// state: the relay retries a resume point the oplog no longer contains, forever,
+// with the one actionable signal never raised. An over-eager break-glass verdict
+// costs an operator a wasted investigation; a missed one costs a wedged relay. If a
+// server version is ever confirmed to attach this label to a resumable condition,
+// narrow it then — with that version named here.
+func isHistoryLost(err error) bool {
+	se, ok := errors.AsType[mongo.ServerError](err)
+	if !ok {
+		return false
+	}
+	return se.HasErrorCode(changeStreamHistoryLostCode) || se.HasErrorLabel(nonResumableChangeStreamErrorLabel)
+}

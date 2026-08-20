@@ -15,7 +15,6 @@ func (e *UnprocessableEventError) Error() string { return "unprocessable event: 
 func (e *UnprocessableEventError) Unwrap() error { return e.err }
 
 func IsUnprocessableEventError(err error) bool {
-	var unprocessableEventError *UnprocessableEventError
-
-	return errors.As(err, &unprocessableEventError)
+	_, ok := errors.AsType[*UnprocessableEventError](err)
+	return ok
 }

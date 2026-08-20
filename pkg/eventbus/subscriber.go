@@ -3,25 +3,52 @@ package eventbus
 import (
 	"context"
 	"fmt"
-	"strings"
+	"runtime/debug"
 	"sync"
 
 	"github.com/quarks-tech/protoevent-go/pkg/encoding"
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
+// Receiver is the transport seam on the subscribe side: it blocks delivering
+// incoming events to p until ctx is canceled, the transport fails, or the
+// transport shuts down cleanly. A clean shutdown returns nil — a
+// drain-capable transport (the rabbitmq receiver) finishes in-flight
+// deliveries after ctx cancellation and reports the planned stop as success,
+// not as context.Canceled.
 type Receiver interface {
 	Receive(ctx context.Context, p Processor) error
 }
 
+// Setuper is the optional transport capability for declaring topology
+// (exchanges, queues, bindings) before receiving; transports without setup
+// needs simply don't implement it.
 type Setuper interface {
 	Setup(ctx context.Context, serviceName string, info ...ServiceInfo) error
 }
 
-type Processor func(md *event.Metadata, data []byte) error
+// Processor consumes one raw incoming event (CloudEvents metadata + encoded
+// payload). A non-nil error tells the transport the event was not handled,
+// and transport-specific redelivery/parking semantics apply.
+//
+// ctx is the per-delivery context and becomes the handler's own: the transport
+// supplies the narrowest context that still covers this delivery. It is NOT
+// canceled at the first shutdown signal, so an in-flight handler still gets its
+// drain window.
+//
+// Do NOT treat ctx as a shutdown deadline. For the rabbitmq receivers it is
+// amqpx's consumer-group context, which amqpx derives from context.Background()
+// and cancels only when the group's stop watcher itself fails — a CLEAN shutdown
+// and an expired DrainTimeout both leave it live (amqpx v0.3.5 consume.go:224,
+// client.go:204). A handler that blocks on ctx.Done() to abandon work therefore
+// never wakes on those paths; it may finish against a connection that is already
+// gone, and its Ack is lost, so the delivery is redelivered after restart. Bound
+// long handler work with a timeout of your own, and make the work idempotent —
+// which at-least-once delivery requires regardless.
+type Processor func(ctx context.Context, md *event.Metadata, data []byte) error
 
 // EventHandler handles a single event. The handler implementation is captured
-// in the closure, so no interface{} is passed at runtime.
+// in the closure, so no any-typed value is passed at runtime.
 //
 // Parameters:
 //   - ctx: request context
@@ -43,7 +70,7 @@ type ServiceDesc struct {
 	Metadata    string
 }
 
-func (sd ServiceDesc) getEventDesc(name string) (EventDesc, bool) {
+func (sd ServiceDesc) eventDesc(name string) (EventDesc, bool) {
 	for _, ed := range sd.Events {
 		if ed.Name == name {
 			return ed, true
@@ -74,7 +101,7 @@ func defaultSubscriberOptions() subscriberOptions {
 type SubscriberOption func(opts *subscriberOptions)
 
 type Subscriber struct {
-	mux      sync.Mutex
+	mu       sync.Mutex
 	name     string
 	opts     subscriberOptions
 	services map[string]*serviceInfo
@@ -109,7 +136,7 @@ func NewSubscriber(name string, opts ...SubscriberOption) *Subscriber {
 // The generated function creates a closure that captures the typed handler,
 // eliminating the need for runtime type checking.
 func (s *Subscriber) RegisterHandler(sd *ServiceDesc, eventName string, h EventHandler) {
-	ed, ok := sd.getEventDesc(eventName)
+	ed, ok := sd.eventDesc(eventName)
 	if !ok {
 		panicf("event not found: %s", eventName)
 	}
@@ -118,8 +145,8 @@ func (s *Subscriber) RegisterHandler(sd *ServiceDesc, eventName string, h EventH
 }
 
 func (s *Subscriber) register(sd *ServiceDesc, ed EventDesc, h EventHandler) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.serve {
 		panicf("Subscriber.RegisterHandler after Subscriber.Subscribe for %q", ed.Name)
@@ -166,26 +193,41 @@ func (s *Subscriber) GetServiceInfo() []ServiceInfo {
 }
 
 func (s *Subscriber) Subscribe(ctx context.Context, r Receiver) error {
-	s.mux.Lock()
+	s.mu.Lock()
 	s.serve = true
-	s.mux.Unlock()
+	s.mu.Unlock()
 
 	if setuper, ok := r.(Setuper); ok {
 		if err := setuper.Setup(ctx, s.name, s.GetServiceInfo()...); err != nil {
-			return err
+			return fmt.Errorf("eventbus: subscribe: setup topology: %w", err)
 		}
 	}
 
-	return r.Receive(ctx, s.process)
+	if err := r.Receive(ctx, s.process); err != nil {
+		return fmt.Errorf("eventbus: subscribe: %w", err)
+	}
+
+	return nil
 }
 
-func (s *Subscriber) process(md *event.Metadata, data []byte) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	pos := strings.LastIndex(md.Type, ".")
-	service := md.Type[:pos]
-	eventName := md.Type[pos+1:]
+// process is the Processor the transport drives. ctx comes FROM the transport
+// (see Processor) rather than from a context.Background() minted here, so a
+// handler sees whatever the transport chose to give it — trace values, deadlines,
+// and cancellation where the transport propagates any.
+//
+// ctx is NOT a shutdown signal under the RabbitMQ receiver: amqpx derives delivery
+// contexts from context.Background() so its drain can let in-flight handlers finish.
+// So a handler slower than the client's DrainTimeout is still running when the
+// connection is force-closed, and its delivery is requeued and redelivered after
+// restart — running any non-idempotent side effect twice. A handler that must bail out
+// early on shutdown needs a signal of its own.
+func (s *Subscriber) process(ctx context.Context, md *event.Metadata, data []byte) error {
+	// md.Type arrives from the incoming message, so it is untrusted: a dot-less
+	// type must be rejected as unprocessable, never sliced (that panics).
+	service, eventName, err := event.SplitType(md.Type)
+	if err != nil {
+		return NewUnprocessableEventError(err)
+	}
 
 	srv, knownService := s.services[service]
 	if !knownService {
@@ -216,6 +258,39 @@ func (s *Subscriber) process(md *event.Metadata, data []byte) error {
 	}
 
 	ctx = event.NewIncomingContext(ctx, md)
+
+	return s.dispatch(ctx, md, df, ei)
+}
+
+// dispatch invokes the registered handler and contains a panic from it.
+//
+// The panic comes from the CALLER's code, where this library cannot prevent it and
+// can only decide what it costs. Uncontained it costs the whole process: the panic
+// unwinds past the transport's per-delivery policy before anything is acked or
+// rejected, so the delivery stays unacknowledged, the broker redelivers it to the
+// replacement instance, and that one dies the same way — one bad event becomes an
+// unbounded crash loop that also takes down every other subscription sharing the
+// process.
+//
+// Reported as an UNPROCESSABLE event, not a transient failure, because a panic is
+// deterministic in the payload: retrying it reproduces it. That routes the delivery
+// to the dead-letter/parking path a human can inspect instead of back onto the
+// queue it would crash on again.
+//
+// The recover deliberately wraps ONLY the handler call. A panic anywhere else in
+// process is a bug in this library, and those must stay loud.
+func (s *Subscriber) dispatch(ctx context.Context, md *event.Metadata, df func(any) error, ei *eventInfo) (err error) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		// The stack is the only way to find the offending line: by the time this
+		// error reaches the transport the frames are gone, and the message alone
+		// ("assignment to entry in nil map") names no handler.
+		err = NewUnprocessableEventError(fmt.Errorf("panic in handler for %s: %v\n%s",
+			md.Type, r, debug.Stack()))
+	}()
 
 	return ei.handler(ctx, md, df, s.opts.interceptor)
 }

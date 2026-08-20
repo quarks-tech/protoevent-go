@@ -14,12 +14,68 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
+// Sender is the transport seam on the publish side: one encoded event out.
+// Implementations include the RabbitMQ sender, the in-memory gochan
+// transport, and the transactional outbox Sender.
 type Sender interface {
 	Send(ctx context.Context, metadata *event.Metadata, data []byte) error
 }
 
+// Outgoing is one event on its way to a transport: exactly the pair Sender.Send
+// takes, in a form a slice can hold.
+type Outgoing struct {
+	Metadata *event.Metadata
+	Data     []byte
+}
+
+// BatchSender is an OPTIONAL Sender capability: deliver a run of events with the
+// per-event acknowledgements overlapped instead of serialized.
+//
+// It exists because a relay is a serial pipeline whose rate is one over the
+// transport's acknowledgement latency, and for a durable transport that latency is
+// not small. Measured against a RabbitMQ quorum queue, a publish costs 0.01ms of
+// work and 0.87ms of waiting for the confirm — so the outbox relay ran at ~1000
+// events/s on loopback and, extrapolating along the same curve, 129/s at the 5ms
+// confirm an ordinary cross-AZ quorum queue answers in. Nothing about that is the
+// database, the batch size or the poll interval: it is one round trip per event,
+// taken one at a time. Overlapping the waits removes it.
+//
+// Discovery is a type assertion by the caller, the same shape the outbox store
+// capabilities use. A Sender that does not implement this is driven one event at a
+// time exactly as before, so adding the interface changes nothing for existing
+// transports.
+type BatchSender interface {
+	Sender
+
+	// SendBatch delivers msgs IN ORDER and reports how many were confirmed
+	// delivered, counting only an unbroken run from the start.
+	//
+	// The return contract is what makes this safe for an at-least-once relay to
+	// build a position on, so it is strict in both directions:
+	//
+	//   - sent is the length of the CONTIGUOUS confirmed prefix. If msgs[3] fails
+	//     while msgs[4] succeeds, sent is 3 — never 4, and never 5. A caller
+	//     advances its committed position past exactly the first sent messages
+	//     and re-delivers the rest, so a gap counted as progress is a lost event.
+	//   - err is nil if and only if sent == len(msgs). When it is non-nil it
+	//     describes the failure of msgs[sent] specifically, so the caller can apply
+	//     its per-message policy (classify it unsendable, park it, or stop) to that
+	//     message. It must therefore carry any marker that policy matches on, such
+	//     as event.ErrUnsendable.
+	//
+	// Delivery beyond the reported prefix is UNSPECIFIED: messages after the
+	// failure may or may not have reached the transport. That is the same
+	// at-least-once license Send already has (a confirm lost on a dropped
+	// connection re-delivers), and it is why sent must never be optimistic.
+	//
+	// An implementation that cannot overlap a particular configuration should fall
+	// back to sending serially rather than refusing — the contract is about the
+	// answer, not the mechanism.
+	SendBatch(ctx context.Context, msgs []Outgoing) (sent int, err error)
+}
+
 type Publisher interface {
-	Publish(ctx context.Context, name string, event interface{}, opts ...PublishOption) error
+	Publish(ctx context.Context, name string, e any, opts ...PublishOption) error
 }
 
 type PublishOption func(m *event.Metadata)
@@ -35,7 +91,7 @@ type IDGenerator func() (string, error)
 func generateUUIDv4() (string, error) {
 	id, err := uuid.NewRandom()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("eventbus: generate uuid v4 event id: %w", err)
 	}
 
 	return id.String(), nil
@@ -86,10 +142,10 @@ func WithEventDataSchema(schema *url.URL) PublishOption {
 	}
 }
 
-func WithEventExtension(name string, value interface{}) PublishOption {
+func WithEventExtension(name string, value any) PublishOption {
 	return func(m *event.Metadata) {
 		if m.Extensions == nil {
-			m.Extensions = make(map[string]interface{})
+			m.Extensions = make(map[string]any)
 		}
 
 		m.Extensions[name] = value
@@ -107,10 +163,14 @@ func WithPublisherContentType(t string) PublisherOption {
 }
 
 // WithIDGenerator sets the generator used to produce event IDs when the caller
-// does not supply one via WithEventID. Defaults to UUID v4.
+// does not supply one via WithEventID. Defaults to UUID v4. A nil gen is
+// ignored, keeping the default (installing nil would only mint a panic at the
+// first Publish).
 func WithIDGenerator(gen IDGenerator) PublisherOption {
 	return func(opts *publisherOptions) {
-		opts.idGenerator = gen
+		if gen != nil {
+			opts.idGenerator = gen
+		}
 	}
 }
 
@@ -123,6 +183,17 @@ func WithDefaultPublishOptions(pos ...PublishOption) PublisherOption {
 type PublisherImpl struct {
 	sender  Sender
 	options publisherOptions
+
+	// defaultContentType and defaultCodec memoize the codec this publisher's own
+	// configuration resolves to. Every publish otherwise re-parses the same content
+	// type — a lower-casing scan, the prefix checks, the subtype token loop — and
+	// re-hashes the result into the codec registry, for a value that has not changed
+	// since NewPublisher. A per-event WithEventContentType override still takes the
+	// full path. Both fields are written once here and only read afterwards, so
+	// concurrent Publish calls need no synchronization; RegisterCodec is documented
+	// as init-time only, so the memoized codec cannot go stale under us.
+	defaultContentType string
+	defaultCodec       encoding.Codec
 }
 
 func NewPublisher(sender Sender, opts ...PublisherOption) *PublisherImpl {
@@ -137,22 +208,82 @@ func NewPublisher(sender Sender, opts ...PublisherOption) *PublisherImpl {
 		options: options,
 	}
 
+	p.defaultContentType, p.defaultCodec = resolveDefaultCodec(options.publishOptions)
+
 	chainPublisherInterceptors(p)
 
 	return p
 }
 
-func (p *PublisherImpl) Publish(ctx context.Context, name string, event interface{}, opts ...PublishOption) error {
+// resolveDefaultCodec replays the publisher's default publish options onto a
+// scratch envelope to find the content type its events will carry, and resolves the
+// codec for it. An unresolvable one is not an error here — NewPublisher has no way
+// to report it — so it leaves the memo empty and publish reports it per event,
+// exactly as it did before.
+func resolveDefaultCodec(opts []PublishOption) (string, encoding.Codec) {
+	var md event.Metadata
+	for _, opt := range opts {
+		opt(&md)
+	}
+	completeMetadata(&md)
+
+	subtype, ok := event.ContentSubtype(md.DataContentType)
+	if !ok {
+		return "", nil
+	}
+	codec, err := encoding.GetCodec(subtype)
+	if err != nil {
+		return "", nil
+	}
+
+	return md.DataContentType, codec
+}
+
+// codecFor resolves the codec for one event's content type, taking the memoized
+// answer when the event carries the publisher's configured content type.
+func (p *PublisherImpl) codecFor(contentType string) (encoding.Codec, error) {
+	if p.defaultCodec != nil && contentType == p.defaultContentType {
+		return p.defaultCodec, nil
+	}
+
+	contentSubtype, ok := event.ContentSubtype(contentType)
+	if !ok {
+		return nil, fmt.Errorf("unsupported content type: %s", contentType)
+	}
+
+	codec, err := encoding.GetCodec(contentSubtype)
+	if err != nil {
+		return nil, fmt.Errorf("eventbus: publish: %w", err)
+	}
+
+	return codec, nil
+}
+
+func (p *PublisherImpl) Publish(ctx context.Context, name string, e any, opts ...PublishOption) error {
 	opts = combine(p.options.publishOptions, opts)
 
 	if p.options.interceptor != nil {
-		return p.options.interceptor(ctx, name, event, p, publish, opts...)
+		return p.options.interceptor(ctx, name, e, p, publish, opts...)
 	}
 
-	return publish(ctx, name, event, p, opts...)
+	return publish(ctx, name, e, p, opts...)
 }
 
-func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, opts ...PublishOption) error {
+func publish(ctx context.Context, name string, e any, p *PublisherImpl, opts ...PublishOption) error {
+	// Reject a malformed event type HERE, at the earliest point, because the
+	// alternative is not a failed publish but a wedged consumer. Generated code
+	// always emits "<service>.<Event>", but Publish is exported and callable with
+	// anything; a dot-less type sails through the codec and the transport, and the
+	// subscriber then rejects every such delivery as unprocessable. Worse over an
+	// outbox: the row commits with the caller's business transaction, and the relay
+	// can neither send it (the RabbitMQ sender needs the dot to split exchange from
+	// routing key) nor classify it as poison — so the lane stops on that row every
+	// tick forever and nothing behind it is delivered, recoverable only by editing
+	// offsets in a live database. Failing the publish is the cheap end of that.
+	if _, _, err := event.SplitType(name); err != nil {
+		return fmt.Errorf("eventbus: publish: %w", err)
+	}
+
 	md := event.NewMetadata(name)
 
 	for _, opt := range opts {
@@ -162,7 +293,7 @@ func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, 
 	if md.ID == "" {
 		id, err := p.options.idGenerator()
 		if err != nil {
-			return fmt.Errorf("generate event id : %w", err)
+			return fmt.Errorf("generate event id: %w", err)
 		}
 
 		md.ID = id
@@ -170,12 +301,37 @@ func publish(ctx context.Context, name string, e interface{}, p *PublisherImpl, 
 
 	completeMetadata(md)
 
-	contentSubtype, ok := event.ContentSubtype(md.DataContentType)
-	if !ok {
-		return fmt.Errorf("unsupported content type: %s", md.DataContentType)
+	// A schema whose URI is empty is no schema. `schema, _ := url.Parse(cfg.URL)`
+	// on an empty config value yields a NON-nil &url.URL{}, and carrying that
+	// forward makes the event's dataschema differ from the one every reader
+	// reconstructs (the decoders map an empty URI back to nil). Normalize once,
+	// here, so the in-process and post-store values agree.
+	if md.DataSchema != nil && md.DataSchema.String() == "" {
+		md.DataSchema = nil
 	}
 
-	codec, err := encoding.GetCodec(contentSubtype)
+	// Reject an unusable extension here for the same reason as the type check
+	// above: the alternative is not a failed publish but a wedged relay. The content
+	// marshalers refuse such an extension too, but they run at SEND time — over an
+	// outbox that is after the row has committed with the caller's business
+	// transaction, and a marshal failure is not a DecodeError, so the lane stops on
+	// that row every tick forever. Catching it at publish keeps the unsendable row
+	// from being written at all.
+	//
+	// Both halves matter. A reserved NAME overwrites a core attribute in whichever
+	// mode shares its namespace; a nested VALUE (map/struct/slice) is rejected by
+	// the AMQP field encoder outright, which is the same wedge arriving through the
+	// other half of the pair.
+	for k, v := range md.Extensions {
+		if event.ReservedExtensionName(k) {
+			return fmt.Errorf("eventbus: publish: extension %q collides with a core CloudEvents attribute; rename it", k)
+		}
+		if err := event.ValidExtensionValue(v); err != nil {
+			return fmt.Errorf("eventbus: publish: extension %q: %w", k, err)
+		}
+	}
+
+	codec, err := p.codecFor(md.DataContentType)
 	if err != nil {
 		return err
 	}

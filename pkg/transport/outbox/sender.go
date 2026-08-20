@@ -2,6 +2,8 @@ package outbox
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -9,40 +11,62 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
-// IDGenerator produces the outbox row ID for a message. It receives the event
+// RowIDGenerator produces the outbox row ID for a message. It receives the event
 // metadata so a generator may derive the ID from it — in particular,
 // ReuseMetadataID returns the event's own ID.
-type IDGenerator func(md *event.Metadata) (string, error)
-
-// GenerateV4 is the default IDGenerator. It ignores the metadata and mints a
-// fresh random UUID v4 as the outbox row's unique primary key, independent of
-// the caller-controlled Metadata.ID.
 //
-// v4 (random) is deliberate: the relay orders by create_time, not by this ID,
-// so a time-ordered ID gives no ordering benefit — and on TiDB a monotonic
-// primary key concentrates inserts on one Region (a write hotspot). A random
-// key scatters inserts across Regions. See storage ADR 012.
-func GenerateV4(_ *event.Metadata) (string, error) {
+// Note: the TiDB store requires UUID IDs (event_id is a BINARY(16) column); the
+// MongoDB store accepts any string. A custom RowIDGenerator used with the TiDB
+// backend must emit UUID strings.
+type RowIDGenerator func(md *event.Metadata) (string, error)
+
+// GenerateUUIDv4 is a non-default RowIDGenerator. It ignores the metadata and mints a
+// fresh random UUID v4 as the outbox row's identity — MongoDB's _id, TiDB's
+// unique event_id column — independent of the caller-controlled Metadata.ID.
+//
+// This only decouples the row key from the event's identity: the full
+// event.Metadata (including the publisher-assigned ID) is persisted in the
+// row's metadata document and relayed verbatim, so the relayed event still
+// carries exactly the id the caller published. Use GenerateUUIDv4 when the store's
+// row key must not depend on caller-controlled input; consumer-side
+// Metadata.ID dedup keeps working either way.
+func GenerateUUIDv4(_ *event.Metadata) (string, error) {
 	id, err := uuid.NewRandom()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("outbox: generate uuid v4 row id: %w", err)
 	}
 
 	return id.String(), nil
 }
 
-// ReuseMetadataID uses the event's Metadata.ID as the outbox row ID. This gives
-// the row and the event a single identity end to end.
+// ReuseMetadataID is the default RowIDGenerator. It copies the event's
+// Metadata.ID into the outbox row ID, giving the row and the event a single
+// identity end to end: the store's event_id column equals the published
+// Metadata.ID. (The relayed event's id always comes from the persisted
+// metadata document, under any generator; this default additionally makes the
+// row key match it.)
 //
-// The relay orders pending rows by create_time, not by ID, so reusing the event
-// ID does not affect delivery ordering regardless of its format. The only
-// requirement is that Metadata.ID be unique (it is the row's primary key).
+// Because ids minted by the eventbus default generator are UUIDs (CloudEvents
+// itself allows any unique string — the TiDB store additionally requires
+// UUIDs and rejects others loudly at publish), the row-identity writes stay
+// scattered: MongoDB's _id and TiDB's uk_outbox_event unique-INDEX entries
+// land across ranges the way any fresh UUID would. (TiDB's clustered primary
+// key is a separate AUTO_INCREMENT id whose tail hotspot is a deliberate,
+// documented trade in the migration header — the row ID choice neither causes
+// nor cures it.)
+//
+// Delivery order is the log order (assigned seq for the TiDB runtime, oplog
+// commit order for the MongoDB runtime), never the row ID, so the ID format
+// does not affect ordering. The only requirement is that Metadata.ID be
+// unique and non-empty (it is the row's identity: MongoDB's _id, TiDB's unique
+// event_id). Sender.Send rejects an empty ID for every generator — see there
+// for why neither backend reports it usefully on its own.
 func ReuseMetadataID(md *event.Metadata) (string, error) {
 	return md.ID, nil
 }
 
 type senderOptions struct {
-	idGenerator IDGenerator
+	idGenerator RowIDGenerator
 }
 
 func defaultSenderOptions() senderOptions {
@@ -54,11 +78,19 @@ func defaultSenderOptions() senderOptions {
 // SenderOption configures an outbox Sender.
 type SenderOption func(opts *senderOptions)
 
-// WithIDGenerator sets the generator used to produce the outbox row ID.
-// Defaults to GenerateV4. Use ReuseMetadataID to key rows on the event ID.
-func WithIDGenerator(gen IDGenerator) SenderOption {
+// WithRowIDGenerator sets the generator used to produce the outbox row ID.
+// Defaults to ReuseMetadataID. Use GenerateUUIDv4 to key rows on a freshly minted
+// UUID independent of the event's Metadata.ID. A nil gen is ignored, keeping
+// the default (the With* nil-guard convention — installing nil would only
+// mint a panic at the first Send, inside the caller's business transaction).
+//
+// Note: the TiDB store requires UUID IDs; the MongoDB store accepts any
+// string. A custom RowIDGenerator used with the TiDB backend must emit UUIDs.
+func WithRowIDGenerator(gen RowIDGenerator) SenderOption {
 	return func(opts *senderOptions) {
-		opts.idGenerator = gen
+		if gen != nil {
+			opts.idGenerator = gen
+		}
 	}
 }
 
@@ -88,16 +120,36 @@ func NewSender(store Store, opts ...SenderOption) *Sender {
 // Send persists the event to the outbox store.
 // This should be called within the same transaction as business operations.
 func (s *Sender) Send(ctx context.Context, metadata *event.Metadata, data []byte) error {
+	if metadata == nil {
+		return errors.New("outbox: metadata must not be nil")
+	}
+
 	id, err := s.options.idGenerator(metadata)
 	if err != nil {
 		return err
+	}
+	// An empty row ID is rejected HERE, for every generator, because neither
+	// backend reports it usefully. MongoDB accepts "" as an _id, so the first
+	// such publish succeeds and every later one fails with a duplicate-key error
+	// that names the index, not the cause. TiDB fails it at uuid.Parse, whose
+	// message describes a malformed UUID rather than a missing ID. Both surface
+	// inside the caller's business transaction, rolling back the whole request.
+	//
+	// Under the default ReuseMetadataID this means Metadata.ID was empty: the
+	// eventbus mints one when the caller does not, so it is reachable mainly by
+	// hand-built metadata passed straight to Send.
+	if id == "" {
+		return errors.New("outbox: row ID generator returned an empty ID " +
+			"(the row's identity: MongoDB's _id, TiDB's unique event_id) — under the default " +
+			"ReuseMetadataID this means Metadata.ID was empty; set it, or pass " +
+			"outbox.WithRowIDGenerator(outbox.GenerateUUIDv4) to mint row IDs independently")
 	}
 
 	msg := &Message{
 		ID:         id,
 		Metadata:   metadata,
 		Data:       data,
-		CreateTime: time.Now(),
+		CreateTime: time.Now().UTC(),
 	}
 
 	return s.store.CreateOutboxMessage(ctx, msg)

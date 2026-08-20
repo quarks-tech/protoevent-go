@@ -1,7 +1,10 @@
-go 1.25.3
+go 1.26.5
 
 use (
 	.
 	./pkg/transport/outbox
+	./pkg/transport/outbox/mongodb
+	./pkg/transport/outbox/tidb
 	./pkg/transport/rabbitmq
+	./test/e2e
 )

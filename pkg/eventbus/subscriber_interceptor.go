@@ -6,9 +6,9 @@ import (
 	"github.com/quarks-tech/protoevent-go/pkg/event"
 )
 
-type Handler func(ctx context.Context, event interface{}) error
+type Handler func(ctx context.Context, e any) error
 
-type SubscriberInterceptor func(ctx context.Context, md *event.Metadata, event interface{}, handler Handler) error
+type SubscriberInterceptor func(ctx context.Context, md *event.Metadata, e any, handler Handler) error
 
 func WithSubscriberInterceptor(f SubscriberInterceptor) SubscriberOption {
 	return func(o *subscriberOptions) {
@@ -31,11 +31,12 @@ func chainSubscriberInterceptors(s *Subscriber) {
 	}
 
 	var chainedInt SubscriberInterceptor
-	if len(interceptors) == 0 {
+	switch len(interceptors) {
+	case 0:
 		chainedInt = nil
-	} else if len(interceptors) == 1 {
+	case 1:
 		chainedInt = interceptors[0]
-	} else {
+	default:
 		chainedInt = chainInterceptors(interceptors)
 	}
 
@@ -43,16 +44,22 @@ func chainSubscriberInterceptors(s *Subscriber) {
 }
 
 func chainInterceptors(interceptors []SubscriberInterceptor) SubscriberInterceptor {
-	return func(ctx context.Context, md *event.Metadata, event interface{}, handler Handler) error {
-		var i int
-		var next Handler
-		next = func(ctx context.Context, event interface{}) error {
-			if i == len(interceptors)-1 {
-				return interceptors[i](ctx, md, event, handler)
-			}
-			i++
-			return interceptors[i-1](ctx, md, event, next)
-		}
-		return next(ctx, event)
+	return func(ctx context.Context, md *event.Metadata, e any, handler Handler) error {
+		return interceptors[0](ctx, md, e, chainHandler(interceptors, 0, md, handler))
+	}
+}
+
+// chainHandler builds interceptor curr's next-Handler with an IMMUTABLE
+// position — each nesting level owns its index (mirroring the publisher
+// chain's chainInvoker), so an interceptor that calls next more than once (a
+// retry interceptor) re-runs the SAME downstream chain. The previous
+// closure-shared mutable index made the second pass skip every interceptor
+// between the caller and the tail.
+func chainHandler(interceptors []SubscriberInterceptor, curr int, md *event.Metadata, finalHandler Handler) Handler {
+	if curr == len(interceptors)-1 {
+		return finalHandler
+	}
+	return func(ctx context.Context, e any) error {
+		return interceptors[curr+1](ctx, md, e, chainHandler(interceptors, curr+1, md, finalHandler))
 	}
 }

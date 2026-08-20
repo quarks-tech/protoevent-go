@@ -1,0 +1,637 @@
+// Package mongodb is the MongoDB-backed outbox store: a session-scoped publish
+// Store (NewStore) that commits outbox rows atomically with business writes,
+// and a pool-scoped RelayStore (NewRelayStore) implementing the change-stream
+// relay contracts (stream.Store + relay.LeaderStore) plus leader election and
+// the retention TTL index.
+package mongodb
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+
+	"github.com/quarks-tech/protoevent-go/pkg/transport/outbox"
+)
+
+// The three collections of one outbox instance. One prefix applies to all of
+// them as a unit (WithCollectionPrefix): an outbox instance IS the
+// three-collection set — prefixing them together gives each instance its own
+// log, resume tokens, and leader locks, so several independent outboxes can
+// coexist in one database. (Unlike TiDB, a separate *mongo.Database per
+// outbox also works — session transactions span databases within a cluster —
+// so the prefix is a convenience, not the only path.)
+const (
+	baseOutboxCollection  = "outbox_messages"
+	baseOffsetsCollection = "outbox_offsets"
+	baseLockCollection    = "relay_locks"
+
+	// defaultRetention is the default outbox TTL; MUST exceed the oplog window
+	// (see the README's resume-token-cliff sizing rule). Override with WithRetention.
+	defaultRetention = 7 * 24 * time.Hour
+
+	// indexOptionsConflictCode is the MongoDB server error code for
+	// IndexOptionsConflict: an index with the same keys already exists with
+	// different options (e.g. a different expireAfterSeconds).
+	indexOptionsConflictCode = 85
+)
+
+// config carries construction-time configuration shared by NewStore and
+// NewRelayStore. Option is func(*config), not func(*Store): the underlying
+// type of an exported func type is API, and binding options to one concrete
+// store type would weld the option set to it forever (the tidb module uses the
+// same shape).
+type config struct {
+	prefix    string
+	retention time.Duration
+}
+
+// Option configures a Store / RelayStore at construction time.
+type Option func(*config)
+
+// WithCollectionPrefix names this outbox instance: all three collections get
+// the prefix, letting several independent outboxes coexist in one database,
+// each with its own commit order, retention, and consumer groups. The publish
+// Store and the RelayStore of one instance MUST use the same prefix.
+//
+// The rule is outbox.ValidateInstancePrefix, shared with the TiDB store's
+// table prefix: kept a conservative identifier fragment even though MongoDB
+// itself allows more, so one prefix value works verbatim across both backends.
+//
+// An invalid prefix panics: it is static developer configuration, not runtime
+// input — the regexp.MustCompile convention for programmer error.
+func WithCollectionPrefix(prefix string) Option {
+	if err := outbox.ValidateInstancePrefix("collection prefix", prefix); err != nil {
+		panic(err)
+	}
+	return func(c *config) { c.prefix = prefix }
+}
+
+// WithRetention sets the outbox TTL applied by RelayStore.EnsureIndexes. It is
+// meaningful only on NewRelayStore: the publish Store creates no indexes.
+// stream.Relay.Run calls EnsureIndexes for you at start (the RelayStore is a
+// stream.IndexEnsurer), so a relayed outbox gets its TTL without a separate
+// call; a deployment that creates no relay — or whose relay credentials cannot
+// issue DDL, where Run only warns — must still call it explicitly, because the
+// option alone changes nothing.
+// Default 7 days; it MUST exceed the oplog window
+// (see the README's resume-token-cliff sizing rule). The value is stored as
+// given — a non-positive or fractional-second d is rejected loudly by
+// EnsureIndexes rather than silently ignored here: a zero from a miscomputed
+// config field is a caller bug, not a request for the default (unlike a nil
+// Logger/Observer, which has exactly one sensible meaning).
+//
+// Retention here is a TTL index, pruning independently of delivery; the TiDB
+// runtime's sequence.WithRetention is a delivery-gated sweep instead — same
+// knob name, deliberately different mechanism per backend.
+//
+// CLOCK CAVEAT: the TTL anchor is create_time, stamped by the PUBLISHER's
+// clock at Send (MongoDB inserts have no server-side default). Publisher
+// clock sync is therefore a retention input: a clock far ahead pins rows past
+// the window; a clock behind by more than the retention lets the TTL monitor
+// reap rows early. Early reaping cannot lose undelivered events in normal
+// operation (the change stream reads the OPLOG — a TTL delete does not
+// remove the insert event a resuming relay replays), but it CAN shrink the
+// break-glass re-read window after ErrHistoryLost, which reads the
+// collection. Keep publisher clocks NTP-synced and the window comfortably
+// above the oplog window.
+//
+// Operational caveat: MongoDB refuses to re-create an existing TTL index with
+// a different expireAfterSeconds (IndexOptionsConflict) — changing retention
+// on an existing collection requires a collMod on the index, not a restart
+// with a new option value. EnsureIndexes surfaces that error with a hint.
+func WithRetention(d time.Duration) Option {
+	return func(c *config) { c.retention = d }
+}
+
+// outboxDoc is one insert-only event envelope. Metadata is JSON bytes so the
+// CloudEvents url.URL / Extensions map round-trip cleanly.
+type outboxDoc struct {
+	ID         string    `bson:"_id"`
+	Metadata   []byte    `bson:"metadata"`
+	Data       []byte    `bson:"data"`
+	CreateTime time.Time `bson:"create_time"`
+}
+
+// offsetDoc is one consumer group's resume-token store. ResumeToken is stored
+// as BSON binary (not an embedded document): the token is an opaque byte
+// blob to this store, and only production resume tokens happen to also be
+// valid BSON documents — storing as bson.Raw would reject arbitrary bytes.
+type offsetDoc struct {
+	Name        string    `bson:"_id"`
+	ResumeToken []byte    `bson:"resume_token"`
+	CommitTime  time.Time `bson:"cluster_time"`
+	UpdateTime  time.Time `bson:"update_time"`
+}
+
+// Store is the session-scoped publish store: it implements only
+// CreateOutboxMessage, over the *mongo.Session bound with WithSession (or,
+// usually, WithTransaction), so the outbox row commits atomically with the
+// caller's business writes. Everything the relay needs — resume tokens, the
+// change stream, leader election, the TTL index — lives on RelayStore instead;
+// see its doc for why that separation is load-bearing rather than cosmetic.
+type Store struct {
+	db *mongo.Database
+
+	// sess, when non-nil, is the transaction the store is bound to (see
+	// WithSession): CreateOutboxMessage joins it as an explicit value instead
+	// of relying on the caller to thread the driver's session context.
+	sess *mongo.Session
+
+	collMessages string
+}
+
+// NewStore creates the publish-side Store over db. Bind it to a transaction
+// with WithTransaction (preferred) or WithSession before publishing: an outbox
+// row that commits independently of the business write is a phantom event, so
+// a transactionless publish is rejected rather than written.
+//
+// For relay use (resume tokens, the change stream, leader election, and the
+// TTL index) construct a RelayStore with NewRelayStore — those are deliberately
+// not methods on this type.
+func NewStore(db *mongo.Database, opts ...Option) *Store {
+	c := config{retention: defaultRetention}
+	for _, opt := range opts {
+		opt(&c)
+	}
+	return &Store{
+		db:           db,
+		collMessages: c.prefix + baseOutboxCollection,
+	}
+}
+
+var _ outbox.Store = (*Store)(nil)
+
+// WithSession returns a copy of the Store bound to sess: CreateOutboxMessage
+// joins sess's transaction as an explicit value — mirroring the TiDB store's
+// tx-scoped Runner — instead of requiring the caller to thread the driver's
+// session context. Bind inside Session.WithTransaction, or use
+// Store.WithTransaction, which does both. A nil sess returns the store
+// unchanged (unbound); the publish-time guard then fails constructively.
+//
+// The bound copy is transaction-scoped: like the session itself it is not
+// safe for concurrent use. The unbound original remains pool-scoped and
+// shareable.
+func (s *Store) WithSession(sess *mongo.Session) *Store {
+	if sess == nil {
+		return s
+	}
+	bound := *s
+	bound.sess = sess
+	return &bound
+}
+
+// WithTransaction runs fn inside a MongoDB transaction and hands it a
+// session-bound *Store: the transaction is a value in fn's hands, and fn's
+// ctx is the driver's session context, so the caller's own writes join the
+// same transaction with no extra wiring. Retry semantics (transient errors,
+// unknown commit results) are the driver's own Session.WithTransaction.
+//
+// An AMBIENT transaction is JOINED, never shadowed. MongoDB has no nested
+// transactions, so starting a second session here — which is what this used to
+// do unconditionally — would commit the outbox row on its own the moment fn
+// returned, independently of the caller's business write. If the outer
+// transaction then aborted, the business row was never written while the event
+// WAS relayed: the phantom event this whole store exists to prevent, produced by
+// the very helper whose name promises atomicity. It is reachable through this
+// package alone — `st.WithTransaction(sc, …)` inside a caller's own
+// sess.WithTransaction, or on the *Store handed to an outer callback — and
+// CreateOutboxMessage's competing-session guard cannot see it, because by then
+// the ctx session IS the new one.
+//
+// So the session is resolved first, in the same order CreateOutboxMessage
+// resolves it, and for the same reason: the driver takes the session from the
+// CONTEXT, so the transaction can legitimately arrive either as a bound value or
+// through the ctx, and two DIFFERENT ones must never be reconciled by silently
+// picking one. When the resolved session already has a transaction running, fn
+// runs inside it — committing or aborting stays the outer owner's call, so an
+// error from fn propagates for that owner to act on.
+func (s *Store) WithTransaction(ctx context.Context, fn func(ctx context.Context, tx *Store) error) error {
+	ctxSess := mongo.SessionFromContext(ctx)
+	switch {
+	case s.sess != nil:
+		if ctxSess != nil && ctxSess != s.sess {
+			return errors.New("outbox: with transaction: ctx carries a different session than the store is bound to; " +
+				"use one transaction, not two")
+		}
+
+		return s.runInSession(ctx, s.sess, fn)
+	case ctxSess != nil:
+		return s.runInSession(ctx, ctxSess, fn)
+	}
+
+	sess, err := s.db.Client().StartSession()
+	if err != nil {
+		return fmt.Errorf("outbox: start session: %w", err)
+	}
+	defer sess.EndSession(ctx)
+
+	return s.runInSession(ctx, sess, fn)
+}
+
+// runInSession runs fn on sess: joining the transaction already running on it,
+// or starting one when there is none. Splitting it out keeps the three arms of
+// WithTransaction's session resolution to one line each.
+func (s *Store) runInSession(ctx context.Context, sess *mongo.Session, fn func(ctx context.Context, tx *Store) error) error {
+	if sess.TransactionRunning() {
+		return fn(mongo.NewSessionContext(ctx, sess), s.WithSession(sess))
+	}
+
+	_, err := sess.WithTransaction(ctx, func(sc context.Context) (any, error) {
+		return nil, fn(sc, s.WithSession(sess))
+	})
+
+	return err
+}
+
+// CreateOutboxMessage inserts an unsequenced event envelope. It MUST run
+// inside a transaction: either on a session-bound store (WithSession /
+// WithTransaction — the transaction as an explicit value, preferred) or with
+// a ctx carrying a running session (mongo.Session.WithTransaction). An
+// outbox row that commits independently of the business write is a phantom
+// event, so the unbound-and-transactionless case is rejected loudly — the
+// same fail-loud stance the TiDB store takes for autocommit publishes. A
+// bound store additionally rejects a ctx carrying a DIFFERENT session rather
+// than silently picking one of two transactions.
+//
+// msg.ID must be non-empty (it is the row's _id; an empty _id would make the
+// SECOND publish fail with a far-from-cause duplicate-key error). Unlike the
+// TiDB store, which validates UUIDs, this store deliberately accepts any
+// non-empty string: MongoDB's _id has no format requirement.
+//
+// msg.CreateTime is persisted as stamped (the publisher's clock): it anchors
+// the TTL index, so publisher clock sync matters — see WithRetention's clock
+// caveat. (The TiDB store DB-stamps create_time instead; MongoDB inserts
+// have no server-side default, and the insert-only + duplicate-key contract
+// rules out the upsert tricks that could fetch one.)
+func (s *Store) CreateOutboxMessage(ctx context.Context, msg *outbox.Message) error {
+	if msg.ID == "" {
+		return errors.New("outbox: message ID is empty")
+	}
+	// Shared write-side envelope rules (nil metadata, zero Metadata.Time). The
+	// zero-Time rejection is the write half of outbox.UnmarshalMetadata's
+	// poison rule: the read side classifies zero-Time metadata as poison (the
+	// marker of a JSON-valid-but-empty document), so enforcing it here keeps a
+	// sloppy direct-Sender publish from planting rows the relay would park.
+	if err := outbox.ValidateMetadata(msg.Metadata); err != nil {
+		return err
+	}
+	if msg.CreateTime.IsZero() {
+		// create_time is the TTL anchor: a zero value (0001-01-01) is already
+		// past every retention window, so the TTL monitor would silently reap
+		// the row on its next pass — an event lost before the relay drains it.
+		return errors.New("outbox: message create time is zero; set Message.CreateTime before publishing")
+	}
+	// Which session carries the insert. This survives the publish/relay type
+	// split because it is not about relay-vs-publish at all: the driver takes
+	// the session from the CONTEXT, so a publish store can legitimately be
+	// handed its transaction either as a bound value or through the ctx, and
+	// the two must never be reconciled by silently picking one.
+	ctxSess := mongo.SessionFromContext(ctx)
+	switch {
+	case s.sess != nil:
+		// Bound store (WithSession / WithTransaction): the transaction is an
+		// explicit value — join it regardless of the ctx, but never silently
+		// pick between two competing transactions.
+		if ctxSess != nil && ctxSess != s.sess {
+			return errors.New("outbox: create message: ctx carries a different session than the store is bound to; " +
+				"use one transaction, not two")
+		}
+		if !s.sess.TransactionRunning() {
+			return errors.New("outbox: create message: bound session has no running transaction; " +
+				"bind inside Session.WithTransaction, or use Store.WithTransaction")
+		}
+		ctx = mongo.NewSessionContext(ctx, s.sess)
+	case ctxSess == nil || !ctxSess.TransactionRunning():
+		return errors.New("outbox: create message: no transaction; " +
+			"use Store.WithTransaction (or WithSession inside mongo.Session.WithTransaction) — " +
+			"an outbox row that commits independently of the business write is a phantom event")
+	}
+	meta, err := outbox.MarshalMetadata(msg.Metadata)
+	if err != nil {
+		return err
+	}
+	doc := outboxDoc{ID: msg.ID, Metadata: meta, Data: msg.Data, CreateTime: msg.CreateTime}
+	if _, err := s.db.Collection(s.collMessages).InsertOne(ctx, doc); err != nil {
+		return fmt.Errorf("outbox: insert: %w", err)
+	}
+	return nil
+}
+
+// RelayStore is the pool-scoped relay store: everything the change-stream
+// relay runtime needs — resume tokens (LoadToken / SaveToken / DeleteToken),
+// the change stream itself (Watch), leader election, and the retention TTL
+// index (EnsureIndexes). It carries NO session, so every one of its calls runs
+// on the pool, outside any caller transaction.
+//
+// That is the point of the split, and it is structural rather than cosmetic.
+// The driver takes the session from the CONTEXT, not from the store, so while
+// one type carried both paths any relay-side method reached with a
+// transaction's session ctx silently ENLISTED in the caller's business
+// transaction. The cost was paid in the caller's request path: an
+// EnsureIndexes issues createIndexes inside a multi-document transaction,
+// which the server rejects outright — aborting the business write with an
+// error naming index creation rather than the misuse. A SaveToken or
+// TryAcquireLeaderLock was worse: it succeeded, then rolled back with the
+// business write, so a persisted resume token or an acquired lease silently
+// disappeared. A per-method ctx guard used to reject that; with the split the
+// mistake no longer typechecks, because the value the publish path hands you
+// (*Store — see WithTransaction) has no relay methods at all.
+//
+// RelayStore deliberately does NOT implement outbox.Store, and *Store must not
+// be embedded here: the promoted CreateOutboxMessage would make
+// outbox.NewSender(relayStore) compile and then publish rows that commit
+// independently of any business write.
+type RelayStore struct {
+	db        *mongo.Database
+	retention time.Duration
+
+	collMessages string
+	collOffsets  string
+	collLocks    string
+}
+
+// coll returns one of this store's collections with the relay's OWN durability
+// settings pinned, rather than whatever the caller configured on its client.
+//
+// The relay store makes two decisions on behalf of the entire deployment — who
+// leads, and where a consumer group resumes — and both must be correct under the
+// failures they exist to survive. Inheriting the application's settings put them at
+// the mercy of choices made for unrelated reasons:
+//
+//   - w:1, a normal throughput choice for business writes, lets a partitioned
+//     primary acknowledge a lock write locally. That relay believes it leads and
+//     drains, while the majority side elects a primary that never saw the write and
+//     hands the lock to a standby: two leaders over one log. The same setting lets
+//     an acknowledged SaveToken be rolled back while the relay has already reported
+//     the position persisted.
+//   - readPreference=secondaryPreferred, a normal read-heavy default, makes
+//     LoadToken read the resume position from a lagging secondary, so every reopen
+//     redelivers the lag window — and once the secondary trails past the oplog
+//     window, resumeAfter is rejected as ChangeStreamHistoryLost, which this module
+//     treats as FATAL and which sends an operator into a break-glass runbook whose
+//     restart-at-"now" step opens a real loss window. All from a healthy stream.
+//
+// Majority on both halves and reads from the primary make these operations depend
+// only on the deployment being a replica set, which NewRelayStore already requires.
+// The publish Store deliberately does NOT do this: its write joins the caller's
+// business transaction, whose concerns are the caller's to choose.
+func (rs *RelayStore) coll(name string) *mongo.Collection {
+	return rs.db.Collection(name, options.Collection().
+		SetWriteConcern(writeconcern.Majority()).
+		SetReadConcern(readconcern.Majority()).
+		SetReadPreference(readpref.Primary()))
+}
+
+// NewRelayStore creates the relay-side store over db. Use the same
+// WithCollectionPrefix as the instance's publish Store (NewStore) — the two
+// sides address one three-collection outbox instance — and WithRetention to
+// tune the TTL index EnsureIndexes creates (default 7 days).
+//
+// db must address a replica set: change streams (Watch) and the publish path's
+// multi-document transactions both require one.
+func NewRelayStore(db *mongo.Database, opts ...Option) *RelayStore {
+	c := config{retention: defaultRetention}
+	for _, opt := range opts {
+		opt(&c)
+	}
+	return &RelayStore{
+		db:           db,
+		retention:    c.retention,
+		collMessages: c.prefix + baseOutboxCollection,
+		collOffsets:  c.prefix + baseOffsetsCollection,
+		collLocks:    c.prefix + baseLockCollection,
+	}
+}
+
+// The compile-time capability pins for *RelayStore live in watch.go, next to
+// the Watch implementation that makes it a stream.Store — one block, so a
+// reader cannot find a partial list and take it for the whole set.
+
+// EnsureIndexes creates the TTL index on outbox.create_time. Idempotent for an
+// unchanged retention; when the index already exists with a DIFFERENT
+// expireAfterSeconds the server rejects the create (IndexOptionsConflict) and
+// the error is surfaced with a collMod hint rather than masked — silently
+// keeping the old TTL would defeat the point of changing WithRetention.
+//
+// The retention is validated here rather than in WithRetention so the failure
+// is loud: expireAfterSeconds is an int32 of whole seconds, and a sub-second
+// retention would truncate to 0 — a TTL that expires every outbox row as soon
+// as create_time passes, silently losing events the relay hasn't drained.
+// Fractional seconds are rejected outright rather than silently truncated
+// (1500ms would otherwise become a 1s TTL that fires earlier than configured).
+func (rs *RelayStore) EnsureIndexes(ctx context.Context) error {
+	if rs.retention%time.Second != 0 {
+		return fmt.Errorf("outbox: ensure ttl index: retention %v is not a whole number of seconds (expireAfterSeconds is int32 seconds; truncating would expire rows earlier than configured)", rs.retention)
+	}
+	secs := int64(rs.retention / time.Second)
+	if secs < 1 || secs > math.MaxInt32 {
+		return fmt.Errorf("outbox: ensure ttl index: retention %v outside the TTL range [1s, ~68y]", rs.retention)
+	}
+	_, err := rs.coll(rs.collMessages).Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "create_time", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(int32(secs)),
+	})
+	if err != nil {
+		if se, ok := errors.AsType[mongo.ServerError](err); ok && se.HasErrorCode(indexOptionsConflictCode) {
+			return fmt.Errorf("outbox: ensure ttl index: retention differs from the existing TTL index; "+
+				"changing retention on an existing collection requires collMod on the create_time index, "+
+				"not index re-creation: %w", err)
+		}
+		return fmt.Errorf("outbox: ensure ttl index: %w", err)
+	}
+	return nil
+}
+
+// LoadToken returns the consumer group's resume token ("" if none) as a string
+// and the anchor clusterTime. The stored bytes are carried verbatim.
+func (rs *RelayStore) LoadToken(ctx context.Context, name string) (string, time.Time, error) {
+	var doc offsetDoc
+	err := rs.coll(rs.collOffsets).FindOne(ctx, bson.M{"_id": name}).Decode(&doc)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return "", time.Time{}, nil
+	}
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("outbox: load token: %w", err)
+	}
+	return string(doc.ResumeToken), doc.CommitTime, nil
+}
+
+// SaveToken upserts the consumer group's resume token + clusterTime. token is
+// the opaque resume token as a string; it is stored as BSON binary bytes.
+//
+// token must be non-empty: LoadToken maps "" to "no stored position", so an
+// empty-token save would ERASE the group's persisted position (the next Watch
+// restarts "at now", silently skipping every event in between). The store
+// rejects it with an error rather than trusting every caller to guard.
+//
+// The save is monotone in the token's server-assigned position (per the
+// stream.Store contract). The ordering key is the token's own KeyString
+// payload (token_key, see tokenKeyFromString): KeyStrings compare bytewise in
+// server order, carrying the FULL (T, I) timestamp plus document position —
+// so a stale leader saving an EARLIER token within the same clusterTime
+// second is rejected too, a tie the coarse second-granularity cluster_time
+// anchor cannot see. When the incoming token is not KeyString-shaped (never
+// the case for real MongoDB resume tokens), the filter falls back to the
+// coarse monotone-in-clusterTime guard and clears token_key so the row
+// degrades coherently.
+//
+// In both modes a newer stored row makes the filter match nothing and the
+// upsert attempts an insert, which hits the _id unique index — that
+// duplicate-key error MEANS "stored position is newer" and the stale save is
+// skipped, reported as persisted=false so the caller does not advance its
+// local trackers past a position that was never stored. A stored row LACKING
+// the ordering fields (never written by this package; external tampering,
+// manual repair, or rows written before token_key existed) also matches, so a
+// legacy/damaged row is healed by the next save instead of freezing the token
+// forever behind the same duplicate-key path.
+func (rs *RelayStore) SaveToken(ctx context.Context, name, token string, clusterTime time.Time) (bool, error) {
+	if token == "" {
+		return false, fmt.Errorf("outbox: save token: empty resume token for group %q; an empty token is never a valid position (it would erase the stored one)", name)
+	}
+	set := bson.M{
+		"resume_token": []byte(token),
+		"cluster_time": clusterTime.UTC(),
+		"update_time":  time.Now().UTC(),
+	}
+	update := bson.M{"$set": set}
+	var guard bson.A
+	if key, ok := tokenKeyFromString(token); ok {
+		set["token_key"] = key
+		guard = bson.A{
+			// Fine-grained: full token order, covers same-second ties.
+			bson.M{"token_key": bson.M{"$lte": key}},
+			// Rows without token_key keep the coarse guard while upgrading,
+			// so a stale keyed save cannot slip in through the $exists hole.
+			bson.M{"token_key": bson.M{"$exists": false}, "cluster_time": bson.M{"$lte": clusterTime.UTC()}},
+			bson.M{"token_key": bson.M{"$exists": false}, "cluster_time": bson.M{"$exists": false}},
+		}
+	} else {
+		update["$unset"] = bson.M{"token_key": ""}
+		guard = bson.A{
+			bson.M{"cluster_time": bson.M{"$lte": clusterTime.UTC()}},
+			bson.M{"cluster_time": bson.M{"$exists": false}},
+		}
+	}
+	_, err := rs.coll(rs.collOffsets).UpdateOne(ctx,
+		bson.M{"_id": name, "$or": guard},
+		update,
+		options.UpdateOne().SetUpsert(true),
+	)
+	if mongo.IsDuplicateKeyError(err) {
+		return false, nil // stored row carries a newer position; stale save skipped
+	}
+	if err != nil {
+		return false, fmt.Errorf("outbox: save token: %w", err)
+	}
+	return true, nil
+}
+
+// DeleteToken removes the consumer group's stored resume token. It is the
+// reset step of the ErrHistoryLost / ErrInvalidated break-glass procedures
+// (see the README's runbook: after a token falls off the oplog or the
+// collection is invalidated, the stored position is unusable — deleting it
+// makes the next Watch start at "now", after which the runbook's re-read
+// covers the gap) and the decommissioning step for a retired consumer group
+// (a retired group's token row otherwise alerts on committed-token age
+// forever). Deleting a missing token is a no-op.
+func (rs *RelayStore) DeleteToken(ctx context.Context, name string) error {
+	if _, err := rs.coll(rs.collOffsets).DeleteOne(ctx, bson.M{"_id": name}); err != nil {
+		return fmt.Errorf("outbox: delete token: %w", err)
+	}
+	return nil
+}
+
+// TryAcquireLeaderLock acquires or renews the lock via a conditional
+// aggregation-pipeline upsert. Both the expiry decision and the new deadline
+// use the SERVER clock ($$NOW): comparing against a client-side time.Now()
+// would let a standby with a fast clock steal a live lease (dual leader) under
+// clock skew between relay instances.
+func (rs *RelayStore) TryAcquireLeaderLock(ctx context.Context, name, holderID string, ttl time.Duration) (bool, error) {
+	// canTake: the caller already holds the lock (renewal) or the lease expired
+	// per the server clock. On a fresh upsert both fields are missing; $ifNull
+	// maps the missing expire_time to the epoch, which is < $$NOW, so the
+	// pipeline claims the new document.
+	canTake := bson.D{{Key: "$or", Value: bson.A{
+		bson.D{{Key: "$eq", Value: bson.A{"$holder_id", holderID}}},
+		bson.D{{Key: "$lt", Value: bson.A{
+			bson.D{{Key: "$ifNull", Value: bson.A{"$expire_time", time.Unix(0, 0).UTC()}}},
+			"$$NOW",
+		}}},
+	}}}
+	// _id is intentionally not written by the pipeline: the filter already pins
+	// it (and the upsert path copies it from the filter), so setting it too is
+	// redundant (and would be fragile if it ever diverged). $$NOW is a Date;
+	// expire_time stays a Date, with ttl added as milliseconds.
+	// A sub-millisecond ttl truncates to 0ms — a lease born expired (silent
+	// dual-leader churn) — so clamp to at least 1ms.
+	millis := max(ttl.Milliseconds(), 1)
+	update := mongo.Pipeline{
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "holder_id", Value: bson.D{{Key: "$cond", Value: bson.A{canTake, holderID, "$holder_id"}}}},
+			{Key: "expire_time", Value: bson.D{{Key: "$cond", Value: bson.A{
+				canTake,
+				bson.D{{Key: "$add", Value: bson.A{"$$NOW", millis}}},
+				"$expire_time",
+			}}}},
+		}}},
+	}
+	var doc struct {
+		Holder string `bson:"holder_id"`
+	}
+	err := rs.coll(rs.collLocks).FindOneAndUpdate(ctx,
+		bson.M{"_id": name},
+		update,
+		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
+	).Decode(&doc)
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return false, nil // lost a concurrent upsert race; another instance holds the lock
+		}
+		return false, fmt.Errorf("outbox: acquire lock: %w", err)
+	}
+	// The pipeline always "succeeds"; whether we lead is decided by whose
+	// holder_id survived the conditional write.
+	return doc.Holder == holderID, nil
+}
+
+// ReleaseLeaderLock drops the lock if still held by holderID (graceful shutdown).
+func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID string) error {
+	_, err := rs.coll(rs.collLocks).DeleteOne(ctx, bson.M{"_id": name, "holder_id": holderID})
+	if err != nil {
+		return fmt.Errorf("outbox: release lock: %w", err)
+	}
+	return nil
+}
+
+// decodeMessage rebuilds an outbox.Message from a stored outboxDoc, reversing
+// CreateOutboxMessage's outbox.MarshalMetadata of the CloudEvents metadata.
+// Its only caller is mongoStream.Next (watch.go).
+//
+// The poison classification (JSON null, and the JSON-valid-but-empty "{}"
+// whose zero Metadata.Time the write side rejects) lives in
+// outbox.UnmarshalMetadata: it is ONE contract about what an outbox row means,
+// shared with the TiDB store so two backends can never disagree about whether
+// the same row is deliverable or poison. Its errors wrap
+// outbox.ErrPoisonEnvelope; Next re-wraps them in *stream.DecodeError with the
+// event's resume position.
+func decodeMessage(doc outboxDoc) (*outbox.Message, error) {
+	md, err := outbox.UnmarshalMetadata(doc.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	return &outbox.Message{
+		ID:         doc.ID,
+		Metadata:   md,
+		Data:       doc.Data,
+		CreateTime: doc.CreateTime,
+	}, nil
+}
