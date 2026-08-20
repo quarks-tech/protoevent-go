@@ -274,6 +274,63 @@ receiver := parkinglot.NewReceiver(client,
 )
 ```
 
+#### Receiver defaults: what a failing handler costs the queue
+
+A handler that returns a plain error gets its delivery **requeued** (not
+discarded), and the requeue is **paced** — the delay starts at 200ms, doubles
+with the quorum queue's `x-delivery-count`, and caps at 5s. Both halves matter:
+an unpaced requeue loop burns a quorum queue's whole `x-delivery-limit` at broker
+speed (measured: 21 attempts in 13.9ms) and the broker then discards the event,
+while pacing turns that budget into a window of about 76s for the fault to clear.
+
+The cost is that **the delay stops the whole consumer, not just that delivery.**
+Deliveries are processed one at a time on a single goroutine — prefetch buys
+buffering, never concurrency — so while one message is being paced, the consumer
+clears `prefetch - 1` others per delay. The defaults are chosen as a pair for
+that reason:
+
+| Option | Default | Why this value |
+| --- | --- | --- |
+| `WithPrefetchCount` | 16 | Sets how many messages get through per pacing delay (`prefetch - 1`). At the old default of 3 a single permanently-failing message dropped a 4264 msg/s consumer to 0.13 msg/s for the message's whole delivery budget. |
+| `WithRequeueBackoff` | 200ms → 5s | The cap is what everything behind the failing message pays. 5s keeps the 20-delivery retry budget at ~76s while tripling throughput during an episode. |
+
+Retune them together — raising the cap or lowering the prefetch reverses the
+trade. If a persistently-failing message must not stall the queue **at all**,
+this receiver is the wrong shape: use `parkinglot.Receiver` above, where the wait
+is served by a broker-side queue TTL instead of by the consume goroutine. A
+permanently unprocessable event is a separate case and is never paced — return
+`eventbus.NewUnprocessableEventError(err)` and it is rejected immediately
+(dead-lettered under `WithDLX`).
+
+#### High-throughput publishing (`SendBatch`)
+
+`rabbitmq.Sender` implements the optional `eventbus.BatchSender` capability:
+publish a run of events on one channel and wait for their confirms **together**,
+instead of paying a full publish-and-confirm round trip per event.
+
+```go
+sent, err := sender.SendBatch(ctx, []eventbus.Outgoing{
+    {Metadata: md1, Data: data1},
+    {Metadata: md2, Data: data2},
+})
+// sent is the CONTIGUOUS confirmed prefix; err describes msgs[sent] specifically.
+// err == nil if and only if sent == len(msgs).
+```
+
+The confirm is ~99% of a send (measured: 86,139 events/s with confirms off,
+1,155/s with them on), so anything publishing serially is bound by one broker
+round trip per event. Overlapping the waits replaces that with one round trip per
+batch. **No guarantee is weakened** — every message is still individually
+confirmed by the broker; only the waiting overlaps.
+
+Most publishers never call this directly. The outbox relay discovers it by type
+assertion and uses it automatically, which is where the effect shows: a backlog
+drain went from 918 to 15,791 events/s, and from 130 to 5,424 events/s at the 5ms
+confirm latency an ordinary cross-AZ quorum queue answers in. It falls back to
+serial sending under `WithMandatoryPublish` (attributing a `basic.return` needs
+exactly one publish in flight per channel) and `WithoutPublisherConfirms`
+(nothing to overlap).
+
 ### Transactional Outbox Transport
 
 The outbox transport implements the transactional outbox pattern: events are
@@ -373,9 +430,12 @@ if err := rs.EnsureIndexes(ctx); err != nil {
     log.Fatal(err)
 }
 
+// DrainWindow is the one latency knob (it is also the change stream's
+// server-side maxAwaitTime). LeaseTTL is left at its 60s default: the
+// constructor requires DrainWindow + OpTimeout < LeaseTTL, so lowering the
+// lease means lowering WithOpTimeout (default 30s) with it.
 r, err := stream.NewRelay("broker-publish", rs, rabbitSender,
     stream.WithDrainWindow(time.Second),
-    stream.WithLeaseTTL(15*time.Second),
 )
 if err != nil {
     log.Fatal(err)

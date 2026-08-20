@@ -137,17 +137,29 @@ consumer-group offset store and the partition-leader counter, in Kafka terms.
 
 **Indexing.** Three indexes, and only one secondary index beyond the PK:
 
-- `PRIMARY KEY (id)` clustered — serves publish inserts; `id` is also the implicit within-tx
-  ordering tiebreak (appended to every secondary index, so it never needs naming in one).
+- `PRIMARY KEY (id)` clustered — serves publish inserts; `id` is also the within-tx ordering
+  tiebreak. It is **not** an ordered suffix of secondary indexes: because the PK is CLUSTERED,
+  a secondary index carries `id` as the row handle, so an `ORDER BY … , id` cannot be satisfied
+  by an index that does not name `id` in its key. (This paragraph previously claimed the
+  opposite, and the sequencer's plan was measurably a `TopN` because of it.)
 - `UNIQUE KEY uk_outbox_event (event_id)` — idempotency / consumer dedup; random UUID, scattered.
-- `KEY idx_outbox_seq (seq, tx_start_ts)` — serves **both** loops from one index: the drain range
-  scan (`seq > @last ORDER BY seq`) uses `seq` as the leading column; the sequencer scan
-  (`seq IS NULL ORDER BY tx_start_ts, id`) reads the NULL-prefix (NULLs sort first) already
-  ordered by `tx_start_ts` then the appended `id`. No filesort on either path.
+- `UNIQUE KEY uk_outbox_seq (seq)` — the completeness invariant, plus the drain range scan
+  (`seq > @last ORDER BY seq`) on its leading column. NULLs are exempt from `UNIQUE` in
+  MySQL/TiDB, so pending rows coexist under it.
+- `KEY idx_outbox_seq_order (seq, tx_start_ts, id)` — the sequencer page
+  (`seq IS NULL ORDER BY seq, tx_start_ts, id LIMIT ?`). Both details are load-bearing: `id` must
+  be in the KEY (see above), and the query's `ORDER BY` must lead with `seq` so it matches the
+  index's leading column. Measured on TiDB v7.5.1 at a 20,000-row pending backlog — with both:
+  `Limit → IndexRangeScan actRows 2048`; with either missing: `TopN → IndexRangeScan actRows
+  20000`, i.e. every pass reads the whole backlog and recovery is quadratic.
 
-No `UNIQUE(seq)`: seq uniqueness/density is guaranteed by the counter-`FOR UPDATE` serialization
-(§5.2), so a unique index would never fire in correct operation — it would only add a second
-monotonic-write hotspot. The invariant is covered by tests instead.
+`UNIQUE(seq)` **is** present. The counter-`FOR UPDATE` serialization (§5.2) makes a duplicate
+impossible in correct operation, but that is a property of the session, not of the table, so
+without the constraint the invariant failed OPEN — and a row assigned a seq below every
+committed offset is never read by `seq > ?` and is later swept as consumed, i.e. permanent silent
+loss. The counter and the data can disagree easily (a down+up migration re-seeds `next_seq = 1`;
+a restore of the small sequencer table from an older backup), so the constraint earns its write
+cost by converting that into ER_DUP_ENTRY, which `SequenceMessages` already reports.
 
 **Hotspot note (TiDB).** `id` (monotonic clustered PK) and `idx_outbox_seq` (leading `seq`,
 monotonic) both take writes at the high end → append hotspot on the last Region; `idx_outbox_seq`
@@ -308,10 +320,28 @@ the read-modify-write case), then `seq(A) < seq(B)`.
 `tx_start_ts(B) > commit_ts(A) > tx_start_ts(A)` (TSO monotone; commit_ts > start_ts), so A
 sorts first. The `ORDER BY ... LIMIT` batch cut cannot take B while dropping A. ∎
 
-Not guaranteed: relative order of genuinely concurrent transactions (overlapping lifetimes, no
-data dependency) — same semantics as one Kafka partition with concurrent producers. Transactions
-that matter to each other (same aggregate) conflict on row locks, serialize, and fall under the
-theorem.
+Not guaranteed: relative order of transactions with **overlapping lifetimes**, whether or not they
+share data — same semantics as one Kafka partition with concurrent producers.
+
+**The same-aggregate case is NOT excused by the theorem.** This paragraph used to claim that
+transactions which matter to each other "conflict on row locks, serialize, and fall under the
+theorem". They do serialize — but serializing on a lock does not satisfy the theorem's premise,
+which is that B *started* after A *committed*. Two transactions can conflict on one row, serialize,
+and still have `tx_start_ts` order be the **reverse** of commit order:
+
+1. A begins (start TSO allocated at `BEGIN`) and reads, taking no lock.
+2. B begins later, takes the row lock, writes, publishes, **commits**.
+3. A then writes the same row (waiting out B's lock), publishes, **commits last**.
+
+`seq` follows `tx_start_ts`, so A is delivered first while A is the last writer. Verified on TiDB
+v7.5.1 — see `TestSameAggregateSeqFollowsBeginOrderNotCommitOrder` in
+`pkg/transport/outbox/tidb/relay_integration_test.go`, which reproduces exactly this and reports
+the divergence. Nothing is duplicated, so `event_id` dedup cannot repair it.
+
+**What `seq` therefore is: transaction-BEGIN order, not commit order.** The theorem above still
+holds for its own premise (a genuine read-after-commit dependency), and no event is ever *skipped*.
+But a consumer that needs last-write-wins semantics per aggregate must carry a version/revision in
+the payload and reject stale writes; the log's order alone is not sufficient.
 
 ### Race matrix
 
@@ -502,6 +532,55 @@ for this p99** (see below) and tracked as a separate availability number.
 **Same-tick pipelining (why added latency ≈ 0 vs. today's one-hop model):** within one `RunOnce`
 the sequencer tx commits *before* the drain query runs, so a row committed before tick T is
 sequenced *and* drained at T. The sequencer does not push events one interval further out.
+
+**Throughput ceiling (measured 2026-08-19).** The SLO above is a latency budget and says nothing
+about rate; the rate is set by the transport's acknowledgement latency, because the relay drains
+from one goroutine. Against a RabbitMQ 4 quorum queue on Docker loopback:
+
+| path | rate | per event |
+| --- | --- | --- |
+| `rabbitmq.Sender`, publisher confirms **off** | 86,139/s | 0.01 ms |
+| `rabbitmq.Sender`, confirms on, **one at a time** | 1,155/s | 0.87 ms |
+| full relay (TiDB read + send + offset commit), serial | 918–1,083/s | ~1.0 ms |
+| full relay, **overlapped confirms** (below) | 15,791/s | 0.06 ms |
+
+The confirm wait is ~99% of a send and the store is ~8% of a pass, so serially the whole pipeline
+runs at **1 / confirm-RTT** — independent of `WithBatchSize`, `WithPollInterval` and
+`maxPagesPerTick`. A cross-AZ quorum queue's confirm RTT lands one to two orders of magnitude above
+loopback's, and the serial rate follows it down. Sustained-publish runs showed the shape: 300/s and
+800/s kept up (peak lag 1.25 s and 1.15 s), 2500/s did not — 918/s drained, 15.8 s of lag, 26.7 s
+to clear a 10-second burst.
+
+**Overlapped confirms (`eventbus.BatchSender`).** The fix is to stop waiting for each confirm
+before issuing the next publish. An optional Sender capability — discovered by type assertion, the
+same shape as the store capabilities in §5 — lets the lane hand a whole page to the transport,
+which publishes it on one channel and collects the confirms in order. Every message is still
+individually confirmed; only the waiting overlaps.
+
+Measured on the same rig, driving the relay against injected per-send acknowledgement latency
+(`WithBatchSize` 100):
+
+| added confirm latency | serial | overlapped | |
+| --- | --- | --- | --- |
+| 0 (loopback) | 1,060/s | **11,299/s** | 10.7× |
+| +2 ms | 264/s | **8,447/s** | 32× |
+| +5 ms (ordinary cross-AZ quorum) | 130/s | **5,424/s** | 42× |
+| +10 ms | 74/s | **4,143/s** | 56× |
+
+End to end the backlog drain went from 918/s to **15,791/s** steady (3,000 pre-committed rows in
+288 ms of wall clock rather than 3.19 s), and the 2500/s sustained-publish case that previously
+fell 15.8 s behind now keeps up at 2,413/s with peak lag 1.12 s — at that rate the limit is the
+publish side, not the relay.
+
+The safety property is the return contract: `SendBatch` reports the **contiguous confirmed
+prefix**, and the relay advances its watermark past exactly that. A message delivered *after* a
+failure is not counted, so a gap can never be committed as progress; those are re-delivered next
+pass, which is the same at-least-once trade the lane makes everywhere else. A parkable failure
+inside a batch is a resumption point — the lane parks it and continues with the remainder — so a
+few unsendable rows do not drop the relay back to the serial path. Two configurations fall back to
+serial sending: `WithoutPublisherConfirms` (nothing to overlap) and `WithMandatoryPublish`
+(attributing a `basic.return` needs exactly one publish in flight per channel). A transport that
+does not implement the capability is driven one message at a time exactly as before.
 
 **Separate batch knobs:** sequencing a row is a cheap `UPDATE seq` (no off-box I/O); draining
 sends over the network (10–100× costlier per row). `WithSequenceBatchSize` (default **1000**) is

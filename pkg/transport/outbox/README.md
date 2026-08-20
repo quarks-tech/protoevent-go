@@ -270,7 +270,12 @@ if `name` is empty (it keys the offset row and the default leader lock); if
 `PollInterval`, `BatchSize`, `SequenceBatchSize`, `LeaseTTL`, or `OpTimeout` is
 not strictly positive; if `PollInterval` is not strictly less than `LeaseTTL/2`
 (the lease must be renewable at least twice per TTL) or not strictly less than
-`OpTimeout` (a store call has to be able to outlast one pass); if `name` (or an overridden
+`OpTimeout` (a store call has to be able to outlast one pass); if
+`PollInterval + OpTimeout` is not strictly less than `LeaseTTL` (the lease is
+renewed once per pass, so a longer store call returns onto an expired lease and
+the relay commits as a stale leader — see "Two timeouts" below, and note this is
+NOT implied by the two checks above, which each compare the tick to one budget);
+if `name` (or an overridden
 `LeaderLockName`) exceeds 64 bytes (the reference schema's `VARCHAR(64)` key
 columns — a relaxed `sql_mode` would silently truncate a longer name into
 another group's offset row and leader lock); if the sweep cadence
@@ -329,14 +334,30 @@ otherwise keeps pinning `MIN(last_seq)` and halts the retention sweep forever.
 
 | Option | Default | Bounds |
 | --- | --- | --- |
-| `WithLeaseTTL` | 15s | How long an **ungraceful** leader loss stalls the relay. A clean shutdown releases the lock explicitly, so only crashes pay it. |
+| `WithLeaseTTL` | 60s | How long an **ungraceful** leader loss stalls the relay. A clean shutdown releases the lock explicitly, so only crashes pay it. |
 | `WithOpTimeout` | 30s | Every individual **store call** (`internal/bound`). Neither `database/sql` nor the mongo driver has a default operation timeout, so without it a call on a wedged connection stalls the single `Run` goroutine with no error and no log. |
 
 These used to be one knob, and shortening the failover budget silently
 shortened every store deadline with it. They answer unrelated questions —
 a wedged connection is wedged whether or not the lease is still held — so
-tune them independently. The one relation the constructors enforce is that
-the runtime's tick (`PollInterval` / `DrainWindow`) stays below both.
+tune them independently.
+
+**They are not fully independent, though, and the third rule is the one that
+surprises people:** the constructors require
+
+```
+tick + OpTimeout < LeaseTTL          (tick = PollInterval / DrainWindow)
+```
+
+because the lease is renewed once per pass, so a store call that outlives what
+is left of the lease returns onto an EXPIRED one and the relay then commits as a
+stale leader. That is why `LeaseTTL` defaults to 60s and not the 15s it once
+did: at 15s the shipped pair violated its own rule by 2×. **Lowering `LeaseTTL`
+to shorten failover therefore means lowering `OpTimeout` with it** — the two
+must be moved together, e.g. `WithLeaseTTL(15*time.Second)` paired with
+`WithOpTimeout(10*time.Second)`. The other two relations (`tick < LeaseTTL/2`,
+`tick < OpTimeout`) each check the tick against ONE budget; this one checks
+their sum, and no combination of the other two implies it.
 
 **A new consumer group starts at "latest"** — its offset is seeded at the current
 max seq, so it sees future events only (the same default as the MongoDB stream
@@ -355,6 +376,22 @@ messages only (parked messages surface via `OnError`). `OnSwept` fires for a
 lagging group blocks pruning store-wide, and a blocked sweep would otherwise be
 indistinguishable from a healthy idle one. `sequence.WithLogger` wires a
 `*log/slog.Logger` for pass-level errors.
+
+**`OnDrained`'s `oldestAge` can be NEGATIVE, and that is deliberate.** It is the
+age of the oldest event in the page: `create_time` subtracted from the store's
+clock. The TiDB store stamps `create_time` from the **publisher** process's clock
+(inside your business transaction) and answers the relay's clock read from the
+**relay** process — the same clock only when one process does both. In the normal
+split deployment, NTP skew between those hosts lands in the reported lag, and a
+relay whose clock trails the publishers' measures rows stamped in its own future.
+
+A negative value used to be clamped to `0`. That rendered a skewed relay sitting
+on a real backlog as perfectly healthy on every gauge, which is the one thing a
+lag metric must never do, so it is now reported as-is and logged once per pass at
+`WARN` naming clock skew. Two consequences for your dashboards: **do not clamp or
+`abs()` it** on the way into a gauge, and treat a persistently negative age as a
+clock-sync alert, not a relay fault. The skew is bounded by your fleet's NTP
+discipline (milliseconds) rather than by anything this library controls.
 
 `sequence.WithPoisonHandler` installs the poison-parking hook: a row whose
 persisted metadata fails to decode (`sequence.DecodeError`) is handed to the
@@ -508,9 +545,12 @@ tokens — `string` rather than the driver's `bson.Raw` keeps the runtime
 driver-free and the token immutable and comparable). It errors if `name` is empty, if `DrainWindow`,
 `LeaseTTL`, `OpTimeout`, or `TokenBatchSize` is not strictly positive, if
 `DrainWindow >= LeaseTTL/2`, since the leader lease must be renewable within a
-single drain window, or if `DrainWindow >= OpTimeout`, since `DrainWindow` is
+single drain window, if `DrainWindow >= OpTimeout`, since `DrainWindow` is
 also the change stream's server-side `maxAwaitTime` and an idle `Next` blocks
-for a whole window by design. As with the sequence runtime, a `Relay` is not safe for
+for a whole window by design, or if `DrainWindow + OpTimeout >= LeaseTTL`, since
+the lease is renewed once per window and a store call that outlives what is left
+of it returns onto an expired lease (see "Two timeouts" in the sequence section
+— that rule is shared, and it is the one a shortened `LeaseTTL` trips first). As with the sequence runtime, a `Relay` is not safe for
 concurrent use: call `Run` from a single goroutine.
 
 ```go
@@ -523,9 +563,12 @@ if err := rs.EnsureIndexes(ctx); err != nil {
     log.Fatal(err)
 }
 
+// DrainWindow is the one latency knob (it is also the change stream's
+// server-side maxAwaitTime). LeaseTTL is left at its 60s default: the
+// constructor requires DrainWindow + OpTimeout < LeaseTTL, so a shorter lease
+// has to be paired with a shorter WithOpTimeout (default 30s).
 r, err := stream.NewRelay("broker-publish", rs, rabbitSender,
     stream.WithDrainWindow(time.Second),
-    stream.WithLeaseTTL(15*time.Second),
     stream.WithObserver(promObserver),
 )
 if err != nil {
