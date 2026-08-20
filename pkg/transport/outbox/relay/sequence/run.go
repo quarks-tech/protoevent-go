@@ -288,8 +288,9 @@ const (
 // renewing the leader lease between pages so a long backlog cannot outlive the
 // lease — bounding stale-leader overlap to a single page.
 func (r *Relay) drain(ctx context.Context, offset int64) error {
-	// One store-clock read per pass, not per page (see oldestAge).
-	r.passStoreNow = time.Time{}
+	// One store-clock read per pass, and one skew warning per pass, not per page
+	// (see oldestAge).
+	r.passStoreNow, r.passSkewWarned = time.Time{}, false
 
 	for range maxPagesPerTick {
 		next, outcome, err := r.drainPage(ctx, offset)
@@ -361,6 +362,100 @@ func (r *Relay) primeOffset(ctx context.Context) (int64, error) {
 	return r.store.InitOffsetLatest(ctx, r.name)
 }
 
+// forward delivers one page's decoded messages and reports how far the page got:
+// the highest seq the caller may commit, how many were actually sent (what
+// OnDrained counts), and why it stopped.
+//
+// Two shapes, one policy. Both drive internal/lane, which owns every decision about
+// what a failure means; the difference is only how many acknowledgements are in
+// flight while it does. The batched shape runs when the transport implements
+// eventbus.BatchSender, and it is what takes the relay off the one-round-trip-per-
+// event ceiling — serially the drain rate is the reciprocal of the confirm latency,
+// which measured 918 events/s against a loopback quorum queue and extrapolates to
+// 129/s at a 5ms cross-AZ confirm.
+func (r *Relay) forward(ctx context.Context, msgs []*outbox.Message, offset int64) (maxSeq int64, sent int, outcome pageOutcome) {
+	if r.lane.Batching() {
+		return r.forwardBatched(ctx, msgs, offset)
+	}
+
+	maxSeq, outcome = offset, pageDone
+	for _, m := range msgs {
+		// A canceled run context is a shutdown, not a message fault: stop the
+		// lane before touching the next message, so a canceled ctx can't walk
+		// the rest of the page fail-fast (and, with a PoisonHandler, park
+		// healthy messages).
+		if ctx.Err() != nil {
+			outcome = pageCanceled
+
+			break
+		}
+		switch r.lane.Send(ctx, m.Seq, m) {
+		case lane.Sent:
+			maxSeq, sent = m.Seq, sent+1
+		case lane.Parked:
+			maxSeq = m.Seq
+		case lane.Canceled:
+			outcome = pageCanceled
+		case lane.Stopped:
+			outcome = pageStopped
+		}
+		if outcome != pageDone {
+			break // stop-the-lane: leave this seq for the next tick
+		}
+	}
+
+	return maxSeq, sent, outcome
+}
+
+// forwardBatched is forward's overlapped-acknowledgement shape.
+//
+// It LOOPS rather than making one call, because a parked message is a resumption
+// point: the lane advances past a message it could park and the rest of the page is
+// still deliverable. Each iteration hands the lane the remaining suffix, so a page
+// with three parkable messages costs four batches instead of degrading to one
+// message at a time.
+//
+// Committing stays exactly as strict as the serial path: maxSeq only ever moves to
+// the last position the lane said may be advanced past, which is its CONTIGUOUS
+// confirmed prefix (plus a confirmed park). A transport that delivered messages
+// beyond a failure does not move it — those are re-delivered next pass, which is
+// the at-least-once trade the relay already makes everywhere else.
+func (r *Relay) forwardBatched(ctx context.Context, msgs []*outbox.Message, offset int64) (int64, int, pageOutcome) {
+	// Positions parallel to msgs, in the buffer reused across pages.
+	r.seqs = r.seqs[:0]
+	for _, m := range msgs {
+		r.seqs = append(r.seqs, m.Seq)
+	}
+
+	maxSeq, sent := offset, 0
+	for i := 0; i < len(msgs); {
+		// Same shutdown pre-check as the serial loop, for the same reason.
+		if ctx.Err() != nil {
+			return maxSeq, sent, pageCanceled
+		}
+
+		n, advanced, d := r.lane.SendBatch(ctx, r.seqs[i:], msgs[i:])
+		sent += n
+		if advanced > 0 {
+			maxSeq = msgs[i+advanced-1].Seq
+		}
+		i += advanced
+
+		switch d {
+		case lane.Sent:
+			// The whole remainder went; i is now len(msgs) and the loop ends.
+		case lane.Parked:
+			// Advanced past the parked message: continue with what is left.
+		case lane.Canceled:
+			return maxSeq, sent, pageCanceled
+		case lane.Stopped:
+			return maxSeq, sent, pageStopped
+		}
+	}
+
+	return maxSeq, sent, pageDone
+}
+
 // drainPage forwards one page of messages and commits what it delivered,
 // returning the offset the next page starts from.
 func (r *Relay) drainPage(ctx context.Context, offset int64) (int64, pageOutcome, error) {
@@ -386,33 +481,7 @@ func (r *Relay) drainPage(ctx context.Context, offset int64) (int64, pageOutcome
 		return offset, pageDone, nil
 	}
 
-	maxSeq := offset
-	sent := 0
-	outcome := pageDone
-	for _, m := range msgs {
-		// A canceled run context is a shutdown, not a message fault: stop the
-		// lane before touching the next message, so a canceled ctx can't walk
-		// the rest of the page fail-fast (and, with a PoisonHandler, park
-		// healthy messages).
-		if ctx.Err() != nil {
-			outcome = pageCanceled
-
-			break
-		}
-		switch r.lane.Send(ctx, m.Seq, m) {
-		case lane.Sent:
-			maxSeq, sent = m.Seq, sent+1
-		case lane.Parked:
-			maxSeq = m.Seq
-		case lane.Canceled:
-			outcome = pageCanceled
-		case lane.Stopped:
-			outcome = pageStopped
-		}
-		if outcome != pageDone {
-			break // stop-the-lane: leave this seq for the next tick
-		}
-	}
+	maxSeq, sent, outcome := r.forward(ctx, msgs, offset)
 
 	// A poison row (persisted metadata failed to decode) sits right after the
 	// decoded prefix. With a PoisonHandler it is parked like any other failed
@@ -486,18 +555,27 @@ func (r *Relay) drainPage(ctx context.Context, offset int64) (int64, pageOutcome
 // oldestAge reports the age of the oldest event in a drained page — the lag
 // value handed to OnDrained.
 //
-// createTime is stamped by the STORE (the DB's NOW at insert), so the age is
-// computed against the store's clock whenever the store offers one (see Clock):
-// subtracting a DB-stamped timestamp from the relay host's time.Now() folds any
-// NTP skew between the two into the metric, and on a pod whose clock trails the
-// database it reports a NEGATIVE age for a genuinely stale backlog — which any
-// gauge wired to OnDrained plots as ~0, so the lag alert never fires. Without
-// the capability (or if the clock read fails) it falls back to the host clock,
-// which is correct to within the skew.
+// createTime is stamped by the STORE at insert, so the age is computed against the
+// store's own clock whenever the store offers one (see Clock): subtracting that
+// timestamp from an unrelated clock's time.Now() folds the skew between the two
+// into the metric. Without the capability (or if the clock read fails) it falls
+// back to the host clock, which is correct to within that skew.
 //
 // The store clock is read at most once per drain pass — a pass can walk many
 // pages — and only when an OnDrained observer will actually consume the value,
 // so an unobserved relay issues no extra query.
+//
+// A NEGATIVE age is reported as negative, not clamped to zero, and that is a
+// deliberate reversal. Clamping was justified by "a store clock cannot predate its
+// own insert", which is not true of the reference store: the tidb store stamps
+// create_time from the PUBLISHER process's clock and answers StoreNow from the
+// RELAY process's clock (see Clock), so a relay pod whose clock trails the
+// publishers produces a negative age for a genuinely stale backlog. Clamping that
+// to 0 renders it as a perfectly healthy relay on any gauge wired to OnDrained —
+// which is the precise failure mode the Clock capability was added to eliminate,
+// reappearing one layer down and invisible. A negative value is not a lag an alert
+// can threshold either, but it is unmistakably wrong on a dashboard, and the log
+// line below names the cause. Hiding it was the worse of the two.
 func (r *Relay) oldestAge(ctx context.Context, createTime time.Time) time.Duration {
 	if r.options.Observer.OnDrained == nil {
 		return 0 // nobody consumes it: don't pay for a clock read
@@ -520,10 +598,14 @@ func (r *Relay) oldestAge(ctx context.Context, createTime time.Time) time.Durati
 	}
 
 	age := now.Sub(createTime)
-	if age < 0 {
-		// Only reachable on the host-clock fallback (a store clock cannot predate
-		// its own insert). A negative lag is not a signal any gauge can use.
-		return 0
+	if age < 0 && !r.passSkewWarned {
+		// Once per pass, for the same reason the failed-clock-read warning above is:
+		// a multi-page pass would otherwise log this per page.
+		r.passSkewWarned = true
+		r.options.Logger.Warn("sequence relay: negative event age — the clock that stamped the row "+
+			"is ahead of the clock the lag is measured against; reported lag is skewed by at least "+
+			"this much and a real backlog may read as healthy",
+			"relay", r.name, "age", age, "create_time", createTime, "measured_against", now)
 	}
 
 	return age

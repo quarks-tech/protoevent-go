@@ -23,6 +23,23 @@ linters:
     - gosec
     - intrange
     - mirror
+    # Policing "use the language feature that now exists" cannot be done by
+    # review: a reviewer pattern-matches against a training corpus, and brand-new
+    # stdlib API has none — errors.AsType survived two full review rounds on this
+    # branch before a human spotted it. An analyzer has no such bias, so the rule
+    # is enforced here instead of remembered.
+    #
+    # Note that golangci bundles its own x/tools snapshot, which lags the
+    # standalone analyzer (the WaitGroup.Go modernizer, for one, is newer than
+    # what ships here). Running
+    #   go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest ./...
+    # per module catches the rest; worth doing on each toolchain bump.
+    #
+    # usestdlibvars is deliberately NOT enabled alongside it: it makes staticcheck
+    # emit an SA5011 false positive on a t.Fatalf-guarded pointer in
+    # mongodb/watch_internal_test.go, and one bogus finding costs more than the
+    # rule is worth here.
+    - modernize
     - misspell
     - musttag
     - nilnesserr

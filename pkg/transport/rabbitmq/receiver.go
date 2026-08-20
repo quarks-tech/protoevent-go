@@ -135,7 +135,13 @@ func WithDLX() ReceiverOption {
 	}
 }
 
-// WithPrefetchCount sets the channel's QoS prefetch count (default 3).
+// WithPrefetchCount sets the channel's QoS prefetch count (default 16).
+//
+// It does NOT set handler concurrency: deliveries are processed one at a time on a
+// single goroutine whatever the prefetch is. What it buys is how many deliveries are
+// already buffered when that goroutine blocks — which is why it is the second knob on
+// the requeue-pacing stall (see WithRequeueBackoff), where the consumer clears
+// prefetch-1 messages per pacing delay.
 //
 // A non-positive c makes Receive fail. AMQP reads prefetch-count 0 as "no
 // specified limit", and this receiver used to pass it straight to Channel.Qos, so
@@ -311,9 +317,17 @@ func (r *Receiver) Receive(shutdownCtx context.Context, processor eventbus.Proce
 // to the cap, so a budget of 20 deliveries spans minutes instead of milliseconds: a
 // blip clears on an early attempt, while a genuinely stuck message still reaches its
 // limit (and a dead-letter exchange, if one is attached) in bounded time.
+//
+// The cap is 5s, not the 15s it started at, because the cap is also what the rest of
+// the queue pays. The delay is served on the single consume goroutine (see
+// WithRequeueBackoff), so during an episode the consumer clears prefetch-1 messages
+// per delay, and at the cap that ratio is the consumer's whole throughput. 5s keeps
+// the 20-delivery budget at ~76s — still four orders of magnitude above the 13.9ms
+// this pacing was introduced to fix, and longer than the blips it exists to survive —
+// while tripling what gets through behind a stuck message.
 const (
 	defaultRequeueBackoffBase = 200 * time.Millisecond
-	defaultRequeueBackoffMax  = 15 * time.Second
+	defaultRequeueBackoffMax  = 5 * time.Second
 )
 
 // deliveryCountHeader is set by quorum queues on each redelivery, and is what lets the
@@ -329,10 +343,29 @@ const deliveryCountHeader = "x-delivery-count"
 // 13.9ms, so any downstream fault lasting longer than a few milliseconds was fatal to
 // the event. Pacing turns that budget into a window long enough for the fault to clear.
 //
-// The delay is served by holding the delivery unacked, which occupies one prefetch slot
-// for its duration. Several simultaneously-failing messages can therefore idle a
-// consumer whose prefetch is small; raise the prefetch, or use the parkinglot receiver,
-// if that matters more than in-order retry of the same message.
+// THE DELAY STOPS THE WHOLE CONSUMER, not just the delivery being held. It is served
+// by a sleep on the single goroutine that reads deliveries — amqpx hands one delivery
+// to the handler and does not read the next until it returns — so prefetch buys
+// buffering, never concurrency. While a delivery is being paced, nothing else on the
+// queue is processed.
+//
+// What that costs, exactly: during an episode the consumer clears prefetch-1 other
+// messages per delay, because those are the ones already buffered when the sleep
+// starts. Measured against a real quorum queue with one permanently-failing message
+// among healthy traffic, at the old 15s cap and the old prefetch of 3, the healthy
+// messages arrived in PAIRS on the backoff ladder — 200ms, 600ms, 1.4s, 3.0s, 6.2s,
+// 12.6s, 25.4s, 40.4s, 55.4s, 70.4s — an aggregate 0.13/s against a 4264/s baseline,
+// for as long as the failing message's delivery budget lasted. With pacing disabled
+// the identical scenario cleared in 11ms, so the stall is this sleep and nothing else.
+//
+// So the two knobs that bound the damage are this cap and the prefetch, and the
+// defaults are set together for that reason (see consume.DefaultPrefetchCount). The
+// pacing itself is cheap for what it was built for: a 2s dependency outage across 100
+// messages cleared 2.7s after the first delivery.
+//
+// If a persistently-failing message must not stall the queue AT ALL, this receiver is
+// the wrong shape — use parkinglot.Receiver, where the wait is served by a broker-side
+// queue TTL rather than by the consume goroutine.
 //
 // A zero or negative base disables pacing and restores the immediate-requeue behavior.
 func WithRequeueBackoff(base, max time.Duration) ReceiverOption {

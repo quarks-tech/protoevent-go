@@ -16,6 +16,7 @@ package lane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/quarks-tech/protoevent-go/pkg/event"
@@ -58,6 +59,15 @@ type Lane[P comparable] struct {
 	// Reporter dispatches the observer/log signals this policy emits.
 	Reporter *notify.Reporter
 	Sender   eventbus.Sender
+	// Batch is Sender's optional overlapping-acknowledgement capability. Nil means
+	// the runtime sends one message at a time, which is the only mode that existed
+	// before and stays the fallback for any transport that does not implement it.
+	//
+	// The policy in this file does not change with it: SendBatch applies exactly the
+	// same branches to the first message the batch could not deliver as Send applies
+	// to a message it could not deliver. What changes is only how many
+	// acknowledgements are in flight at once.
+	Batch eventbus.BatchSender
 	// Poison parks a message retrying can never fix. Nil means no parking path:
 	// such a message stops the lane instead.
 	Poison relay.PoisonHandler
@@ -84,6 +94,10 @@ type Lane[P comparable] struct {
 	SendTimeout time.Duration
 
 	stuck notify.StuckTracker[P]
+	// out is the scratch slice SendBatch marshals the page into. Reused across
+	// pages: a drain pass walks up to maxPagesPerTick of them, and this would
+	// otherwise be one BatchSize-long allocation each.
+	out []eventbus.Outgoing
 }
 
 // Send delivers msg and applies the failure policy, returning what the caller
@@ -112,6 +126,87 @@ func (l *Lane[P]) Send(ctx context.Context, pos P, msg *outbox.Message) Disposit
 
 		return Sent
 	}
+
+	return l.failed(ctx, pos, msg, sendErr)
+}
+
+// Batching reports whether the Sender can overlap acknowledgements, and therefore
+// whether the runtime should drive SendBatch instead of Send.
+func (l *Lane[P]) Batching() bool { return l.Batch != nil }
+
+// SendBatch delivers msgs in order through the Sender's batch capability and
+// applies the same per-message failure policy Send does to the first one that did
+// not make it.
+//
+// positions must be parallel to msgs. The three returns separate what the caller
+// needs to keep straight and used to conflate:
+//
+//   - sent is how many were DELIVERED, which is what OnDrained counts.
+//   - advanced is how many POSITIONS the caller may move past, which is sent plus
+//     one when the message that stopped the batch was parked. Parking is a
+//     disposal, not a delivery, so it advances without counting (relay.Observer's
+//     contract: parked messages are reported through OnError).
+//   - d is what happened to msgs[advanced], and therefore whether the caller
+//     continues with the remainder (Sent, Parked) or stops here (Stopped,
+//     Canceled).
+//
+// The batch is bounded as a WHOLE by SendTimeout rather than per message. That is
+// deliberate and it is the one place batching is not merely faster: against a
+// transport slow enough that a full page cannot acknowledge inside the budget, the
+// call returns the prefix that did acknowledge and stops — so the lane still makes
+// a page's worth of progress per pass instead of wedging, and the goroutine is
+// still never blocked for longer than one SendTimeout. A per-message budget would
+// let one page hold the goroutine for BatchSize times that.
+func (l *Lane[P]) SendBatch(ctx context.Context, positions []P, msgs []*outbox.Message) (sent, advanced int, d Disposition) {
+	l.out = l.out[:0]
+	for _, m := range msgs {
+		l.out = append(l.out, eventbus.Outgoing{Metadata: m.Metadata, Data: m.Data})
+	}
+
+	sendCtx := ctx
+	if l.SendTimeout > 0 {
+		var cancel context.CancelFunc
+		sendCtx, cancel = bound.Call(ctx, l.SendTimeout)
+		defer cancel()
+	}
+
+	n, sendErr := l.Batch.SendBatch(sendCtx, l.out)
+	// Defend the position arithmetic against a misbehaving Sender rather than
+	// indexing out of range on it, or — far worse — advancing a durable watermark
+	// past events a buggy transport over-counted.
+	n = min(max(n, 0), len(msgs))
+	for i := range n {
+		l.Progress(positions[i])
+	}
+	if n == len(msgs) {
+		// A Sender that reports every message delivered must not also report an
+		// error; if it does, believe the error and stop rather than advance.
+		if sendErr != nil {
+			return n, n, Stopped
+		}
+
+		return n, n, Sent
+	}
+	if sendErr == nil {
+		// A short batch with no error breaks the contract in the direction that
+		// silently stalls: the caller would advance past n and re-read the rest
+		// forever with nothing to report. Name it.
+		sendErr = fmt.Errorf("sender reported %d of %d messages delivered but returned no error "+
+			"(eventbus.BatchSender requires a non-nil error describing the failure of message %d)",
+			n, len(msgs), n)
+	}
+
+	switch f := l.failed(ctx, positions[n], msgs[n], sendErr); f {
+	case Parked:
+		return n, n + 1, Parked
+	default:
+		return n, n, f
+	}
+}
+
+// failed applies the per-message failure policy: the branches documented on Send,
+// shared with SendBatch so the two cannot drift into different delivery semantics.
+func (l *Lane[P]) failed(ctx context.Context, pos P, msg *outbox.Message, sendErr error) Disposition {
 	if ctx.Err() != nil {
 		return Canceled
 	}

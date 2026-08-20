@@ -139,11 +139,29 @@ type FencedCommitter interface {
 // measuring its age against an unrelated clock folds the skew between them into the
 // reported lag — against a clock that trails the stamping one, a genuinely stale
 // backlog reports a negative age, which a Prometheus gauge plots as ~0 and no alert
-// ever fires on. With this capability both operands come from the same clock.
+// ever fires on. With this capability both operands come from the store's own clock
+// instead — as close to "the same clock" as the store implementation can make them,
+// which is not always all the way; see the caveat below.
 //
-// What matters is that the two operands SHARE a clock, not which clock it is. A store
-// that stamps with the database's clock answers from the database; one that stamps
-// from its own process answers from there.
+// What matters is that the two operands share a clock DOMAIN, not which clock it is. A
+// store that stamps with the database's clock answers from the database; one that
+// stamps from its own process answers from there.
+//
+// READ THAT LITERALLY: the guarantee is only as good as the domain the implementation
+// picks, and the shipped tidb store's domain is a PROCESS, not a cluster. It stamps
+// create_time from the publisher's Go clock (inside the caller's business
+// transaction) and answers StoreNow from the relay's Go clock, which are the same
+// clock only in a single-process deployment. A relay running as its own workload —
+// the normal shape, and the reason leadership exists — measures rows stamped on other
+// hosts, so NTP skew between them lands in the reported lag exactly as the DB-vs-host
+// skew this capability was introduced to remove. It is a smaller error than the old
+// zone-less NOW(6) bug (which was hours), not zero.
+//
+// A store whose domain really is cluster-wide — one that stamps and answers from the
+// database — is strictly better here, and an implementation is free to do that. The
+// relay cannot tell the difference and does not try; what it does do is report a
+// negative age rather than silently clamp it (see Relay.oldestAge), because a
+// negative age is the observable signature of exactly this skew.
 //
 // A store that cannot cheaply answer it simply doesn't implement it: the relay
 // then falls back to the host clock (see Relay.oldestAge). The relay calls
@@ -424,6 +442,15 @@ type Relay struct {
 	// passStoreNow caches the store's clock for the current drain pass, so a
 	// multi-page pass reads it once (see oldestAge). Reset at the top of drain.
 	passStoreNow time.Time
+	// passSkewWarned keeps the negative-age warning to once per pass rather than
+	// once per page. Reset alongside passStoreNow.
+	passSkewWarned bool
+
+	// seqs is the positions-parallel-to-messages buffer forwardBatched hands the
+	// lane. Reused across pages for the same reason lane's own scratch slice is:
+	// one BatchSize-long allocation per page, over up to maxPagesPerTick pages per
+	// pass, for a slice whose contents never outlive the call.
+	seqs []int64
 }
 
 // NewRelay creates a relay for the named consumer group. It validates the
@@ -529,8 +556,17 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 		leader:   elector,
 		reporter: reporter,
 		lane: &lane.Lane[int64]{
-			Reporter:   reporter,
-			Sender:     sender,
+			Reporter: reporter,
+			Sender:   sender,
+			// Overlapped acknowledgements when the transport can do them. A plain
+			// type assertion, like every other optional capability here: a sender
+			// without it is driven one message at a time exactly as before.
+			//
+			// This is the difference between a drain rate of one-over-confirm-RTT and
+			// one bounded by the page: measured at ~1000 events/s serially against a
+			// loopback quorum queue, and 129/s once the confirm costs the 5ms a
+			// cross-AZ quorum queue takes.
+			Batch:      batchSender(sender),
 			Poison:     options.PoisonHandler,
 			Unsendable: options.Unsendable,
 			Label:      stuckLabel,
@@ -599,4 +635,20 @@ func NewRelay(name string, store Store, sender eventbus.Sender, opts ...Option) 
 	}
 
 	return r, nil
+}
+
+// batchSender resolves the sender's optional overlapping-acknowledgement
+// capability, or nil.
+//
+// Written as a function rather than inline so the nil case is a nil INTERFACE and
+// not a typed nil: `var b eventbus.BatchSender = s` where s is a nil *T is non-nil
+// as an interface, and Lane.Batching would then take the batch path into a nil
+// receiver. The comma-ok assertion below cannot produce that.
+func batchSender(s eventbus.Sender) eventbus.BatchSender {
+	b, ok := s.(eventbus.BatchSender)
+	if !ok {
+		return nil
+	}
+
+	return b
 }

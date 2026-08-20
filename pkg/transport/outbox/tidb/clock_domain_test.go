@@ -504,9 +504,7 @@ func TestConcurrentSequencersHoldUnderOptimisticTxnMode(t *testing.T) {
 		wg    sync.WaitGroup
 	)
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				n, err := st.SequenceMessages(ctx, 20)
 				if err != nil {
@@ -523,7 +521,7 @@ func TestConcurrentSequencersHoldUnderOptimisticTxnMode(t *testing.T) {
 				total += n
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

@@ -1557,6 +1557,56 @@ func TestOldestAgeUsesStoreClock(t *testing.T) {
 	}
 }
 
+// TestOldestAgeReportsNegativeSkewInsteadOfClampingIt pins the one case the store
+// clock does NOT remove, and the decision to make it visible.
+//
+// sequence.Clock's contract is that both operands share a clock. The reference tidb
+// store satisfies that per PROCESS, not per cluster: create_time is stamped from the
+// publisher's clock inside the business transaction, and StoreNow answers from the
+// relay's. In the ordinary deployment those are different pods, so a relay whose
+// clock trails the publishers' measures rows stamped in its own future.
+//
+// That used to be clamped to 0, on the reasoning that "a store clock cannot predate
+// its own insert" — true of a database clock, false of this one. The clamp turned a
+// skewed relay sitting on a real backlog into a flat, healthy-looking zero on every
+// gauge wired to OnDrained, which is precisely the alarm-never-fires failure the
+// Clock capability exists to prevent. A negative age is not a usable threshold
+// either, but it cannot be mistaken for health.
+func TestOldestAgeReportsNegativeSkewInsteadOfClampingIt(t *testing.T) {
+	st := &clockStore{fakeStore: newFakeStore()}
+	m := msg()
+	// A genuinely stale row: stamped an hour ago by the publisher's clock.
+	m.CreateTime = time.Now().Add(-time.Hour)
+	st.append(m)
+	// The relay's clock trails the publisher's by two hours, so the row looks like
+	// it was created an hour from now.
+	st.now = m.CreateTime.Add(-time.Hour)
+
+	var ages []time.Duration
+	obs := relay.Observer{OnDrained: func(_ string, _ int, oldestAge time.Duration, _ bool) {
+		ages = append(ages, oldestAge)
+	}}
+
+	r, err := sequence.NewRelay("c", st, noopSender,
+		sequence.WithStartFromBeginning(), sequence.WithObserver(obs))
+	if err != nil {
+		t.Fatalf("NewRelay: %v", err)
+	}
+	if err := r.RunOnce(t.Context()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if len(ages) != 1 {
+		t.Fatalf("OnDrained fired %d times, want 1", len(ages))
+	}
+	if ages[0] != -time.Hour {
+		t.Fatalf("oldestAge = %v, want -1h.\n"+
+			"A relay clock behind the clock that stamped the row must surface the skew. Clamping "+
+			"it to 0 reports a stale backlog as a perfectly current one, and no lag alert can "+
+			"ever fire on it.", ages[0])
+	}
+}
+
 // TestOldestAgeSkipsStoreClockWithoutObserver pins the cost guard: the store
 // clock is only worth a round trip when something consumes the value.
 func TestOldestAgeSkipsStoreClockWithoutObserver(t *testing.T) {

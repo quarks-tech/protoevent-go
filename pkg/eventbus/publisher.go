@@ -21,6 +21,59 @@ type Sender interface {
 	Send(ctx context.Context, metadata *event.Metadata, data []byte) error
 }
 
+// Outgoing is one event on its way to a transport: exactly the pair Sender.Send
+// takes, in a form a slice can hold.
+type Outgoing struct {
+	Metadata *event.Metadata
+	Data     []byte
+}
+
+// BatchSender is an OPTIONAL Sender capability: deliver a run of events with the
+// per-event acknowledgements overlapped instead of serialized.
+//
+// It exists because a relay is a serial pipeline whose rate is one over the
+// transport's acknowledgement latency, and for a durable transport that latency is
+// not small. Measured against a RabbitMQ quorum queue, a publish costs 0.01ms of
+// work and 0.87ms of waiting for the confirm — so the outbox relay ran at ~1000
+// events/s on loopback and, extrapolating along the same curve, 129/s at the 5ms
+// confirm an ordinary cross-AZ quorum queue answers in. Nothing about that is the
+// database, the batch size or the poll interval: it is one round trip per event,
+// taken one at a time. Overlapping the waits removes it.
+//
+// Discovery is a type assertion by the caller, the same shape the outbox store
+// capabilities use. A Sender that does not implement this is driven one event at a
+// time exactly as before, so adding the interface changes nothing for existing
+// transports.
+type BatchSender interface {
+	Sender
+
+	// SendBatch delivers msgs IN ORDER and reports how many were confirmed
+	// delivered, counting only an unbroken run from the start.
+	//
+	// The return contract is what makes this safe for an at-least-once relay to
+	// build a position on, so it is strict in both directions:
+	//
+	//   - sent is the length of the CONTIGUOUS confirmed prefix. If msgs[3] fails
+	//     while msgs[4] succeeds, sent is 3 — never 4, and never 5. A caller
+	//     advances its committed position past exactly the first sent messages
+	//     and re-delivers the rest, so a gap counted as progress is a lost event.
+	//   - err is nil if and only if sent == len(msgs). When it is non-nil it
+	//     describes the failure of msgs[sent] specifically, so the caller can apply
+	//     its per-message policy (classify it unsendable, park it, or stop) to that
+	//     message. It must therefore carry any marker that policy matches on, such
+	//     as event.ErrUnsendable.
+	//
+	// Delivery beyond the reported prefix is UNSPECIFIED: messages after the
+	// failure may or may not have reached the transport. That is the same
+	// at-least-once license Send already has (a confirm lost on a dropped
+	// connection re-delivers), and it is why sent must never be optimistic.
+	//
+	// An implementation that cannot overlap a particular configuration should fall
+	// back to sending serially rather than refusing — the contract is about the
+	// answer, not the mechanism.
+	SendBatch(ctx context.Context, msgs []Outgoing) (sent int, err error)
+}
+
 type Publisher interface {
 	Publish(ctx context.Context, name string, e any, opts ...PublishOption) error
 }

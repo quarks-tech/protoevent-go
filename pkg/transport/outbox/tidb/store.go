@@ -677,14 +677,30 @@ func (rs *RelayStore) CommitOffsetFenced(
 }
 
 // StoreNow returns the clock this store stamps with (sequence.Clock), so the relay
-// reports lag against the same clock that produced create_time rather than an
-// unrelated one — which is the property sequence.Clock actually needs.
+// reports lag against the same KIND of clock that produced create_time rather than an
+// unrelated one.
 //
 // It no longer round-trips SELECT NOW(6). That read returned a time in the session's
 // time_zone while create_time is a zone-less DATETIME(6), so on any connection whose
 // zone was not the one that stamped the rows, the "age" it produced was wrong by the
-// offset between them. Reading the same clock the store writes with cannot disagree
-// with itself, and costs no round trip. ctx is unused for that reason.
+// offset between them — by hours, in the reported case. Reading a Go clock instead
+// cannot disagree about zones, and costs no round trip. ctx is unused for that reason.
+//
+// WHAT THIS DOES NOT GIVE YOU. The clock read here belongs to the RELAY process;
+// create_time was stamped by the PUBLISHER process, inside the caller's business
+// transaction (see CreateOutboxMessage). Those are the same clock only when one
+// process both publishes and relays. In the normal deployment they are different
+// pods, so NTP skew between them still lands in the reported lag — bounded by a
+// well-run fleet's skew (milliseconds) rather than by a timezone offset, which is why
+// this remains the better trade, but not zero. A relay whose clock trails the
+// publishers' produces a NEGATIVE age; sequence.Relay reports that as negative and
+// logs it rather than clamping it to a healthy-looking zero.
+//
+// A deployment that needs a genuinely cluster-wide domain wants both sides reading
+// the database — which is what NOW(6) was, minus the zone bug. Fixing it that way
+// means a zone-pinned session (or a UTC_TIMESTAMP(6) read) on both the insert and
+// this call, and paying the round trip. Not done here because the insert is on the
+// caller's business-transaction path.
 func (rs *RelayStore) StoreNow(_ context.Context) (time.Time, error) {
 	return rs.now().UTC(), nil
 }
@@ -988,10 +1004,22 @@ func (rs *RelayStore) ReleaseLeaderLock(ctx context.Context, name, holderID stri
 
 // SweepMessages deletes sequenced rows at or below the minimum committed offset
 // across all consumers and inserted (create_time) longer ago than this store's
-// retention window (WithRetentionWindow, default 7 days) — per the DATABASE
-// clock on both sides: create_time is DB-stamped at insert (see
-// CreateOutboxMessage) and the cutoff comes from that same clock, so no publisher or
-// relay host clock can sweep early or pin rows forever.
+// retention window (WithRetentionWindow, default 7 days).
+//
+// Both sides come from a STORE clock (WithClock, default time.Now) rather than from
+// SQL NOW(6): create_time is bound as a parameter at insert (see
+// CreateOutboxMessage) and the cutoff below is computed the same way, so no session
+// time_zone can make the two incommensurable — which it could, and did, when the
+// cutoff was a zone-rendered NOW(6) compared against a zone-less DATETIME(6) column.
+//
+// They are the same clock only when one process both publishes and sweeps. The
+// stamping side runs in the publisher and the cutoff side in the relay, so ordinary
+// NTP skew between those hosts shifts the effective window by that much. The exposure
+// is small by construction: the sweep also requires seq <= MIN(last_seq), so it can
+// only ever touch rows every consumer group has already committed past — skew costs
+// replay depth, never an undelivered event. A deployment that needs the window itself
+// to be exact wants a store whose clock reads the database (see StoreNow).
+//
 // Retention is anchored to insert time, not event time, so a backdated
 // WithEventTime event is not swept early. If no offsets exist yet,
 // MIN(last_seq) is NULL and nothing is deleted.

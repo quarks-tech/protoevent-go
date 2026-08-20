@@ -180,9 +180,7 @@ func TestTwoDeploymentsSharingARelayNameSplitTheLog(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for _, rel := range []*sequence.Relay{relA, relB} {
-		wg.Add(1)
-		go func(rel *sequence.Relay) {
-			defer wg.Done()
+		wg.Go(func() {
 			for runCtx.Err() == nil {
 				if err := rel.RunOnce(runCtx); err != nil {
 					return
@@ -190,7 +188,7 @@ func TestTwoDeploymentsSharingARelayNameSplitTheLog(t *testing.T) {
 				// Give the other instance a chance to win the lock.
 				time.Sleep(10 * time.Millisecond)
 			}
-		}(rel)
+		})
 	}
 
 	// Drain until the shared watermark covers the whole log.

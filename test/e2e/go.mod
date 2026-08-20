@@ -29,6 +29,7 @@ require (
 	github.com/quarks-tech/protoevent-go/pkg/transport/outbox v0.4.3
 	github.com/quarks-tech/protoevent-go/pkg/transport/outbox/tidb v0.0.0
 	github.com/quarks-tech/protoevent-go/pkg/transport/rabbitmq v0.4.3
+	github.com/rabbitmq/amqp091-go v1.13.0
 	google.golang.org/protobuf v1.36.11
 )
 
@@ -74,7 +75,6 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/rabbitmq/amqp091-go v1.13.0 // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.6 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect

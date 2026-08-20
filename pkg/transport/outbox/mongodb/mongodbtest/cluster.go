@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -178,9 +179,9 @@ func (c *Cluster) namespaceOwner() testcontainers.Container {
 func (c *Cluster) terminateContainers() {
 	// Reverse order: the namespace owner is last, since the others' namespace dies
 	// with it.
-	for i := len(c.members) - 1; i >= 0; i-- {
+	for _, m := range slices.Backward(c.members) {
 		tctx, tcancel := context.WithTimeout(context.Background(), 30*time.Second)
-		_ = c.members[i].Terminate(tctx)
+		_ = m.Terminate(tctx)
 		tcancel()
 	}
 }
