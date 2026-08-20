@@ -27,8 +27,8 @@ require (
 	//     GOWORK=off build on go.sum verification, which step 5 catches;
 	//  5. verify with `make check-modules` — it must report OK for all five modules;
 	//  6. only then tag pkg/transport/outbox/tidb, .../mongodb and .../rabbitmq.
-	github.com/quarks-tech/protoevent-go v0.4.2
-	github.com/quarks-tech/protoevent-go/pkg/transport/outbox v0.4.3
+	github.com/quarks-tech/protoevent-go v0.5.0
+	github.com/quarks-tech/protoevent-go/pkg/transport/outbox v0.5.0
 	github.com/testcontainers/testcontainers-go v0.43.0
 )
 

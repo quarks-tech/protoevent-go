@@ -10,12 +10,14 @@ require (
 	// an external `go get` sees. See ../tidb/go.mod for the publishing order (a
 	// `replace` cannot substitute: Go ignores replace directives in a non-main
 	// module, so a consumer would still resolve the tag below).
-	github.com/quarks-tech/protoevent-go v0.4.2
-	github.com/quarks-tech/protoevent-go/pkg/transport/outbox v0.4.3
+	github.com/quarks-tech/protoevent-go v0.5.0
+	github.com/quarks-tech/protoevent-go/pkg/transport/outbox v0.5.0
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.43.0
 	go.mongodb.org/mongo-driver/v2 v2.8.0
 )
+
+require github.com/moby/moby/api v1.55.0
 
 require (
 	dario.cat/mergo v1.0.2 // indirect
@@ -42,7 +44,6 @@ require (
 	github.com/magiconair/properties v1.8.10 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/go-archive v0.2.0 // indirect
-	github.com/moby/moby/api v1.55.0 // indirect
 	github.com/moby/moby/client v0.5.0 // indirect
 	github.com/moby/patternmatcher v0.6.1 // indirect
 	github.com/moby/sys/sequential v0.7.0 // indirect
