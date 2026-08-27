@@ -1,6 +1,6 @@
 # PUBLISHED modules: these are what external consumers import, so they are the ones
 # check-modules gates under GOWORK=off.
-MODULES := . pkg/transport/outbox pkg/transport/outbox/mongodb pkg/transport/outbox/tidb pkg/transport/rabbitmq
+MODULES := . pkg/prometheus pkg/transport/outbox pkg/transport/outbox/mongodb pkg/transport/outbox/tidb pkg/transport/rabbitmq
 
 # test/e2e is never published and is imported by nothing. It exists only so a test
 # can use a store and the RabbitMQ transport together (see its go.mod). It is tested
